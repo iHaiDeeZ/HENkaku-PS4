@@ -4,12 +4,14 @@
 in WSL Ubuntu with the M33 / Resonance / DolphinPS4 / Crema PS4 toolchain (clang 21 + libc++ 21 on
 OpenOrbis).
 
-Status: **v00.12**. On the console the launcher works (text, firmware download, installing a VPK),
-PKGj runs (renderer on RADV, audio, dynarmic, the network), and Mortal Kombat (PCSE00023) runs
-its menus at 20-30 fps. Starting a fight the GPU hung, three times: v00.11's trace (RADV's
-per-draw markers) put it at the first draw of the fight whose vertex shader needs scratch, after
-four that finished; HTILE turned out not to matter. v00.12 turns Vita3K's memory mapping off (see
-"Graphics" below). Remember to install each new package from `/data/pkg`.
+Status: **v00.13**. On the console the launcher works (text, firmware download, installing a VPK),
+PKGj runs (renderer on RADV, audio, dynarmic, the network), and Mortal Kombat (PCSE00023) plays:
+v00.12 fixed the GPU hang at the start of a fight by turning Vita3K's memory mapping off (see
+"Graphics" below). The fights ran at 30 fps where the game wants 60, so in slow motion, with
+v00.12's GPU trace mode still on. v00.13 is the first speed build: the trace mode is off again,
+the CPU emulation uses dynarmic's fast floating point (see "CPU"), the log keeps info lines and
+up, and `vita3k.log` gets a `perf:` line every 10 s that says which thread holds the game back.
+Remember to install each new package from `/data/pkg`.
 
 ## Using it
 
@@ -59,6 +61,7 @@ When a game ends (or Exit in the pause menu) the app restarts into the launcher.
 | `/data/Vita3K/config.yml` | Vita3K's settings |
 | `/data/Vita3K/cache` | shader cache; `download/`: the firmware while it downloads |
 | `/data/Vita3K` | `vita3k.log`, `boot-trace.log` (startup milestones), `crash.log` (appended to); the run before's are `vita3k.prev.log` and `boot-trace.prev.log` (the app starts over after every game, so a game's log is there) |
+| `/data/Vita3K/trace-log` | an empty file there keeps Vita3K's trace and debug lines in the log (left out otherwise: thousands while a game loads, each a write to the file) |
 | `/app0` | the package: `eboot.bin`, `data/`, `shaders-builtin/`, `icons/`, `fonts/` |
 
 Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
@@ -89,7 +92,19 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
   reservation committed in 256 KiB steps as code is emitted (system flexible memory, else regular),
   with a 512 KiB constant pool. The prelude (some 4700 fastmem fallbacks, about 1.7 MiB, written
   with no commit on the way: v00.05 faulted there) gets an 8 MiB window, cut back to what it used
-  when it's done. Fastmem through dynarmic's POSIX fault handler (SIGSEGV and SIGBUS).
+  when it's done. Fastmem through dynarmic's POSIX fault handler (SIGSEGV and SIGBUS). The PS4's
+  Jaguar cores have no FMA, so dynarmic's accurate floating point did NEON's reciprocal steps and
+  estimates in soft-float, checked every result for NaNs and switched MXCSR around NEON
+  instructions; the PS4 build turns on its unsafe floating-point optimizations (yuzu's "Unsafe"
+  accuracy: unfused FMA, the host's estimates, no NaN fix-ups, no standard-FPSCR switch).
+  Exclusive accesses (the global monitor) stay accurate.
+- **Speed** (`perf:` lines in `vita3k.log`, every 10 s while a game runs): the game's frame rate,
+  the emulated vblanks a second (60 when the timing holds), where the render thread's time went
+  (waiting for the game's commands, showing frames, waiting for the GPU), how long the game's
+  threads waited for vblanks, and every thread busier than 3% of a core with its share (guest
+  threads by their own names, `render`, `pipeline compiler`, `audio mixer`, `vblank`; each reads
+  its own CPU clock, as the PS4 doesn't let a thread read another's). A Vita game that misses
+  its vblank runs at 30 fps and, for most, at half speed.
 - **Shaders**: Vita3K's USSE translator turned vector instructions predicated on `!p2` into
   unconditional ones (an upstream TODO); now they get their condition. Mortal Kombat's GPU hung
   right after such a shader, and a loop counting with one never ends: every translated loop also
