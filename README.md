@@ -4,10 +4,11 @@
 in WSL Ubuntu with the M33 / Resonance / DolphinPS4 / Crema PS4 toolchain (clang 21 + libc++ 21 on
 OpenOrbis).
 
-Status: **v00.06**. On the console the launcher works (v00.05: text, firmware download, installing
+Status: **v00.07**. On the console the launcher works (v00.05: text, firmware download, installing
 a VPK), and starting an app gets through the renderer (Vulkan on RADV), audio and loading the
 firmware modules; v00.05 then crashed creating the first guest thread's JIT (see "CPU" below),
-which v00.06 fixes. No game has run yet.
+which v00.06 fixes (its first test still ran v00.05: a package copied to `/data/pkg` has to be
+installed). v00.07 writes its version in `boot-trace.log` and `crash.log`. No game has run yet.
 
 ## Using it
 

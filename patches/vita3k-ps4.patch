@@ -3133,10 +3133,10 @@ index 00000000..0210098f
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..0254cb84
+index 00000000..33b3fb9a
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
-@@ -0,0 +1,354 @@
+@@ -0,0 +1,372 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -3192,6 +3192,7 @@ index 00000000..0254cb84
 +#include <chrono>
 +#include <cstdio>
 +#include <cstdlib>
++#include <cstring>
 +#include <exception>
 +#include <fstream>
 +#include <iterator>
@@ -3203,6 +3204,22 @@ index 00000000..0254cb84
 +namespace {
 +
 +EmuEnvState *crash_emuenv = nullptr;
++// The package's version (/app0/version.txt), in the logs: an app installed over an older one is
++// easy to forget (v00.06 was "tested" as v00.05)
++char app_version[32] = "dev";
++
++void read_app_version() {
++    FILE *f = std::fopen("/app0/version.txt", "r");
++    if (!f)
++        return;
++    char line[24] = {};
++    if (std::fgets(line, sizeof(line), f)) {
++        line[std::strcspn(line, "\r\n ")] = 0;
++        if (line[0])
++            std::snprintf(app_version, sizeof(app_version), "v%s", line);
++    }
++    std::fclose(f);
++}
 +
 +} // namespace
 +
@@ -3213,8 +3230,8 @@ index 00000000..0254cb84
 +    FILE *f = std::fopen("/data/Vita3K/crash.log", "a");
 +    if (!f)
 +        return;
-+    std::fprintf(f, "\n== Vita3K: %s (%s), the details are in vita3k.log\n", crash_emuenv->current_app_title.c_str(),
-+        crash_emuenv->app_info.app_title_id.c_str());
++    std::fprintf(f, "\n== Vita3K for PS4 %s: %s (%s), the details are in vita3k.log\n", app_version,
++        crash_emuenv->current_app_title.c_str(), crash_emuenv->app_info.app_title_id.c_str());
 +    std::fclose(f);
 +}
 +
@@ -3405,7 +3422,8 @@ index 00000000..0254cb84
 +
 +// main, inside its catch-all
 +int run_app() {
-+    trace("main");
++    read_app_version();
++    trace(std::string("main: Vita3K for PS4 ") + app_version);
 +    Root root_paths;
 +    app::init_paths(root_paths);
 +    // the launcher's text: the PS Vita's fonts once the font package is installed
@@ -3415,7 +3433,7 @@ index 00000000..0254cb84
 +    fs::create_directories(ps4launcher::INSTALL_DIR, ec);
 +    if (logging::init(root_paths, false) != Success)
 +        trace("logging could not start");
-+    LOG_INFO("Vita3K for PS4");
++    LOG_INFO("Vita3K for PS4 {}", app_version);
 +
 +    // CLI11 needs a program name (a PS4 app gets none)
 +    char program[] = "vita3k";
