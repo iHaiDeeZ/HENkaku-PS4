@@ -293,6 +293,7 @@ extern "C" int __real_close(int fd);
 extern "C" int ps4_netfs_is_path(const char* path);
 extern "C" int ps4_netfs_open(const char* path, int flags);
 extern "C" int ps4_netfs_close(int fd);
+extern "C" void ps4_fileat_closed(int fd);  // ps4_fileat.cpp
 
 extern "C" __attribute__((noinline)) int __wrap_open(const char* path, int flags, ...) {
     va_list args;
@@ -305,6 +306,8 @@ extern "C" __attribute__((noinline)) int __wrap_open(const char* path, int flags
 }
 
 extern "C" int __wrap_close(int fd) {
+    // (first: the number may be handed out again as soon as it's closed)
+    ps4_fileat_closed(fd);
     if (ps4_netfs_close(fd))
         return 0;
     return __real_close(fd);

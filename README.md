@@ -4,20 +4,22 @@
 in WSL Ubuntu with the M33 / Resonance / DolphinPS4 / Crema PS4 toolchain (clang 21 + libc++ 21 on
 OpenOrbis).
 
-Status: **v00.02**: builds and packages; not yet run on a console.
+Status: **v00.03**: v00.02 crashed at startup on the console (see "How the port works", file
+functions); v00.03 fixes that and downloads the firmware by itself. Not yet seen running.
 
 ## Using it
 
-1. Install `out/Vita3K-vXX.YY.pkg` with GoldHEN's Package Installer and start **Vita3K** once: it
-   creates `/data/Vita3K/`.
-2. Over FTP, copy to **`/data/Vita3K/install/`**:
-   - `PSVUPDAT.PUP`: the PS Vita firmware (Sony's update file; most games need it)
-   - `PSP2UPDAT.PUP`: the PS Vita font package
-   - games: `.vpk` or `.zip` archives, dumped game folders (with `sce_sys/param.sfo`), or a `.pkg`
-     with a `.zrif` text file of the same name holding its zRIF (or its `.rif` license next to it)
-3. In the launcher press **Triangle**: everything there is installed, and what installed moves to
+1. Install `out/Vita3K-vXX.YY.pkg` with GoldHEN's Package Installer and start **Vita3K**.
+2. The first time, the launcher downloads the PS Vita firmware (3.74, 128 MiB) and font package
+   (54 MiB) from Sony's update server and installs them. Circle stops the download (it carries on
+   later, and doesn't start by itself again); Square starts it. Without a connection, copy Sony's
+   update files (`PSVUPDAT.PUP`, `PSP2UPDAT.PUP`) to `/data/Vita3K/install/` instead.
+3. Over FTP, copy games to **`/data/Vita3K/install/`**: `.vpk` or `.zip` archives, dumped game
+   folders (with `sce_sys/param.sfo`), or a `.pkg` with a `.zrif` text file of the same name
+   holding its zRIF (or its `.rif` license next to it).
+4. In the launcher press **Triangle**: everything there is installed, and what installed moves to
    `install/done/`.
-4. Pick a game and press **Cross**.
+5. Pick a game and press **Cross**.
 
 | DualShock 4 | PS Vita |
 |---|---|
@@ -36,9 +38,10 @@ When a game ends (or Exit in the pause menu) the app restarts into the launcher.
 | Path | What |
 |---|---|
 | `/data/Vita3K/install` | what the launcher installs (Triangle); `done/` afterwards |
+| `/data/Vita3K/cache/download/stopped` | there after Circle stopped the firmware download (Square starts it again) |
 | `/data/Vita3K/fs` | the Vita's file system: `ux0` (apps, saves), `vs0`/`os0`/`sa0`/`pd0` (firmware) |
 | `/data/Vita3K/config.yml` | Vita3K's settings |
-| `/data/Vita3K/cache` | shader cache |
+| `/data/Vita3K/cache` | shader cache; `download/`: the firmware while it downloads |
 | `/data/Vita3K` | `vita3k.log`, `boot-trace.log` (startup milestones), `crash.log` |
 | `/app0` | the package: `eboot.bin`, `data/`, `shaders-builtin/`, `icons/` |
 
@@ -71,7 +74,16 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
   events, motion as sensor events (`ps4_pad.cpp`).
 - **SDL3**: built for the console (`scripts/build-sdl3.sh`) for Vita3K's core services only (threads,
   timers, surfaces, gamepad and sensor types); dummy video and audio drivers.
+- **Firmware download** (`ps4_download.cpp`, `ps4_launcher.cpp`): libcurl over plain HTTP from
+  Sony's update server (the URLs Vita3K's welcome dialog links to), resumed from a `.part` file,
+  checked against the expected size, then `install_pup`.
 - **Libraries**: Boost 1.89, OpenSSL, curl and FFmpeg 7.1 from M33's sysroot.
+- **File functions** (`port/ps4_fileat.cpp`): the OpenOrbis C library has `fstatat`, `unlinkat`,
+  `fchmodat` and `utimensat` only as stubs failing with ENOSYS, and the sysroot's Boost.Filesystem
+  uses them for every status check and removal (v00.02 died at its first `create_directories`).
+  Linker wraps implement them with `stat`, `lstat`, `open`, `unlink`, `rmdir`, `chmod` and `utimes`;
+  `openat` remembers which path each directory descriptor stands for. `statvfs` is wrapped too:
+  the C library's never fills in its result.
 - **Runtime** (`port/`, from M33): heap, crash and boot logs, profiler, DNS, the RADV winsys.
 
 ## Building

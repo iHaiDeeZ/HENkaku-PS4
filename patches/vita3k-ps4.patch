@@ -987,10 +987,10 @@ index 117569cf2..bd15b552 100644
          result.font_names.emplace_back("NotoSansCJK-Regular.ttc");
 diff --git a/vita3k/ps4/ps4.cmake b/vita3k/ps4/ps4.cmake
 new file mode 100644
-index 00000000..38518fbc
+index 00000000..9a597d5e
 --- /dev/null
 +++ b/vita3k/ps4/ps4.cmake
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,35 @@
 +# PS4: Vita3K's frontend for the console, included from vita3k/CMakeLists.txt once the vita3k target
 +# exists. Built with the port's toolchain (toolchain/ps4-vita3k.cmake, and ps4-love-style.cmake as
 +# the project include: PS4_RUNTIME_SOURCES, ps4_link_mesa, ps4_add_eboot).
@@ -999,6 +999,8 @@ index 00000000..38518fbc
 +	ps4/ps4_main.cpp
 +	ps4/ps4_canvas.cpp
 +	ps4/ps4_canvas.h
++	ps4/ps4_download.cpp
++	ps4/ps4_download.h
 +	ps4/ps4_launcher.cpp
 +	ps4/ps4_launcher.h
 +	ps4/ps4_pad.cpp
@@ -1011,6 +1013,8 @@ index 00000000..38518fbc
 +# archive.h and the other headers next to main.cpp
 +target_include_directories(vita3k PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 +target_link_libraries(vita3k PRIVATE emuenv mem overlay stb vulkan SDL3::SDL3)
++# the launcher's firmware download (ps4_download.cpp)
++target_link_libraries(vita3k PRIVATE libcurl)
 +
 +# The network library's shares (port/ps4_netfs.cpp: SMB and NFS under /net)
 +target_link_libraries(vita3k PRIVATE ${PS4_SYSROOT}/lib/libnfs.a ${PS4_SYSROOT}/lib/libsmb2.a)
@@ -1559,12 +1563,236 @@ index 00000000..68141c2f
 +bool fonts_loaded();
 +
 +} // namespace ps4ui
+diff --git a/vita3k/ps4/ps4_download.cpp b/vita3k/ps4/ps4_download.cpp
+new file mode 100644
+index 00000000..e3695b45
+--- /dev/null
++++ b/vita3k/ps4/ps4_download.cpp
+@@ -0,0 +1,164 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// PS4: downloads with libcurl, which Vita3K links already (net_utils). Host names go through the
++// console's resolver (port/ps4_net.cpp wraps getaddrinfo); nothing here needs TLS, Sony's update
++// server is plain HTTP.
++
++#include "ps4_download.h"
++
++#include <util/log.h>
++
++#include <curl/curl.h>
++#include <fmt/format.h>
++
++#include <csignal>
++#include <cstdio>
++#include <mutex>
++
++namespace ps4download {
++
++namespace {
++
++const char *const SAVE_FAILED = "it couldn't be saved (is the PS4's storage full?)";
++
++struct Transfer {
++    FILE *file = nullptr;
++    uint64_t resumed = 0; // what the .part file had already
++    const Progress *progress = nullptr;
++    bool write_failed = false;
++};
++
++size_t on_data(char *data, size_t size, size_t count, void *user) {
++    auto *t = static_cast<Transfer *>(user);
++    const size_t bytes = size * count;
++    if (std::fwrite(data, 1, bytes, t->file) != bytes) {
++        t->write_failed = true;
++        return 0; // curl stops with CURLE_WRITE_ERROR
++    }
++    return bytes;
++}
++
++int on_progress(void *user, curl_off_t, curl_off_t now, curl_off_t, curl_off_t) {
++    auto *t = static_cast<Transfer *>(user);
++    return (*t->progress)(t->resumed + static_cast<uint64_t>(now)) ? 0 : 1;
++}
++
++std::string describe(CURLcode code, long http_status, const Transfer &t, const char *details) {
++    switch (code) {
++    case CURLE_COULDNT_RESOLVE_HOST:
++        return "the server couldn't be found (is the PS4 online?)";
++    case CURLE_COULDNT_CONNECT:
++        return "the server couldn't be reached";
++    case CURLE_OPERATION_TIMEDOUT:
++        return "the connection stalled";
++    case CURLE_HTTP_RETURNED_ERROR:
++        return fmt::format("the server answered {}", http_status);
++    case CURLE_WRITE_ERROR:
++        if (t.write_failed)
++            return SAVE_FAILED;
++        break;
++    default:
++        break;
++    }
++    return *details ? details : curl_easy_strerror(code);
++}
++
++uint64_t size_of(const fs::path &path) {
++    boost::system::error_code ec;
++    const auto size = fs::file_size(path, ec);
++    return ec ? 0 : static_cast<uint64_t>(size);
++}
++
++} // namespace
++
++Result download(const std::string &url, const fs::path &path, uint64_t size, const Progress &progress) {
++    static std::once_flag init;
++    std::call_once(init, [] {
++        curl_global_init(CURL_GLOBAL_DEFAULT);
++        // a server that closes the connection raises SIGPIPE on the next write, which would end the app
++        std::signal(SIGPIPE, SIG_IGN);
++    });
++    boost::system::error_code ec;
++    if (size_of(path) == size)
++        return { Status::Done, {} };
++    fs::path part = path;
++    part += ".part";
++    uint64_t have = size_of(part);
++    if (have > size) {
++        fs::remove(part, ec);
++        have = 0;
++    }
++
++    // a second round only when the server wouldn't carry on where the .part file ends
++    for (int round = 0; round < 2 && have < size; round++) {
++        FILE *file = std::fopen(part.string().c_str(), have ? "ab" : "wb");
++        if (!file)
++            return { Status::Failed, "it couldn't be saved in " + part.parent_path().string() };
++        std::setvbuf(file, nullptr, _IOFBF, 1 << 20);
++        Transfer t{ file, have, &progress };
++        char details[CURL_ERROR_SIZE] = {};
++        CURL *curl = curl_easy_init();
++        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
++        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Vita3K");
++        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
++        curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
++        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
++        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 20L);
++        // nothing for 30 s: give up (the next try carries on)
++        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
++        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 30L);
++        curl_easy_setopt(curl, CURLOPT_RESUME_FROM_LARGE, static_cast<curl_off_t>(have));
++        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, on_data);
++        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &t);
++        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
++        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, on_progress);
++        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &t);
++        curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, details);
++        const CURLcode code = curl_easy_perform(curl);
++        long status = 0;
++        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
++        curl_easy_cleanup(curl);
++        if (std::fclose(file) != 0 && code == CURLE_OK)
++            return { Status::Failed, SAVE_FAILED };
++        if (code == CURLE_ABORTED_BY_CALLBACK)
++            return { Status::Stopped, {} };
++        if (code == CURLE_RANGE_ERROR || status == 416) {
++            // the server would send all of it again, or the .part file isn't part of what it has
++            LOG_WARN("Download of {}: no resuming at {} (HTTP {}), starting over", url, have, status);
++            fs::remove(part, ec);
++            have = 0;
++            continue;
++        }
++        if (code != CURLE_OK) {
++            LOG_ERROR("Download of {} failed: {} ({}, HTTP {})", url, details, curl_easy_strerror(code), status);
++            return { Status::Failed, describe(code, status, t, details) };
++        }
++        have = size_of(part);
++    }
++    if (have != size) {
++        LOG_ERROR("Download of {}: {} bytes, expected {}", url, have, size);
++        fs::remove(part, ec);
++        return { Status::Failed, have < size ? "the download ended early" : "the server's file isn't the expected one" };
++    }
++    fs::rename(part, path, ec);
++    if (ec)
++        return { Status::Failed, "it couldn't be saved: " + ec.message() };
++    return { Status::Done, {} };
++}
++
++} // namespace ps4download
+diff --git a/vita3k/ps4/ps4_download.h b/vita3k/ps4/ps4_download.h
+new file mode 100644
+index 00000000..01fdf0f1
+--- /dev/null
++++ b/vita3k/ps4/ps4_download.h
+@@ -0,0 +1,48 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// PS4: HTTP downloads (ps4_download.cpp), for the PS Vita firmware the launcher gets from Sony.
++
++#pragma once
++
++#include <util/fs.h>
++
++#include <cstdint>
++#include <functional>
++#include <string>
++
++namespace ps4download {
++
++// Told how many bytes there are so far; returning false stops the download.
++using Progress = std::function<bool(uint64_t done)>;
++
++enum class Status {
++    Done,
++    Stopped,
++    Failed,
++};
++
++struct Result {
++    Status status = Status::Failed;
++    std::string error; // why it failed, for the user
++};
++
++// Downloads url to path, which must come out `size` bytes long. Until it's complete the file is
++// path + ".part", and the next call for it carries on from where this one stopped.
++Result download(const std::string &url, const fs::path &path, uint64_t size, const Progress &progress);
++
++} // namespace ps4download
 diff --git a/vita3k/ps4/ps4_launcher.cpp b/vita3k/ps4/ps4_launcher.cpp
 new file mode 100644
-index 00000000..d4d39cef
+index 00000000..a300ebf7
 --- /dev/null
 +++ b/vita3k/ps4/ps4_launcher.cpp
-@@ -0,0 +1,603 @@
+@@ -0,0 +1,837 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -1585,12 +1813,14 @@ index 00000000..d4d39cef
 +// PS4: the launcher, in place of the desktop's Qt window: the installed apps with their icons,
 +// and installing what the user copied to /data/Vita3K/install (the PS Vita firmware and font
 +// package .PUP files, .vpk/.zip archives, .pkg files with their zRIF or .rif license, dumped game
-+// folders). Drawn by the CPU into VideoOut buffers 12-13, so it needs no Vulkan; the renderer's
-+// swapchain takes over the screen with its first flip.
++// folders). When the firmware or the font package isn't installed, it downloads them from Sony's
++// update server first. Drawn by the CPU into VideoOut buffers 12-13, so it needs no Vulkan; the
++// renderer's swapchain takes over the screen with its first flip.
 +
 +#include "ps4_launcher.h"
 +
 +#include "ps4_canvas.h"
++#include "ps4_download.h"
 +#include "ps4_pad.h"
 +#include "ps4_wsi.h"
 +
@@ -1613,7 +1843,9 @@ index 00000000..d4d39cef
 +#include <algorithm>
 +#include <atomic>
 +#include <chrono>
++#include <cstdint>
 +#include <cstring>
++#include <functional>
 +#include <map>
 +#include <mutex>
 +#include <thread>
@@ -1623,6 +1855,7 @@ index 00000000..d4d39cef
 +int32_t ps4l_allocate_direct(off_t start, off_t end, size_t len, size_t align, int32_t type, off_t *phys) __asm__("sceKernelAllocateDirectMemory");
 +int32_t ps4l_map_direct(void **addr, size_t len, int32_t prot, int32_t flags, off_t phys, size_t align) __asm__("sceKernelMapDirectMemory");
 +size_t ps4l_direct_memory_size() __asm__("sceKernelGetDirectMemorySize");
++void ps4_boot_trace(const char *line); // port/ps4_crashlog.cpp
 +}
 +
 +namespace ps4launcher {
@@ -1752,7 +1985,7 @@ index 00000000..d4d39cef
 +    c.fill_rect(MARGIN, 172, W - 2 * MARGIN, 2, rgb(0xffffff, 28));
 +}
 +
-+void footer(Canvas &c, bool have_apps) {
++void footer(Canvas &c, bool have_apps, bool firmware_missing) {
 +    int x = MARGIN;
 +    const int y = 1024;
 +    if (have_apps) {
@@ -1763,6 +1996,11 @@ index 00000000..d4d39cef
 +    c.triangle_button(x + 20.f, y - 10.f, 20.f);
 +    x += 50;
 +    x += c.text(x, y, "Install from /data/Vita3K/install", 30, TEXT) + 48;
++    if (firmware_missing) {
++        c.square_button(x + 20.f, y - 10.f, 20.f);
++        x += 50;
++        x += c.text(x, y, "Download firmware", 30, TEXT) + 48;
++    }
 +    c.pill_button(x, y - 10, "OPTIONS", 22);
 +    x += c.text_width("OPTIONS", 22, Weight::Bold) + 40;
 +    c.text(x, y, "Quit", 30, TEXT);
@@ -1811,14 +2049,44 @@ index 00000000..d4d39cef
 +    std::thread thread;
 +    std::atomic<bool> running{ false };
 +    std::atomic<bool> finished{ false };
++    bool firmware = false; // the firmware download, rather than the install folder
 +    std::mutex mutex;
++    std::string heading; // what the firmware download is doing
 +    std::string current;
 +    float progress = 0; // of the current file, 0-1
 +    int index = 0;
 +    int total = 0;
 +    int installed = 0;
++    bool stoppable = false; // a download, which Circle stops
++    bool stop_requested = false;
++    bool stopped = false;
++    std::vector<std::string> done; // what the firmware download installed
 +    std::vector<std::string> failures;
 +};
++
++void reset(InstallJob &job, bool firmware) {
++    job.running = true;
++    job.finished = false;
++    job.firmware = firmware;
++    const std::lock_guard<std::mutex> lock(job.mutex);
++    job.heading.clear();
++    job.current.clear();
++    job.progress = 0;
++    job.index = job.total = job.installed = 0;
++    job.stoppable = job.stop_requested = job.stopped = false;
++    job.done.clear();
++    job.failures.clear();
++}
++
++// install_pup, which throws when a file isn't what it expects: the firmware's version, or nothing
++std::string install_update(EmuEnvState &emuenv, const fs::path &pup, const std::function<void(float)> &progress) {
++    try {
++        return install_pup(emuenv.vita_fs_path, pup, [&](uint32_t percent) { progress(percent / 100.f); });
++    } catch (const std::exception &e) {
++        LOG_ERROR("PS4 launcher: {} couldn't be installed: {}", pup, e.what());
++        return {};
++    }
++}
 +
 +std::string read_zrif(const fs::path &pkg) {
 +    for (const char *ext : { ".zrif", ".txt" }) {
@@ -1897,49 +2165,204 @@ index 00000000..d4d39cef
 +        }
 +    };
 +
-+    // licenses first: the packages after them may need them
-+    for (const auto &p : licenses) {
-+        begin(p);
-+        finish(p, copy_license(emuenv, p), "not a valid license");
-+    }
-+    for (const auto &p : pups) {
-+        begin(p);
-+        const std::string version = install_pup(emuenv.vita_fs_path, p, [&](uint32_t percent) { set_progress(percent / 100.f); });
-+        finish(p, !version.empty(), "not a PS Vita firmware or font package");
-+    }
-+    for (const auto &p : pkgs) {
-+        begin(p);
-+        std::string zrif = read_zrif(p);
-+        if (zrif.empty())
-+            zrif = find_pkg_zrif(p, emuenv.vita_fs_path);
-+        if (zrif.empty()) {
-+            finish(p, false, "no license: put its zRIF in a .zrif file of the same name, or its .rif next to it");
-+            continue;
++    // (an exception here would end the app: it stops the installing instead, as a failure)
++    try {
++        // licenses first: the packages after them may need them
++        for (const auto &p : licenses) {
++            begin(p);
++            finish(p, copy_license(emuenv, p), "not a valid license");
 +        }
-+        finish(p, install_pkg(p, emuenv, zrif, set_progress), "the package couldn't be installed");
++        for (const auto &p : pups) {
++            begin(p);
++            const std::string version = install_update(emuenv, p, set_progress);
++            finish(p, !version.empty(), "not a PS Vita firmware or font package");
++        }
++        for (const auto &p : pkgs) {
++            begin(p);
++            std::string zrif = read_zrif(p);
++            if (zrif.empty())
++                zrif = find_pkg_zrif(p, emuenv.vita_fs_path);
++            if (zrif.empty()) {
++                finish(p, false, "no license: put its zRIF in a .zrif file of the same name, or its .rif next to it");
++                continue;
++            }
++            finish(p, install_pkg(p, emuenv, zrif, set_progress), "the package couldn't be installed");
++        }
++        for (const auto &p : archives) {
++            begin(p);
++            const auto contents = install_archive(emuenv, p, [&](ArchiveContents progress) {
++                if (progress.progress)
++                    set_progress(*progress.progress);
++                else if (progress.count && progress.current && *progress.count > 0)
++                    set_progress(*progress.current / *progress.count);
++            });
++            const bool ok = !contents.empty() && std::all_of(contents.begin(), contents.end(), [](const ContentInfo &c) { return c.state; });
++            finish(p, ok, "nothing in it could be installed");
++        }
++        for (const auto &p : folders) {
++            begin(p);
++            finish(p, install_contents(emuenv, p) > 0, "not an app folder");
++        }
++        app::init_apps_list(emuenv);
++    } catch (const std::exception &e) {
++        const std::lock_guard<std::mutex> lock(job.mutex);
++        job.failures.push_back(job.current + ": " + e.what());
++        LOG_ERROR("PS4 launcher: installing {} stopped: {}", job.current, e.what());
 +    }
-+    for (const auto &p : archives) {
-+        begin(p);
-+        const auto contents = install_archive(emuenv, p, [&](ArchiveContents progress) {
-+            if (progress.progress)
-+                set_progress(*progress.progress);
-+            else if (progress.count && progress.current && *progress.count > 0)
-+                set_progress(*progress.current / *progress.count);
-+        });
-+        const bool ok = !contents.empty() && std::all_of(contents.begin(), contents.end(), [](const ContentInfo &c) { return c.state; });
-+        finish(p, ok, "nothing in it could be installed");
-+    }
-+    for (const auto &p : folders) {
-+        begin(p);
-+        finish(p, install_contents(emuenv, p) > 0, "not an app folder");
-+    }
++    job.finished = true;
++}
 +
-+    app::init_apps_list(emuenv);
++// --- the firmware, from Sony ---
++
++// What Vita3K's welcome dialog sends the user to: the system software on Sony's support page
++// (3.74, the last there is) and the font package
++struct FirmwareDownload {
++    const char *name;
++    const char *file;
++    const char *url;
++    uint64_t size;
++};
++
++const FirmwareDownload FIRMWARE{
++    "the PS Vita firmware",
++    "PSVUPDAT.PUP",
++    "http://dus01.psv.update.playstation.net/update/psv/image/2022_0209/rel_f2c7b12fe85496ec88a0391b514d6e3b/PSVUPDAT.PUP?dest=us",
++    133834240,
++};
++const FirmwareDownload FONT_PACKAGE{
++    "the PS Vita font package",
++    "PSP2UPDAT.PUP",
++    "http://dus01.psp2.update.playstation.net/update/psp2/image/2019_0924/sd_8b5f60b56c3da8365b973dba570c53a5/PSP2UPDAT.PUP?dest=us",
++    56768512,
++};
++
++constexpr const char *DOWNLOAD_DIR = "/data/Vita3K/cache/download";
++// there once the user stopped a download: it doesn't start by itself again (Square still starts it)
++constexpr const char *DOWNLOAD_STOPPED = "/data/Vita3K/cache/download/stopped";
++
++std::vector<const FirmwareDownload *> missing_firmware(const app::FirmwareState &fw) {
++    std::vector<const FirmwareDownload *> missing;
++    if (!fw.main_firmware)
++        missing.push_back(&FIRMWARE);
++    if (!fw.font_package)
++        missing.push_back(&FONT_PACKAGE);
++    return missing;
++}
++
++// Update files the user copied to the install folder (Triangle installs them)
++bool updates_waiting() {
++    boost::system::error_code ec;
++    for (const auto &e : fs::directory_iterator(INSTALL_DIR, ec)) {
++        if (string_utils::tolower(e.path().extension().string()) == ".pup")
++            return true;
++    }
++    return false;
++}
++
++// Downloads each missing package and installs it. A download Circle stopped stays in DOWNLOAD_DIR
++// and carries on the next time; an installed one is deleted.
++void firmware_worker(EmuEnvState &emuenv, InstallJob &job, const std::vector<const FirmwareDownload *> &downloads) {
++    boost::system::error_code ec;
++    fs::create_directories(DOWNLOAD_DIR, ec);
++    fs::remove(DOWNLOAD_STOPPED, ec);
++    {
++        const std::lock_guard<std::mutex> lock(job.mutex);
++        job.total = static_cast<int>(downloads.size());
++    }
++    // (an exception here would end the app: it stops the download instead, as a failure)
++    try {
++        for (const FirmwareDownload *d : downloads) {
++            const std::string name = d->name;
++            const fs::path file = fs::path(DOWNLOAD_DIR) / d->file;
++            {
++                const std::lock_guard<std::mutex> lock(job.mutex);
++                job.index++;
++                job.heading = "Downloading " + name;
++                job.current = "From Sony's update server";
++                job.progress = 0;
++                job.stoppable = true;
++            }
++            ps4_boot_trace(fmt::format("firmware: downloading {}", d->file).c_str());
++            LOG_INFO("PS4 launcher: downloading {} from {}", name, d->url);
++            // the speed, over a second or so
++            Clock::time_point mark_time{};
++            uint64_t mark_bytes = UINT64_MAX;
++            double speed = 0;
++            const ps4download::Result result = ps4download::download(d->url, file, d->size, [&](uint64_t done) {
++                const auto now = Clock::now();
++                if (mark_bytes == UINT64_MAX || done < mark_bytes) {
++                    mark_time = now;
++                    mark_bytes = done;
++                } else if (now - mark_time >= std::chrono::seconds(1)) {
++                    speed = (done - mark_bytes) / std::chrono::duration<double>(now - mark_time).count();
++                    mark_time = now;
++                    mark_bytes = done;
++                }
++                const std::lock_guard<std::mutex> lock(job.mutex);
++                job.progress = static_cast<float>(static_cast<double>(done) / d->size);
++                job.current = fmt::format("{} of {} MB", done >> 20, d->size >> 20);
++                if (speed > 0)
++                    job.current += fmt::format("   {:.1f} MB/s", speed / (1 << 20));
++                return !job.stop_requested;
++            });
++            if (result.status != ps4download::Status::Done) {
++                const std::lock_guard<std::mutex> lock(job.mutex);
++                if (result.status == ps4download::Status::Stopped) {
++                    job.stopped = true;
++                    if (FILE *f = std::fopen(DOWNLOAD_STOPPED, "w"))
++                        std::fclose(f);
++                    ps4_boot_trace("firmware: stopped");
++                } else {
++                    job.failures.push_back("Couldn't download " + name + ": " + result.error);
++                    ps4_boot_trace(("firmware: " + result.error).c_str());
++                }
++                break;
++            }
++            {
++                const std::lock_guard<std::mutex> lock(job.mutex);
++                job.heading = "Installing " + name;
++                job.current = "This can take a few minutes";
++                job.progress = 0;
++                job.stoppable = false;
++            }
++            ps4_boot_trace(fmt::format("firmware: installing {}", d->file).c_str());
++            const std::string version = install_update(emuenv, file, [&](float v) {
++                const std::lock_guard<std::mutex> lock(job.mutex);
++                job.progress = v;
++            });
++            // a broken download is fetched again the next time
++            fs::remove(file, ec);
++            const std::lock_guard<std::mutex> lock(job.mutex);
++            if (version.empty()) {
++                job.failures.push_back("Couldn't install " + name + " (it is downloaded again next time)");
++                ps4_boot_trace("firmware: install failed");
++                break;
++            }
++            LOG_INFO("PS4 launcher: installed {} {}", name, version);
++            ps4_boot_trace(fmt::format("firmware: installed {}", version).c_str());
++            job.installed++;
++            job.done.push_back(name);
++        }
++    } catch (const std::exception &e) {
++        const std::lock_guard<std::mutex> lock(job.mutex);
++        job.failures.push_back("The firmware download stopped: " + std::string(e.what()));
++        ps4_boot_trace(fmt::format("firmware: {}", e.what()).c_str());
++    }
 +    job.finished = true;
 +}
 +
 +std::string summary(InstallJob &job) {
 +    const std::lock_guard<std::mutex> lock(job.mutex);
++    if (job.firmware) {
++        std::string text;
++        for (size_t i = 0; i < job.done.size(); i++)
++            text += (i == 0 ? "Installed " : " and ") + job.done[i];
++        if (job.stopped)
++            text += std::string(text.empty() ? "" : "\n") + "Download stopped: Square carries on with it";
++        for (const auto &failure : job.failures)
++            text += (text.empty() ? "" : "\n") + failure + ". Square tries again";
++        return text;
++    }
 +    if (job.total == 0)
 +        return std::string("Nothing to install: copy files to ") + INSTALL_DIR + " first";
 +    std::string text = fmt::format("Installed {} of {}", job.installed, job.total);
@@ -1953,22 +2376,38 @@ index 00000000..d4d39cef
 +    const int pw = 1100, ph = 300;
 +    const int px = (W - pw) / 2, py = (H - ph) / 2;
 +    c.fill_round_rect(px, py, pw, ph, 28, rgb(0x14213a));
-+    std::string current;
++    std::string heading, current;
 +    float progress;
 +    int index, total;
++    bool stoppable, stopping;
 +    {
 +        const std::lock_guard<std::mutex> lock(job.mutex);
++        heading = job.heading;
 +        current = job.current;
 +        progress = job.progress;
 +        index = job.index;
 +        total = job.total;
++        stoppable = job.stoppable;
++        stopping = job.stop_requested;
 +    }
-+    c.text(px + 56, py + 92, total ? fmt::format("Installing {} of {}", std::max(index, 1), total) : std::string("Looking for files"), 44, TEXT, Weight::Bold);
++    if (heading.empty())
++        heading = total ? fmt::format("Installing {} of {}", std::max(index, 1), total) : std::string("Looking for files");
++    else if (total > 1)
++        heading += fmt::format(" ({} of {})", std::max(index, 1), total);
++    c.text(px + 56, py + 92, heading, 44, TEXT, Weight::Bold, pw - 112);
 +    c.text(px + 56, py + 150, current, 30, MUTED, Weight::Regular, pw - 112);
 +    c.fill_round_rect(px + 56, py + 196, pw - 112, 22, 11, rgb(0xffffff, 30));
 +    if (progress > 0)
 +        c.fill_round_rect(px + 56, py + 196, std::max(22, static_cast<int>((pw - 112) * progress)), 22, 11, ACCENT);
 +    c.text(px + 56, py + 264, fmt::format("{}%", static_cast<int>(progress * 100)), 26, MUTED);
++    if (stoppable) {
++        const char *label = stopping ? "Stopping" : "Stop";
++        const int right = px + pw - 56;
++        const int lw = c.text_width(label, 26);
++        c.text(right - lw, py + 264, label, 26, stopping ? MUTED : TEXT);
++        if (!stopping)
++            c.circle_button(right - lw - 30.f, py + 255.f, 18.f);
++    }
 +}
 +
 +void draw_list(Canvas &c, std::vector<Item> &items, int selected, int top) {
@@ -1977,11 +2416,11 @@ index 00000000..d4d39cef
 +        c.fill_round_rect(MARGIN, LIST_Y + 20, cw, 600, 32, rgb(0x14213a, 220));
 +        c.text(MARGIN + 64, LIST_Y + 120, "No games yet", 52, TEXT, Weight::Bold);
 +        const int y = c.text_wrapped(MARGIN + 64, LIST_Y + 200,
-+            "Copy these to /data/Vita3K/install over FTP, then press Triangle:", 32, MUTED, cw - 128, 46);
++            "Copy games to /data/Vita3K/install over FTP, then press Triangle:", 32, MUTED, cw - 128, 46);
 +        const char *lines[] = {
-+            "PSVUPDAT.PUP: the PS Vita firmware (from Sony's update page)",
-+            "PSP2UPDAT.PUP: the PS Vita font package",
-+            "Games: .vpk or .zip files, dumped game folders, or a .pkg with a .zrif file of the same name holding its zRIF",
++            ".vpk or .zip files, or dumped game folders",
++            "a .pkg, with a .zrif file of the same name holding its zRIF",
++            "The PS Vita firmware and font package download from Sony when they're missing (Square), or install from their .PUP files there",
 +        };
 +        int ly = y + 24;
 +        for (const char *line : lines) {
@@ -2070,11 +2509,26 @@ index 00000000..d4d39cef
 +    }
 +    std::string notice = notice_text;
 +    auto notice_until = Clock::now() + std::chrono::seconds(notice.empty() ? 0 : 12);
-+    if (!fw.main_firmware && notice.empty()) {
-+        notice = "The PS Vita firmware isn't installed: most games need it. Copy PSVUPDAT.PUP and PSP2UPDAT.PUP to /data/Vita3K/install and press Triangle.";
-+        notice_until = Clock::now() + std::chrono::hours(1);
-+    }
 +    InstallJob job;
++    const auto start_firmware = [&] {
++        reset(job, true);
++        job.thread = std::thread([&emuenv, &job, downloads = missing_firmware(fw)] { firmware_worker(emuenv, job, downloads); });
++        notice.clear();
++    };
++    // What's missing of the firmware comes from Sony by itself, unless the user stopped that
++    // before or copied update files to install
++    if (!missing_firmware(fw).empty()) {
++        boost::system::error_code ec;
++        if (!fs::exists(DOWNLOAD_STOPPED, ec) && !updates_waiting()) {
++            start_firmware();
++        } else if (notice.empty()) {
++            if (updates_waiting())
++                notice = "Press Triangle to install the update files in /data/Vita3K/install";
++            else
++                notice = std::string(fw.main_firmware ? "The PS Vita font package isn't installed: some games need it." : "The PS Vita firmware isn't installed: most games need it.") + " Press Square to download it from Sony.";
++            notice_until = Clock::now() + std::chrono::hours(1);
++        }
++    }
 +
 +    // buttons held from the game don't count as presses here
 +    uint32_t previous = ps4pad::read().buttons;
@@ -2105,9 +2559,17 @@ index 00000000..d4d39cef
 +                notice = summary(job);
 +                notice_until = now + std::chrono::seconds(20);
 +                dirty = true;
-+            } else if (now - last_progress > std::chrono::milliseconds(100)) {
-+                last_progress = now;
-+                dirty = true;
++            } else {
++                // Circle stops a download
++                if ((pressed & ORBIS_PAD_BUTTON_CIRCLE) && job.firmware) {
++                    const std::lock_guard<std::mutex> lock(job.mutex);
++                    if (job.stoppable)
++                        job.stop_requested = true;
++                }
++                if (now - last_progress > std::chrono::milliseconds(100)) {
++                    last_progress = now;
++                    dirty = true;
++                }
 +            }
 +        } else {
 +            int dir = (buttons & ORBIS_PAD_BUTTON_UP) ? -1 : (buttons & ORBIS_PAD_BUTTON_DOWN) ? 1 : 0;
@@ -2131,16 +2593,16 @@ index 00000000..d4d39cef
 +                return Choice{ false, item.entry.path, item.entry.title };
 +            }
 +            if (pressed & ORBIS_PAD_BUTTON_TRIANGLE) {
-+                job.finished = false;
-+                job.running = true;
-+                job.index = job.total = job.installed = 0;
-+                job.failures.clear();
++                reset(job, false);
 +                job.thread = std::thread([&emuenv, &job] { install_worker(emuenv, job); });
 +                notice.clear();
 +                dirty = true;
-+            }
-+            if (pressed & ORBIS_PAD_BUTTON_OPTIONS)
++            } else if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && !missing_firmware(fw).empty()) {
++                start_firmware();
++                dirty = true;
++            } else if (pressed & ORBIS_PAD_BUTTON_OPTIONS) {
 +                return Choice{ true, {}, {} };
++            }
 +        }
 +        if (!notice.empty() && now >= notice_until) {
 +            notice.clear();
@@ -2157,7 +2619,7 @@ index 00000000..d4d39cef
 +            header(canvas, fw);
 +            draw_list(canvas, items, selected, top);
 +            draw_notice(canvas, notice);
-+            footer(canvas, !items.empty());
++            footer(canvas, !items.empty(), !missing_firmware(fw).empty());
 +            if (job.running)
 +                draw_install(canvas, job);
 +            present(canvas);
@@ -2220,10 +2682,10 @@ index 00000000..0210098f
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..7f8779be
+index 00000000..927fe680
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
-@@ -0,0 +1,332 @@
+@@ -0,0 +1,348 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -2278,6 +2740,7 @@ index 00000000..7f8779be
 +#include <chrono>
 +#include <cstdio>
 +#include <cstdlib>
++#include <exception>
 +#include <fstream>
 +#include <iterator>
 +#include <optional>
@@ -2488,9 +2951,8 @@ index 00000000..7f8779be
 +    return notice;
 +}
 +
-+} // namespace
-+
-+int main(int argc, char *argv[]) {
++// main, inside its catch-all
++int run_app() {
 +    trace("main");
 +    Root root_paths;
 +    app::init_paths(root_paths);
@@ -2504,8 +2966,6 @@ index 00000000..7f8779be
 +    // CLI11 needs a program name (a PS4 app gets none)
 +    char program[] = "vita3k";
 +    char *args[] = { program, nullptr };
-+    (void)argc;
-+    (void)argv;
 +    Config cfg{};
 +    EmuEnvState emuenv;
 +    crash_emuenv = &emuenv;
@@ -2555,6 +3015,24 @@ index 00000000..7f8779be
 +    if (following)
 +        save_relaunch(*following);
 +    restart(notice);
++}
++
++} // namespace
++
++int main(int argc, char *argv[]) {
++    (void)argc;
++    (void)argv;
++    try {
++        return run_app();
++    } catch (const std::exception &e) {
++        // what nothing else caught goes on the screen (and in the logs) rather than the app vanishing
++        trace(std::string("uncaught exception: ") + e.what());
++        LOG_ERROR("Uncaught exception: {}", e.what());
++        ps4launcher::show_message("Vita3K stopped", e.what());
++        std::this_thread::sleep_for(std::chrono::seconds(15));
++        sceSystemServiceLoadExec("exit", nullptr);
++        return 1;
++    }
 +}
 diff --git a/vita3k/ps4/ps4_pad.cpp b/vita3k/ps4/ps4_pad.cpp
 new file mode 100644
