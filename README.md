@@ -4,11 +4,12 @@
 in WSL Ubuntu with the M33 / Resonance / DolphinPS4 / Crema PS4 toolchain (clang 21 + libc++ 21 on
 OpenOrbis).
 
-Status: **v00.08**. On the console the launcher works (text, firmware download, installing a VPK)
-and v00.07 runs PKGj for a few seconds: renderer (Vulkan on RADV), audio, the firmware modules and
-dynarmic all work. Then a directory walk failed in the file functions (see below), fixed in v00.08.
-Games copied straight into `ux0/app` as NoNpDrm dumps (still encrypted) couldn't load; v00.08
-decrypts them the first time they start. Remember to install each new package from `/data/pkg`.
+Status: **v00.09**. On the console the launcher works (text, firmware download, installing a VPK)
+and v00.08 runs PKGj (renderer on RADV, audio, dynarmic, and the network: it downloads its lists).
+Games copied straight into `ux0/app` as NoNpDrm dumps (still encrypted) can't load, so the launcher
+decrypts them the first time they start; in v00.08 that failed on `realpath` (see the file
+functions below), fixed in v00.09. No game has run yet. Remember to install each new package from
+`/data/pkg`.
 
 ## Using it
 
@@ -108,8 +109,10 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
   (Boost opens the top of a directory walk with `open`, then the rest relative to it: v00.07 failed
   there). The kernel refuses relative
   names (EINVAL, which Boost throws on, where elsewhere they'd just not be found: v00.03 died on
-  `status("ux0/app")`), so the wraps take them from the working directory. `statvfs` is wrapped
-  too: the C library's never fills in its result.
+  `status("ux0/app")`), so the wraps take them from the working directory. `realpath` (the C
+  library's reads `/proc/self/fd/N` with a `readlink` stub, so libc++'s `canonical`, used by
+  psvpfstools to decrypt dumps, failed) and `readlink` are wrapped, and so is `statvfs`: the C
+  library's never fills in its result.
 - **Runtime** (`port/`, from M33): heap, crash and boot logs, profiler, DNS, the RADV winsys.
 
 ## Building

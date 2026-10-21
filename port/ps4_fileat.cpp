@@ -1,5 +1,5 @@
 // The *at file functions (fstatat, openat, unlinkat, fchmodat, utimensat) on top of the path ones,
-// and statvfs.
+// and realpath, readlink and statvfs.
 // The OpenOrbis C library's fstatat, unlinkat, fchmodat and utimensat only fail with ENOSYS (the
 // PS4 has no such system calls for apps), and the sysroot's Boost.Filesystem (built with the POSIX
 // *at APIs) and libc++'s std::filesystem go through them for every status, directory listing and
@@ -20,10 +20,14 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <limits.h>
+#include <stdlib.h>
+
 #include <atomic>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 extern "C" {
 void ps4_boot_trace(const char* stage);   // ps4_crashlog.cpp
@@ -185,6 +189,73 @@ extern "C" int __wrap_utimensat(int dirfd, const char* path, const struct timesp
         }
     }
     return utimes(full.c_str(), tv);
+}
+
+// realpath: the C library's opens the path and reads the link /proc/self/fd/N with readlink,
+// which it only has as an ENOSYS stub (the PS4 has neither), so libc++'s canonical and
+// weakly_canonical failed: psvpfstools' fs::relative, decrypting a NoNpDrm dump in Vita3K v00.08.
+// The path made absolute and tidied (".", "..", "//") is it, if it's there.
+extern "C" char* __wrap_realpath(const char* path, char* resolved) {
+    if (!path) {
+        errno = EINVAL;
+        return nullptr;
+    }
+    if (!*path) {
+        errno = ENOENT;
+        return nullptr;
+    }
+    std::string full;
+    if (!resolve(AT_FDCWD, path, full))
+        return nullptr;
+    std::vector<std::string> parts;
+    for (size_t start = 0; start < full.size();) {
+        size_t end = full.find('/', start);
+        if (end == std::string::npos)
+            end = full.size();
+        const std::string part = full.substr(start, end - start);
+        if (part == "..") {
+            if (!parts.empty())
+                parts.pop_back();
+        } else if (!part.empty() && part != ".") {
+            parts.push_back(part);
+        }
+        start = end + 1;
+    }
+    std::string out;
+    for (const std::string& part : parts)
+        out += "/" + part;
+    if (out.empty())
+        out = "/";
+    struct stat st;
+    if (stat(out.c_str(), &st) != 0)
+        return nullptr;
+    if (out.size() >= PATH_MAX) {
+        errno = ENAMETOOLONG;
+        return nullptr;
+    }
+    if (!resolved) {
+        resolved = static_cast<char*>(malloc(out.size() + 1));
+        if (!resolved) {
+            errno = ENOMEM;
+            return nullptr;
+        }
+    }
+    memcpy(resolved, out.c_str(), out.size() + 1);
+    return resolved;
+}
+
+// readlink: an ENOSYS stub in the C library; the PS4's file systems have no links, so a file that's
+// there isn't one (EINVAL), which is what callers expect of a plain file
+extern "C" ssize_t __wrap_readlink(const char* path, char* buf, size_t size) {
+    (void)buf;
+    (void)size;
+    std::string full;
+    if (!path || !resolve(AT_FDCWD, path, full))
+        return -1;
+    struct stat st;
+    if (lstat(full.c_str(), &st) == 0)
+        errno = EINVAL;
+    return -1;
 }
 
 // statvfs: the C library's asks the kernel (fstatfs) and then fills nothing in, so Boost's space()

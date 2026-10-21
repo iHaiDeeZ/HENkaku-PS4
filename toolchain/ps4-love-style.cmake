@@ -113,9 +113,9 @@ foreach (fn read _read readv _readv pread lseek fstat stat getdents)
     list(APPEND PS4_NETFS_WRAPS --wrap=${fn})
 endforeach ()
 # The *at file functions, which the C library only has as ENOSYS stubs, on top of the path ones,
-# and a statvfs that fills its result in (port/ps4_fileat.cpp): Boost.Filesystem and libc++'s
-# std::filesystem use them. App only as well.
-foreach (fn fstatat openat unlinkat fchmodat utimensat statvfs)
+# a realpath and readlink that don't need /proc, and a statvfs that fills its result in
+# (port/ps4_fileat.cpp): Boost.Filesystem and libc++'s std::filesystem use them. App only as well.
+foreach (fn fstatat openat unlinkat fchmodat utimensat realpath readlink statvfs)
     list(APPEND PS4_NETFS_WRAPS --wrap=${fn})
 endforeach ()
 
