@@ -1,0 +1,4 @@
+upstream: https://github.com/Vita3K/Vita3K.git
+base: 649d7d69b2da2eb55f17233376f861a3a32cf12a
+date: 2026-10-20 (android/ui: Add option to create a game specific shortcut (#4084))
+submodules: as recorded by that commit (git submodule update --init --recursive)

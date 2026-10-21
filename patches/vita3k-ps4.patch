@@ -1,0 +1,3659 @@
+diff --git a/external/CMakeLists.txt b/external/CMakeLists.txt
+index 794f8368..bf2d7c72 100644
+--- a/external/CMakeLists.txt
++++ b/external/CMakeLists.txt
+@@ -1,5 +1,10 @@
+ add_compile_options(-w)
+ 
++if(PS4)
++	# The bundled Boost headers (1.89, as the sysroot's, which lacks ICL: dynarmic uses it)
++	include_directories(BEFORE "${CMAKE_CURRENT_SOURCE_DIR}/boost")
++endif()
++
+ include(${CMAKE_ROOT}/Modules/ExternalProject.cmake)
+ 
+ # Make option() in all external projects do nothing when a normal variable of the
+@@ -48,6 +53,10 @@ add_library(printf INTERFACE)
+ target_include_directories(printf INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/printf")
+ 
+ set(FMT_INSTALL ON)
++if(PS4)
++	# not the C++ module: it includes <xlocale.h> on FreeBSD, which the PS4's C library lacks
++	set(FMT_MODULE OFF)
++endif()
+ add_subdirectory(fmt)
+ set(fmt_DIR fmt)
+ 
+@@ -67,10 +76,13 @@ target_include_directories(ddspp INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/ddspp")
+ add_library(glad STATIC "${CMAKE_CURRENT_SOURCE_DIR}/glad/src/glad.c")
+ target_include_directories(glad PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/glad/include")
+ 
+-add_library(googletest STATIC googletest/googletest/src/gtest_main.cc googletest/googletest/src/gtest-all.cc)
+-target_include_directories(googletest PUBLIC googletest/googletest/include)
+-target_include_directories(googletest PRIVATE googletest/googletest)
+-target_compile_definitions(googletest PUBLIC GTEST_HAS_PTHREAD=0)
++# PS4: no unit tests (they would have to run on the console)
++if(NOT PS4)
++	add_library(googletest STATIC googletest/googletest/src/gtest_main.cc googletest/googletest/src/gtest-all.cc)
++	target_include_directories(googletest PUBLIC googletest/googletest/include)
++	target_include_directories(googletest PRIVATE googletest/googletest)
++	target_compile_definitions(googletest PUBLIC GTEST_HAS_PTHREAD=0)
++endif()
+ 
+ add_library(concurrentqueue INTERFACE)
+ target_include_directories(concurrentqueue INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/concurrentqueue")
+@@ -80,8 +92,21 @@ add_subdirectory(libfat16)
+ add_library(miniz STATIC miniz/miniz.c miniz/miniz.h)
+ target_include_directories(miniz PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/miniz")
+ 
+-add_subdirectory(sdl)
++if(PS4)
++	# Built for the console by scripts/build-sdl3.sh (core services, dummy video and audio drivers,
++	# the virtual joystick) and installed in the sysroot
++	find_package(SDL3 CONFIG REQUIRED GLOBAL)
++	# its "-pthread" is a compiler driver flag, and ld.lld links PS4 executables directly (pthreads
++	# are in libkernel anyway)
++	set_property(TARGET SDL3::SDL3-static PROPERTY INTERFACE_LINK_OPTIONS "")
++else()
++	add_subdirectory(sdl)
++endif()
+ 
++if(PS4)
++	# No cubeb: the PS4 plays through sceAudioOut (audio/src/impl/ps4_audio.cpp)
++	add_library(cubeb INTERFACE)
++else()
+ # Cubeb setup, from https://github.com/RPCS3/rpcs3/blob/master/3rdparty/cubeb/CMakeLists.txt
+ set(BUILD_SHARED_LIBS FALSE CACHE BOOL "Don't build shared libs")
+ set(BUILD_TESTS FALSE CACHE BOOL "Don't build tests")
+@@ -103,6 +128,7 @@ elseif (ARCHITECTURE STREQUAL "x86_64")
+ 		_USE_SSE2
+ 	)
+ endif ()
++endif()
+ 
+ if(ANDROID)
+ 	if(ARCHITECTURE STREQUAL "arm64")
+@@ -199,7 +225,15 @@ option(ENABLE_GLSLANG_BINARIES "Builds glslang and spirv-remap" OFF)
+ option(ENABLE_HLSL "Enables HLSL input support" OFF)
+ option(GLSLANG_TESTS "Enable glslang testing" OFF)
+ option(ENABLE_OPT "Enables spirv-opt capability if present" OFF)
+-add_subdirectory(glslang)
++if(PS4)
++	# PacBrew's toolchain says CMAKE_SYSTEM_NAME Generic, so UNIX is unset and glslang would leave out
++	# its OS layer (pthread-based on the PS4 too)
++	set(UNIX 1)
++	add_subdirectory(glslang)
++	unset(UNIX)
++else()
++	add_subdirectory(glslang)
++endif()
+ 
+ option(SPIRV_CROSS_CLI "Build the CLI binary. Requires SPIRV_CROSS_STATIC." OFF)
+ option(SPIRV_CROSS_ENABLE_TESTS "Enable SPIRV-Cross tests." OFF)
+@@ -270,7 +304,18 @@ target_include_directories(vma INTERFACE
+ if(ANDROID)
+ 	set(USE_STATIC_ANDROID_FFMPEG ON)
+ endif()
+-add_subdirectory(ffmpeg)
++if(PS4)
++	# The sysroot's FFmpeg 7.1 (rpcs3's PS4 build: H.264, MPEG-4, MJPEG, AAC, MP3, ATRAC3/3+, the MP4
++	# demuxer), the same version as the headers in ffmpeg/include
++	add_library(ffmpeg INTERFACE)
++	# Vita3K's own copy of the 7.1 headers: it has the internal ones its codecs use (codec_internal.h)
++	target_include_directories(ffmpeg SYSTEM INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg/include")
++	target_link_libraries(ffmpeg INTERFACE
++		"${PS4_SYSROOT}/lib/libavformat.a" "${PS4_SYSROOT}/lib/libavcodec.a" "${PS4_SYSROOT}/lib/libswscale.a"
++		"${PS4_SYSROOT}/lib/libswresample.a" "${PS4_SYSROOT}/lib/libavutil.a" "${PS4_SYSROOT}/lib/libz.a")
++else()
++	add_subdirectory(ffmpeg)
++endif()
+ 
+ if(APPLE OR NOT FORCE_BUILD_OPENSSL_MAC)
+ 	execute_process(
+@@ -464,7 +509,7 @@ endif()
+ # Use XDG desktop portals on Linux
+ set(NFD_PORTAL ON)
+ 
+-if(NOT ANDROID)
++if(NOT ANDROID AND NOT PS4)
+ 	# nativefiledialog-extended
+ 	add_subdirectory(nativefiledialog-extended)
+ 
+diff --git a/tools/gen-modules/CMakeLists.txt b/tools/gen-modules/CMakeLists.txt
+index cb1481f2..8dbb054c 100644
+--- a/tools/gen-modules/CMakeLists.txt
++++ b/tools/gen-modules/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-if(NOT ANDROID)
++if(NOT ANDROID AND NOT PS4)
+     add_executable(gen-modules gen-modules.cpp)
+     target_link_libraries(gen-modules PRIVATE yaml-cpp)
+ endif()
+diff --git a/vita3k/CMakeLists.txt b/vita3k/CMakeLists.txt
+index ecce2b3a..d1b284e0 100644
+--- a/vita3k/CMakeLists.txt
++++ b/vita3k/CMakeLists.txt
+@@ -90,7 +90,13 @@ endif()
+ 
+ get_boost()
+ 
+-include_directories(${Boost_INCLUDE_DIRS})
++if(PS4)
++	# The bundled Boost headers (1.89, as the sysroot's libboost_filesystem.a, and with ICL): the
++	# sysroot's include directory as an -I would hide the fmt, glslang and pugixml from external/
++	include_directories(${CMAKE_SOURCE_DIR}/external/boost)
++else()
++	include_directories(${Boost_INCLUDE_DIRS})
++endif()
+ 
+ if (USE_DISCORD_RICH_PRESENCE)
+ 	add_definitions(-DUSE_DISCORD)
+@@ -103,7 +109,7 @@ if(NOT MSVC)
+ 	add_compile_options(-Wformat -Werror=format-security)
+ endif()
+ 
+-if(NOT ANDROID)
++if(NOT ANDROID AND NOT PS4)
+ 	include(${CMAKE_SOURCE_DIR}/cmake/qt6.cmake)
+ endif()
+ 
+@@ -121,7 +127,7 @@ add_subdirectory(display)
+ add_subdirectory(features)
+ add_subdirectory(glutil)
+ add_subdirectory(updater)
+-if(NOT ANDROID)
++if(NOT ANDROID AND NOT PS4)
+ 	add_subdirectory(gui-qt)
+ endif()
+ add_subdirectory(gxm)
+@@ -144,7 +150,9 @@ add_subdirectory(overlay)
+ add_subdirectory(regmgr)
+ add_subdirectory(renderer)
+ add_subdirectory(rtc)
+-add_subdirectory(sdl-frontend)
++if(NOT PS4)
++	add_subdirectory(sdl-frontend)
++endif()
+ add_subdirectory(shader)
+ add_subdirectory(threads)
+ add_subdirectory(touch)
+@@ -202,6 +210,9 @@ if(ANDROID)
+ 		endforeach()
+ 		set_target_properties(vita3k PROPERTIES LINK_FLAGS "${LIBS_TO_EXCLUDE_FLAG}")
+ 	endif()
++elseif(PS4)
++	# The PS4 frontend (ps4/) instead of main.cpp, the Qt UI and the SDL window
++	add_executable(vita3k interface.cpp interface.h performance.cpp)
+ else()
+ 	add_executable(vita3k MACOSX_BUNDLE main.cpp interface.cpp interface.h performance.cpp)
+ endif()
+@@ -211,15 +222,20 @@ if(WIN32)
+ 	target_sources(vita3k PRIVATE util/src/vc_runtime_checker.cpp)
+ endif()
+ 
+-target_link_libraries(vita3k PRIVATE app audio compat config ctrl dialog display ime lang gdbstub gxm io miniz modules motion packages patch renderer sdl-frontend shader touch util psvpfsparser)
+-if(NOT ANDROID)
++target_link_libraries(vita3k PRIVATE app audio compat config ctrl dialog display ime lang gdbstub gxm io miniz modules motion packages patch renderer shader touch util psvpfsparser)
++if(PS4)
++	include(ps4/ps4.cmake)
++else()
++	target_link_libraries(vita3k PRIVATE sdl-frontend)
++endif()
++if(NOT ANDROID AND NOT PS4)
+ 	target_link_libraries(vita3k PRIVATE gui-qt)
+ endif()
+ if(USE_DISCORD_RICH_PRESENCE)
+ 	target_link_libraries(vita3k PRIVATE discord-rpc)
+ endif()
+ 
+-if(NOT ANDROID)
++if(NOT ANDROID AND NOT PS4)
+ 	file(GLOB VITA3K_QT_TS_FILES CONFIGURE_DEPENDS
+ 		"${CMAKE_SOURCE_DIR}/i18n/qt/*.ts")
+ 	set(VITA3K_QT_QM_DIR "${CMAKE_BINARY_DIR}/qt_translations")
+diff --git a/vita3k/app/src/app_init.cpp b/vita3k/app/src/app_init.cpp
+index d7ee705f..2c72cb58 100644
+--- a/vita3k/app/src/app_init.cpp
++++ b/vita3k/app/src/app_init.cpp
+@@ -257,6 +257,17 @@ bool init_paths(Root &root_paths) {
+     root_paths.set_shared_path(internal_storage_path);
+     root_paths.set_cache_path(internal_storage_path / "cache" / "");
+     root_paths.set_patch_path(internal_storage_path / "patch" / "");
++#elif defined(__PS4__)
++    // The package's files (data/, shaders-builtin/, icons/) are read-only in /app0. Everything
++    // else lives in /data/Vita3K, which survives updates of the package.
++    const fs::path data_path = "/data/Vita3K/";
++    root_paths.set_static_assets_path("/app0/");
++    root_paths.set_vita_fs_path(data_path / "fs" / "");
++    root_paths.set_log_path(data_path);
++    root_paths.set_config_path(data_path);
++    root_paths.set_shared_path(data_path);
++    root_paths.set_cache_path(data_path / "cache" / "");
++    root_paths.set_patch_path(data_path / "patch" / "");
+ #else
+     auto sdl_exe_path = SDL_GetBasePath();
+     auto exe_path = fs_utils::utf8_to_path(sdl_exe_path);
+diff --git a/vita3k/audio/CMakeLists.txt b/vita3k/audio/CMakeLists.txt
+index 87e909cd..aa66ddd0 100644
+--- a/vita3k/audio/CMakeLists.txt
++++ b/vita3k/audio/CMakeLists.txt
+@@ -2,8 +2,13 @@ add_library(
+     audio
+     STATIC
+     src/audio.cpp
+-    src/impl/sdl_audio.cpp
+-    src/impl/cubeb_audio.cpp)
++    src/impl/sdl_audio.cpp)
++
++if(PS4)
++	target_sources(audio PRIVATE src/impl/ps4_audio.cpp)
++else()
++	target_sources(audio PRIVATE src/impl/cubeb_audio.cpp)
++endif()
+ 
+ target_include_directories(audio PUBLIC include)
+ target_link_libraries(audio PRIVATE util cubeb SDL3::SDL3)
+diff --git a/vita3k/audio/include/audio/impl/ps4_audio.h b/vita3k/audio/include/audio/impl/ps4_audio.h
+new file mode 100644
+index 00000000..6163184b
+--- /dev/null
++++ b/vita3k/audio/include/audio/impl/ps4_audio.h
+@@ -0,0 +1,67 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#pragma once
++
++#include "../state.h"
++
++#include <condition_variable>
++#include <thread>
++#include <vector>
++
++struct PS4AudioOutPort;
++
++// PS4: one sceAudioOut port (48 kHz stereo) fed by a mixer thread. Each Vita port is resampled to
++// 48 kHz into its own ring, which the mixer drains a 256-frame grain at a time.
++class PS4AudioAdapter : public AudioAdapter {
++private:
++    int32_t handle = -1;
++    std::thread mixer;
++    std::atomic<bool> quit{ false };
++    std::atomic<bool> paused{ false };
++    std::mutex ports_mutex;
++    std::vector<std::weak_ptr<PS4AudioOutPort>> ports;
++
++    void mix_loop();
++
++public:
++    explicit PS4AudioAdapter(AudioState &audio_state);
++    ~PS4AudioAdapter() override;
++
++    bool init() override;
++    void switch_state(const bool pause) override;
++    AudioOutPortPtr open_port(int nb_channels, int freq, int nb_sample) override;
++    void audio_output(AudioOutPort &out_port, const void *buffer) override;
++    void set_volume(AudioOutPort &out_port, float volume) override;
++    int get_rest_sample(AudioOutPort &out_port) override;
++    void wake_all_ports() override;
++};
++
++struct PS4AudioOutPort : public AudioOutPort {
++    int channels = 2;
++    std::atomic<float> gain{ 1.0f };
++    std::mutex mutex;
++    std::condition_variable cond_var;
++    // 48 kHz stereo frames waiting for the mixer
++    std::vector<int16_t> ring;
++    size_t read_pos = 0;
++    size_t count = 0;
++    // resampler: position of the next output frame in input frames (-1 = the previous call's last)
++    double phase = -1.0;
++    int16_t prev[2] = {};
++    std::vector<int16_t> scratch;
++};
+diff --git a/vita3k/audio/src/audio.cpp b/vita3k/audio/src/audio.cpp
+index 3a65f6db..df1b26a4 100644
+--- a/vita3k/audio/src/audio.cpp
++++ b/vita3k/audio/src/audio.cpp
+@@ -17,7 +17,11 @@
+ 
+ #include <audio/state.h>
+ 
++#ifdef __PS4__
++#include <audio/impl/ps4_audio.h>
++#else
+ #include <audio/impl/cubeb_audio.h>
++#endif
+ #include <audio/impl/sdl_audio.h>
+ 
+ #include <util/log.h>
+@@ -61,7 +65,13 @@ void AudioState::deinit() {
+     next_port_id = 1;
+ }
+ 
+-void AudioState::set_backend(const std::string &adapter_name) {
++void AudioState::set_backend(const std::string &requested_name) {
++#ifdef __PS4__
++    // sceAudioOut is the PS4's only sound output, whatever the config names
++    const std::string adapter_name = "PS4";
++#else
++    const std::string &adapter_name = requested_name;
++#endif
+     if (adapter_name == this->audio_backend)
+         return;
+ 
+@@ -70,8 +80,13 @@ void AudioState::set_backend(const std::string &adapter_name) {
+     adapter.reset();
+     if (adapter_name == "SDL") {
+         adapter = std::make_unique<SDLAudioAdapter>(*this);
++#ifdef __PS4__
++    } else if (adapter_name == "PS4") {
++        adapter = std::make_unique<PS4AudioAdapter>(*this);
++#else
+     } else if (adapter_name == "Cubeb") {
+         adapter = std::make_unique<CubebAudioAdapter>(*this);
++#endif
+     } else {
+         LOG_ERROR("Unknown audio adapter {}", adapter_name);
+         return;
+diff --git a/vita3k/audio/src/impl/ps4_audio.cpp b/vita3k/audio/src/impl/ps4_audio.cpp
+new file mode 100644
+index 00000000..425c281f
+--- /dev/null
++++ b/vita3k/audio/src/impl/ps4_audio.cpp
+@@ -0,0 +1,218 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#include "audio/impl/ps4_audio.h"
++#include "util/log.h"
++
++#include <orbis/AudioOut.h>
++#include <orbis/libkernel.h>
++
++#include <algorithm>
++#include <chrono>
++#include <cmath>
++#include <cstring>
++
++namespace {
++
++constexpr int RATE = 48000;
++constexpr int GRAIN = 256; // frames per sceAudioOutOutput
++constexpr size_t RING_FRAMES = 16384; // ~340 ms
++// As the SDL backend: a port's thread waits while more than this many frames are queued
++constexpr size_t THRESHOLD_FRAMES = 4 * 512;
++constexpr int32_t SYSTEM_USER = 0xFF; // the main port, whoever is signed in
++constexpr int32_t VOLUME_MAX = 32768;
++
++// libkernel declares these without parameters
++using SetAffinityFn = int32_t (*)(OrbisPthread, uint64_t);
++using SetPrioFn = int32_t (*)(OrbisPthread, int);
++
++int16_t lerp(int a, int b, float t) {
++    return static_cast<int16_t>(a + (b - a) * t);
++}
++
++} // namespace
++
++PS4AudioAdapter::PS4AudioAdapter(AudioState &audio_state)
++    : AudioAdapter(audio_state) {}
++
++PS4AudioAdapter::~PS4AudioAdapter() {
++    quit = true;
++    wake_all_ports();
++    if (mixer.joinable())
++        mixer.join();
++    if (handle >= 0)
++        sceAudioOutClose(handle);
++}
++
++bool PS4AudioAdapter::init() {
++    const int32_t result = sceAudioOutInit();
++    // already initialized is fine
++    if (result != 0 && result != static_cast<int32_t>(0x8026000E)) {
++        LOG_ERROR("sceAudioOutInit failed: {:08X}", static_cast<uint32_t>(result));
++        return false;
++    }
++    handle = sceAudioOutOpen(SYSTEM_USER, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, GRAIN, RATE, ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
++    if (handle < 0) {
++        LOG_ERROR("sceAudioOutOpen failed: {:08X}", static_cast<uint32_t>(handle));
++        return false;
++    }
++    int32_t volume[2] = { VOLUME_MAX, VOLUME_MAX };
++    sceAudioOutSetVolume(handle, 0x3, volume); // front left + right
++    mixer = std::thread([this] { mix_loop(); });
++    LOG_INFO("PS4 audio: sceAudioOut port {:08X}, {} frames at {} Hz", static_cast<uint32_t>(handle), GRAIN, RATE);
++    return true;
++}
++
++void PS4AudioAdapter::mix_loop() {
++    // Above the emulation threads, so a slow frame doesn't make the sound crackle
++    const OrbisPthread self = scePthreadSelf();
++    reinterpret_cast<SetPrioFn>(&scePthreadSetprio)(self, 400);
++
++    alignas(32) int16_t grains[2][GRAIN * 2];
++    int32_t acc[GRAIN * 2];
++    int current = 0;
++    std::vector<std::shared_ptr<PS4AudioOutPort>> live;
++    while (!quit) {
++        std::memset(acc, 0, sizeof(acc));
++        if (!paused) {
++            live.clear();
++            {
++                const std::lock_guard<std::mutex> lock(ports_mutex);
++                std::erase_if(ports, [](const auto &weak) { return weak.expired(); });
++                for (const auto &weak : ports) {
++                    if (auto port = weak.lock())
++                        live.push_back(std::move(port));
++                }
++            }
++            for (const auto &port : live) {
++                const float gain = port->gain;
++                {
++                    const std::lock_guard<std::mutex> lock(port->mutex);
++                    const size_t frames = std::min<size_t>(port->count, GRAIN);
++                    for (size_t i = 0; i < frames; i++) {
++                        const size_t at = ((port->read_pos + i) % RING_FRAMES) * 2;
++                        acc[i * 2] += static_cast<int32_t>(port->ring[at] * gain);
++                        acc[i * 2 + 1] += static_cast<int32_t>(port->ring[at + 1] * gain);
++                    }
++                    port->read_pos = (port->read_pos + frames) % RING_FRAMES;
++                    port->count -= frames;
++                }
++                if (port->count < THRESHOLD_FRAMES)
++                    port->cond_var.notify_one();
++            }
++            live.clear();
++        }
++        int16_t *out = grains[current];
++        for (int i = 0; i < GRAIN * 2; i++)
++            out[i] = static_cast<int16_t>(std::clamp(acc[i], -32768, 32767));
++        // blocks until the previous grain is playing, which paces this thread
++        sceAudioOutOutput(handle, out);
++        current ^= 1;
++    }
++    sceAudioOutOutput(handle, nullptr); // wait for the last grain
++}
++
++void PS4AudioAdapter::switch_state(const bool pause) {
++    paused = pause;
++}
++
++AudioOutPortPtr PS4AudioAdapter::open_port(int nb_channels, int freq, int nb_sample) {
++    auto port = std::make_shared<PS4AudioOutPort>();
++    port->channels = nb_channels;
++    port->len_microseconds = (nb_sample * 1'000'000ULL) / freq;
++    port->len_bytes = nb_sample * nb_channels * sizeof(int16_t);
++    port->freq = freq;
++    port->ring.resize(RING_FRAMES * 2);
++    {
++        const std::lock_guard<std::mutex> lock(ports_mutex);
++        ports.push_back(port);
++    }
++    return port;
++}
++
++void PS4AudioAdapter::audio_output(AudioOutPort &out_port, const void *buffer) {
++    if (out_port.stopping)
++        return;
++
++    auto &port = static_cast<PS4AudioOutPort &>(out_port);
++    const int16_t *in = static_cast<const int16_t *>(buffer);
++    const int channels = port.channels;
++    const int in_frames = port.len_bytes / (channels * static_cast<int>(sizeof(int16_t)));
++    if (in_frames <= 0 || port.freq <= 0)
++        return;
++
++    // Linear resampling to 48 kHz, continuing from the previous call (its last frame is at -1)
++    const auto frame = [&](int i, int c) -> int {
++        if (i < 0)
++            return port.prev[c];
++        return in[i * channels + (channels == 2 ? c : 0)];
++    };
++    const double step = static_cast<double>(port.freq) / RATE;
++    auto &scratch = port.scratch;
++    scratch.clear();
++    double pos = port.phase;
++    while (pos < in_frames - 1) {
++        const int i = static_cast<int>(std::floor(pos));
++        const float t = static_cast<float>(pos - i);
++        scratch.push_back(lerp(frame(i, 0), frame(i + 1, 0), t));
++        scratch.push_back(lerp(frame(i, 1), frame(i + 1, 1), t));
++        pos += step;
++    }
++    port.phase = pos - in_frames;
++    port.prev[0] = static_cast<int16_t>(frame(in_frames - 1, 0));
++    port.prev[1] = static_cast<int16_t>(frame(in_frames - 1, 1));
++
++    // If there's lots of audio left to play, wait: the mixer wakes this thread when it runs low
++    std::unique_lock<std::mutex> lock(port.mutex);
++    if (port.count > THRESHOLD_FRAMES) {
++        port.cond_var.wait_for(lock, std::chrono::microseconds(port.len_microseconds * 2));
++        if (out_port.stopping || quit)
++            return;
++    }
++    const size_t frames = scratch.size() / 2;
++    for (size_t i = 0; i < frames; i++) {
++        if (port.count == RING_FRAMES) {
++            // full: drop the oldest frame
++            port.read_pos = (port.read_pos + 1) % RING_FRAMES;
++            port.count--;
++        }
++        const size_t at = ((port.read_pos + port.count) % RING_FRAMES) * 2;
++        port.ring[at] = scratch[i * 2];
++        port.ring[at + 1] = scratch[i * 2 + 1];
++        port.count++;
++    }
++}
++
++void PS4AudioAdapter::set_volume(AudioOutPort &out_port, float volume) {
++    static_cast<PS4AudioOutPort &>(out_port).gain = volume;
++}
++
++int PS4AudioAdapter::get_rest_sample(AudioOutPort &out_port) {
++    auto &port = static_cast<PS4AudioOutPort &>(out_port);
++    const std::lock_guard<std::mutex> lock(port.mutex);
++    return static_cast<int>(port.count);
++}
++
++void PS4AudioAdapter::wake_all_ports() {
++    for (auto &[_, port_ptr] : state.out_ports) {
++        auto &port = static_cast<PS4AudioOutPort &>(*port_ptr);
++        {
++            const std::lock_guard<std::mutex> lock(port.mutex);
++        }
++        port.cond_var.notify_all();
++    }
++}
+diff --git a/vita3k/mem/CMakeLists.txt b/vita3k/mem/CMakeLists.txt
+index 2e2bd287..659ab47a 100644
+--- a/vita3k/mem/CMakeLists.txt
++++ b/vita3k/mem/CMakeLists.txt
+@@ -16,7 +16,7 @@ add_library(
+ target_include_directories(mem PUBLIC include)
+ target_link_libraries(mem PUBLIC util)
+ 
+-if(NOT ANDROID)
++if(NOT ANDROID AND NOT PS4)
+ 	add_executable(
+ 		mem-tests
+ 		tests/allocator_tests.cpp
+diff --git a/vita3k/mem/src/mem.cpp b/vita3k/mem/src/mem.cpp
+index 28bc81bf..ba83dc55 100644
+--- a/vita3k/mem/src/mem.cpp
++++ b/vita3k/mem/src/mem.cpp
+@@ -26,6 +26,7 @@
+ #include <cstring>
+ #include <mutex>
+ #include <utility>
++#include <vector>
+ 
+ #ifdef _WIN32
+ #define WIN32_LEAN_AND_MEAN
+@@ -62,8 +63,188 @@ static std::string get_error_msg() {
+ }
+ #endif
+ 
++#ifdef __PS4__
++// The PS4 has no overcommit: anonymous memory is flexible memory (a few hundred MiB, shared with
++// the eboot, the heap and the thread stacks), and mmap(PROT_NONE) can't reserve gigabytes. So the
++// 4 GiB of guest space is a virtual range reservation, and each host page the allocator commits is
++// backed by direct memory mapped in at its place, then given back to a free list when decommitted.
++// The PS4 maps and protects 16 KiB pages (sysconf says 4 KiB).
++extern "C" {
++// Declared by hand: several OpenOrbis prototypes are wrong.
++size_t sceKernelGetDirectMemorySize();
++int32_t sceKernelAllocateDirectMemory(off_t search_start, off_t search_end, size_t length, size_t alignment, int32_t memory_type, off_t *physical_out);
++int32_t sceKernelMapDirectMemory(void **address, size_t length, int32_t protection, int32_t flags, off_t direct_memory_start, size_t alignment);
++int32_t sceKernelReserveVirtualRange(void **address, size_t length, int32_t flags, size_t alignment);
++int32_t sceKernelMunmap(void *address, size_t length);
++}
++
++namespace ps4_mem {
++
++constexpr uint32_t PAGE = KiB(16);
++constexpr size_t SLAB = MiB(64);
++constexpr size_t LARGE_PAGE = MiB(2);
++constexpr int32_t WB_ONION = 0; // SCE_KERNEL_WB_ONION
++constexpr int32_t MAP_FIXED_FLAG = 0x10; // SCE_KERNEL_MAP_FIXED
++constexpr int32_t PROT_CPU_RW = 0x3;
++
++std::mutex mutex;
++uint8_t *base = nullptr;
++// For each host page of the guest space: its physical page + 1, or 0 while not committed
++std::vector<uint32_t> phys_pages;
++// Physical pages given back, used first
++std::vector<uint32_t> free_pages;
++// The rest of the newest block of direct memory
++off_t slab = 0;
++size_t slab_left = 0;
++size_t direct_total = 0;
++size_t committed = 0;
++
++uint8_t *reserve(size_t size) {
++    // Above the kernel's own allocations at 0x200000000, away from the heap (0x1000000000) and
++    // RADV's GPU windows (0x4000000000-0x4600000000). A hint whose range isn't free fails
++    // instead of searching on, so try a few.
++    for (const uintptr_t hint : { 0x2000000000ULL, 0x2400000000ULL, 0x3000000000ULL, 0x1800000000ULL, 0x800000000ULL }) {
++        void *addr = reinterpret_cast<void *>(hint);
++        const int32_t ret = sceKernelReserveVirtualRange(&addr, size, 0, LARGE_PAGE);
++        if (ret == 0) {
++            const std::lock_guard<std::mutex> lock(mutex);
++            base = static_cast<uint8_t *>(addr);
++            phys_pages.assign(size / PAGE, 0);
++            LOG_INFO("PS4: {} MiB of guest address space at {}, {} MiB of direct memory reused", size >> 20, addr, (free_pages.size() * PAGE) >> 20);
++            return base;
++        }
++        LOG_WARN("PS4: reserving {} MiB at 0x{:X} failed: {:08X}", size >> 20, hint, static_cast<uint32_t>(ret));
++    }
++    return nullptr;
++}
++
++// Physical pages for a run of n host pages: one given back, else a contiguous piece of the newest
++// block of direct memory, else a new block. Returns how many it found (at least 1), 0 if none.
++size_t take(size_t n, off_t &phys) {
++    if (!free_pages.empty()) {
++        phys = static_cast<off_t>(free_pages.back()) * PAGE;
++        free_pages.pop_back();
++        return 1;
++    }
++    if (slab_left < PAGE) {
++        size_t size = std::max(SLAB, align(n * PAGE, LARGE_PAGE));
++        off_t start = 0;
++        int32_t ret = sceKernelAllocateDirectMemory(0, static_cast<off_t>(sceKernelGetDirectMemorySize()), size, LARGE_PAGE, WB_ONION, &start);
++        if (ret != 0) {
++            // what's left, in smaller pieces
++            size = align(n * PAGE, PAGE);
++            ret = sceKernelAllocateDirectMemory(0, static_cast<off_t>(sceKernelGetDirectMemorySize()), size, PAGE, WB_ONION, &start);
++        }
++        if (ret != 0) {
++            LOG_CRITICAL("PS4: out of direct memory ({} MiB in use for guest memory, {:08X})", direct_total >> 20, static_cast<uint32_t>(ret));
++            return 0;
++        }
++        direct_total += size;
++        slab = start;
++        slab_left = size;
++    }
++    const size_t pages = std::min<size_t>(n, slab_left / PAGE);
++    phys = slab;
++    slab += pages * PAGE;
++    slab_left -= pages * PAGE;
++    return pages;
++}
++
++// Unmaps a range of the guest space and reserves it again, so nothing else lands in it.
++void unmap_to_reserved(uint8_t *ptr, size_t size) {
++    sceKernelMunmap(ptr, size);
++    void *addr = ptr;
++    const int32_t ret = sceKernelReserveVirtualRange(&addr, size, MAP_FIXED_FLAG, PAGE);
++    LOG_CRITICAL_IF(ret != 0 || addr != ptr, "PS4: reserving {} again failed: {:08X}", static_cast<void *>(ptr), static_cast<uint32_t>(ret));
++}
++
++bool map_run(uint8_t *ptr, size_t size, off_t phys) {
++    void *addr = ptr;
++    // over the reservation, or failing that in its place
++    int32_t ret = sceKernelMapDirectMemory(&addr, size, PROT_CPU_RW, MAP_FIXED_FLAG, phys, PAGE);
++    if (ret != 0 || addr != ptr) {
++        sceKernelMunmap(ptr, size);
++        addr = ptr;
++        ret = sceKernelMapDirectMemory(&addr, size, PROT_CPU_RW, MAP_FIXED_FLAG, phys, PAGE);
++    }
++    if (ret != 0 || addr != ptr) {
++        LOG_CRITICAL("PS4: mapping {} KiB of direct memory at {} failed: {:08X}", size >> 10, static_cast<void *>(ptr), static_cast<uint32_t>(ret));
++        unmap_to_reserved(ptr, size);
++        return false;
++    }
++    return true;
++}
++
++// Backs the host pages of [ptr, ptr + size) that aren't yet (already committed ones keep their data).
++bool commit(uint8_t *ptr, size_t size) {
++    const std::lock_guard<std::mutex> lock(mutex);
++    const size_t first = (ptr - base) / PAGE;
++    const size_t last = (ptr + size - base + PAGE - 1) / PAGE;
++    for (size_t page = first; page < last;) {
++        if (phys_pages[page]) {
++            page++;
++            continue;
++        }
++        size_t end = page;
++        while (end < last && !phys_pages[end])
++            end++;
++        while (page < end) {
++            off_t phys = 0;
++            const size_t pages = take(end - page, phys);
++            if (!pages)
++                return false;
++            if (!map_run(base + page * PAGE, pages * PAGE, phys)) {
++                for (size_t i = 0; i < pages; i++)
++                    free_pages.push_back(static_cast<uint32_t>(phys / PAGE + i));
++                return false;
++            }
++            for (size_t i = 0; i < pages; i++)
++                phys_pages[page + i] = static_cast<uint32_t>(phys / PAGE + i + 1);
++            committed += pages * PAGE;
++            page += pages;
++        }
++    }
++    return true;
++}
++
++// Gives the physical pages of [ptr, ptr + size) back to the free list.
++void decommit(uint8_t *ptr, size_t size) {
++    const std::lock_guard<std::mutex> lock(mutex);
++    const size_t first = (ptr - base) / PAGE;
++    const size_t last = (ptr + size - base + PAGE - 1) / PAGE;
++    for (size_t page = first; page < last; page++) {
++        if (phys_pages[page]) {
++            free_pages.push_back(phys_pages[page] - 1);
++            phys_pages[page] = 0;
++            committed -= PAGE;
++        }
++    }
++    unmap_to_reserved(base + first * PAGE, (last - first) * PAGE);
++}
++
++// The whole guest space goes; its physical pages stay with us for the next one.
++void release(uint8_t *ptr, size_t size) {
++    const std::lock_guard<std::mutex> lock(mutex);
++    for (uint32_t &phys : phys_pages) {
++        if (phys) {
++            free_pages.push_back(phys - 1);
++            phys = 0;
++        }
++    }
++    committed = 0;
++    sceKernelMunmap(ptr, size);
++    base = nullptr;
++    phys_pages.clear();
++    phys_pages.shrink_to_fit();
++}
++
++} // namespace ps4_mem
++#endif
++
+ bool init(MemState &state, const bool use_page_table) {
+-#ifdef _WIN32
++#ifdef __PS4__
++    state.host_page_size = ps4_mem::PAGE;
++#elif defined(_WIN32)
+     SYSTEM_INFO system_info = {};
+     GetSystemInfo(&system_info);
+     state.host_page_size = system_info.dwPageSize;
+@@ -86,6 +267,13 @@ bool init(MemState &state, const bool use_page_table) {
+             return false;
+         }
+     }
++#elif defined(__PS4__)
++    (void)preferred_address;
++    state.memory = Memory(ps4_mem::reserve(TOTAL_MEM_SIZE), delete_memory);
++    if (!state.memory) {
++        LOG_CRITICAL("PS4: no address space for the guest memory");
++        return false;
++    }
+ #else
+     // http://man7.org/linux/man-pages/man2/mmap.2.html
+     const int prot = PROT_NONE;
+@@ -137,6 +325,8 @@ static void delete_memory(uint8_t *memory) {
+ #ifdef _WIN32
+         const BOOL ret = VirtualFree(memory, 0, MEM_RELEASE);
+         assert(ret);
++#elif defined(__PS4__)
++        ps4_mem::release(memory, TOTAL_MEM_SIZE);
+ #else
+         munmap(memory, TOTAL_MEM_SIZE);
+ #endif
+@@ -179,6 +369,11 @@ static Address alloc_inner(MemState &state, uint32_t start_page, uint32_t page_c
+ #ifdef _WIN32
+     const void *const ret = VirtualAlloc(commit_ptr, commit_size, MEM_COMMIT, PAGE_READWRITE);
+     LOG_CRITICAL_IF(!ret, "VirtualAlloc failed: {}", get_error_msg());
++#elif defined(__PS4__)
++    if (!ps4_mem::commit(commit_ptr, commit_size)) {
++        state.allocator.free(page_num, page_count);
++        return 0;
++    }
+ #else
+     const int ret = mprotect(commit_ptr, commit_size, PROT_READ | PROT_WRITE);
+     LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
+@@ -520,6 +715,8 @@ void free(MemState &state, Address address) {
+ #ifdef _WIN32
+             const BOOL ret = VirtualFree(memory, batch_size, MEM_DECOMMIT);
+             LOG_CRITICAL_IF(!ret, "VirtualFree failed: {}", get_error_msg());
++#elif defined(__PS4__)
++            ps4_mem::decommit(memory, batch_size);
+ #else
+             int ret = mprotect(memory, batch_size, PROT_NONE);
+             LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
+@@ -536,6 +733,8 @@ void free(MemState &state, Address address) {
+ #ifdef _WIN32
+         const BOOL ret = VirtualFree(memory, batch_size, MEM_DECOMMIT);
+         LOG_CRITICAL_IF(!ret, "VirtualFree failed: {}", get_error_msg());
++#elif defined(__PS4__)
++        ps4_mem::decommit(memory, batch_size);
+ #else
+         int ret = mprotect(memory, batch_size, PROT_NONE);
+         LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
+@@ -602,6 +801,12 @@ static void register_access_violation_handler(const AccessViolationHandler &hand
+ 
+ #else
+ 
++#ifdef __PS4__
++// The handlers this one replaced (the crash log's), for faults that aren't the guest's
++static struct sigaction previous_sigsegv;
++static struct sigaction previous_sigbus;
++#endif
++
+ static void signal_handler(int sig, siginfo_t *info, void *uct) noexcept {
+     auto context = static_cast<ucontext_t *>(uct);
+ 
+@@ -630,6 +835,9 @@ static void signal_handler(int sig, siginfo_t *info, void *uct) noexcept {
+ #else
+ #ifdef __APPLE__
+     const uint64_t err = context->uc_mcontext->__es.__err;
++#elif defined(__FreeBSD__)
++    // also the PS4 (its mcontext is at byte 0x40 of the context: the sysroot's libc overlay)
++    const uint64_t err = context->uc_mcontext.mc_err;
+ #else
+     const uint64_t err = context->uc_mcontext.gregs[REG_ERR];
+ #endif
+@@ -643,6 +851,14 @@ static void signal_handler(int sig, siginfo_t *info, void *uct) noexcept {
+         }
+     }
+ 
++#ifdef __PS4__
++    // To the crash log (port/ps4_crashlog.cpp) with the faulting context, which ends the app
++    const struct sigaction &previous = sig == SIGBUS ? previous_sigbus : previous_sigsegv;
++    if ((previous.sa_flags & SA_SIGINFO) && previous.sa_sigaction) {
++        previous.sa_sigaction(sig, info, uct);
++        return;
++    }
++#endif
+     LOG_CRITICAL("Unhandled access to 0x{:X}", reinterpret_cast<uintptr_t>(info->si_addr));
+     raise(SIGTRAP);
+     return;
+@@ -652,15 +868,30 @@ static void register_access_violation_handler(const AccessViolationHandler &hand
+     access_violation_handler = handler;
+     struct sigaction sa;
+     sa.sa_flags = SA_SIGINFO;
++#ifdef __PS4__
++    // on the thread's signal stack (every thread has one, port/ps4_runtime.cpp): a stack overflow
++    // then still reaches the crash log
++    sa.sa_flags |= SA_ONSTACK;
++    static bool chained = false;
++    struct sigaction *const previous = chained ? nullptr : &previous_sigsegv;
++#else
++    struct sigaction *const previous = nullptr;
++#endif
+     sigemptyset(&sa.sa_mask);
+     sa.sa_sigaction = signal_handler;
+-    if (sigaction(SIGSEGV, &sa, NULL) == -1) {
++    if (sigaction(SIGSEGV, &sa, previous) == -1) {
+         LOG_CRITICAL("Failed to register an exception handler");
+     }
+-#ifdef __APPLE__
++#if defined(__APPLE__) || defined(__PS4__)
+     // When accessing memory region which is PROT_NONE on macOS, it is raising SIGBUS not SIGSEGV.
+-    // So apply same signal handler to SIGBUS
+-    if (sigaction(SIGBUS, &sa, NULL) == -1) {
++    // So apply same signal handler to SIGBUS (the PS4's FreeBSD kernel may too, for protection faults)
++#ifdef __PS4__
++    struct sigaction *const previous_bus = chained ? nullptr : &previous_sigbus;
++    chained = true;
++#else
++    struct sigaction *const previous_bus = nullptr;
++#endif
++    if (sigaction(SIGBUS, &sa, previous_bus) == -1) {
+         LOG_CRITICAL("Failed to register an exception handler to SIGBUS");
+     }
+ #endif
+diff --git a/vita3k/module/CMakeLists.txt b/vita3k/module/CMakeLists.txt
+index 040421ec..989f2107 100644
+--- a/vita3k/module/CMakeLists.txt
++++ b/vita3k/module/CMakeLists.txt
+@@ -11,7 +11,7 @@ if(TRACY_ENABLE_ON_CORE_COMPONENTS)
+ 	target_link_libraries(module PUBLIC tracy)
+ endif()
+ 
+-if(NOT ANDROID)
++if(NOT ANDROID AND NOT PS4)
+ 	add_executable(
+ 		module-tests
+ 		tests/arg_layout_tests.cpp
+diff --git a/vita3k/overlay/src/font.cpp b/vita3k/overlay/src/font.cpp
+index 117569cf2..bd15b552 100644
+--- a/vita3k/overlay/src/font.cpp
++++ b/vita3k/overlay/src/font.cpp
+@@ -185,6 +185,12 @@ glyph_load_setup font::get_glyph_files(language_class class_) const {
+         result.font_names.emplace_back("Roboto-Regular.ttf");
+         result.font_names.emplace_back("DroidSans.ttf");
+         result.font_names.emplace_back("NotoSans-Regular.ttf");
++#elif defined(__PS4__)
++        // the console's own (/preinst/common/font, the frame host's font directory)
++        if (bold)
++            result.font_names.emplace_back("SST-Bold.otf");
++        result.font_names.emplace_back("SST-Medium.otf");
++        result.font_names.emplace_back("SST-Roman.otf");
+ #elif !defined(_WIN32)
+         result.font_names.emplace_back("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf");
+         result.font_names.emplace_back("/usr/share/fonts/TTF/DejaVuSans.ttf");
+@@ -217,6 +223,9 @@ glyph_load_setup font::get_glyph_files(language_class class_) const {
+         result.font_names.emplace_back("NotoSansCJK-Regular.ttc");
+         result.font_names.emplace_back("NotoSansJP-Regular.otf");
+         result.font_names.emplace_back("NotoSansSC-Regular.otf");
++#elif defined(__PS4__)
++        result.font_names.emplace_back("SSTJpPro-Regular.otf");
++        result.font_names.emplace_back("DFHEI5-SONY.ttf");
+ #else
+         result.font_names.emplace_back("NotoSansCJK-Regular.ttc");
+         result.font_names.emplace_back("NotoSansSC-Regular.otf");
+@@ -241,6 +250,8 @@ glyph_load_setup font::get_glyph_files(language_class class_) const {
+ #elif defined(__ANDROID__)
+         result.font_names.emplace_back("NotoSansKR-Regular.otf");
+         result.font_names.emplace_back("NotoSansCJK-Regular.ttc");
++#elif defined(__PS4__)
++        result.font_names.emplace_back("SCEPS4Yoongd-Medium.otf");
+ #elif !defined(_WIN32)
+         result.font_names.emplace_back("NotoSansKR-Regular.otf");
+         result.font_names.emplace_back("NotoSansCJK-Regular.ttc");
+diff --git a/vita3k/ps4/ps4.cmake b/vita3k/ps4/ps4.cmake
+new file mode 100644
+index 00000000..38518fbc
+--- /dev/null
++++ b/vita3k/ps4/ps4.cmake
+@@ -0,0 +1,31 @@
++# PS4: Vita3K's frontend for the console, included from vita3k/CMakeLists.txt once the vita3k target
++# exists. Built with the port's toolchain (toolchain/ps4-vita3k.cmake, and ps4-love-style.cmake as
++# the project include: PS4_RUNTIME_SOURCES, ps4_link_mesa, ps4_add_eboot).
++
++target_sources(vita3k PRIVATE
++	ps4/ps4_main.cpp
++	ps4/ps4_canvas.cpp
++	ps4/ps4_canvas.h
++	ps4/ps4_launcher.cpp
++	ps4/ps4_launcher.h
++	ps4/ps4_pad.cpp
++	ps4/ps4_pad.h
++	ps4/ps4_wsi.cpp
++	ps4/ps4_wsi.h
++	ps4/ps4_stubs.c
++	${PS4_RUNTIME_SOURCES})
++
++# archive.h and the other headers next to main.cpp
++target_include_directories(vita3k PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
++target_link_libraries(vita3k PRIVATE emuenv mem overlay stb vulkan SDL3::SDL3)
++
++# The network library's shares (port/ps4_netfs.cpp: SMB and NFS under /net)
++target_link_libraries(vita3k PRIVATE ${PS4_SYSROOT}/lib/libnfs.a ${PS4_SYSROOT}/lib/libsmb2.a)
++# every undefined symbol at once
++target_link_options(vita3k PRIVATE --error-limit=0)
++
++# RADV on GNM, the system libraries, and eboot.bin
++ps4_link_mesa(vita3k)
++target_link_libraries(vita3k PRIVATE
++	SceSysmodule SceSystemService SceUserService SceVideoOut SceAudioOut ScePad SceNet SceCommonDialog SceImeDialog)
++ps4_add_eboot(vita3k)
+diff --git a/vita3k/ps4/ps4_canvas.cpp b/vita3k/ps4/ps4_canvas.cpp
+new file mode 100644
+index 00000000..e8ac8c90
+--- /dev/null
++++ b/vita3k/ps4/ps4_canvas.cpp
+@@ -0,0 +1,428 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// PS4: the launcher's software canvas. Text comes from the console's own fonts
++// (/preinst/common/font), rasterized with stb_truetype (implemented in overlay/src/font.cpp);
++// pictures are decoded with stb_image (renderer/src/texture/replacement.cpp).
++
++#include "ps4_canvas.h"
++
++#include <util/log.h>
++
++#include <stb_image.h>
++#include <stb_truetype.h>
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <memory>
++#include <mutex>
++#include <unordered_map>
++
++namespace ps4ui {
++
++namespace {
++
++constexpr const char *FONT_DIR = "/preinst/common/font/";
++
++struct Font {
++    std::vector<uint8_t> data;
++    stbtt_fontinfo info{};
++};
++
++struct Glyph {
++    int width = 0;
++    int height = 0;
++    int xoff = 0;
++    int yoff = 0;
++    float advance = 0;
++    std::vector<uint8_t> alpha;
++};
++
++struct FontSet {
++    std::vector<std::unique_ptr<Font>> fonts;
++    std::unordered_map<uint64_t, Glyph> glyphs;
++};
++
++std::mutex fonts_mutex;
++bool fonts_tried = false;
++FontSet regular_set;
++FontSet bold_set;
++
++std::unique_ptr<Font> load_font(const char *name) {
++    const std::string path = std::string(FONT_DIR) + name;
++    FILE *f = std::fopen(path.c_str(), "rb");
++    if (!f)
++        return nullptr;
++    auto font = std::make_unique<Font>();
++    std::fseek(f, 0, SEEK_END);
++    const long size = std::ftell(f);
++    std::fseek(f, 0, SEEK_SET);
++    font->data.resize(size > 0 ? static_cast<size_t>(size) : 0);
++    const size_t got = std::fread(font->data.data(), 1, font->data.size(), f);
++    std::fclose(f);
++    if (got != font->data.size() || !stbtt_InitFont(&font->info, font->data.data(), stbtt_GetFontOffsetForIndex(font->data.data(), 0))) {
++        LOG_WARN("PS4 launcher: font {} unreadable", path);
++        return nullptr;
++    }
++    return font;
++}
++
++// The first font of each list that the console has, then the fallbacks for other scripts
++void load_fonts() {
++    if (fonts_tried)
++        return;
++    fonts_tried = true;
++    const auto load_set = [](FontSet &set, std::initializer_list<const char *> primary) {
++        for (const char *name : primary) {
++            if (auto font = load_font(name)) {
++                set.fonts.push_back(std::move(font));
++                break;
++            }
++        }
++        for (const char *name : { "SSTJpPro-Regular.otf", "DFHEI5-SONY.ttf", "SCEPS4Yoongd-Medium.otf" }) {
++            if (auto font = load_font(name))
++                set.fonts.push_back(std::move(font));
++        }
++    };
++    load_set(regular_set, { "SST-Roman.otf", "SST-Medium.otf" });
++    load_set(bold_set, { "SST-Bold.otf", "SST-Medium.otf", "SST-Roman.otf" });
++    LOG_INFO("PS4 launcher: {} regular and {} bold fonts", regular_set.fonts.size(), bold_set.fonts.size());
++}
++
++FontSet &font_set(Weight weight) {
++    load_fonts();
++    return weight == Weight::Bold && !bold_set.fonts.empty() ? bold_set : regular_set;
++}
++
++// Decodes the next code point of a UTF-8 string (U+FFFD for broken sequences)
++char32_t next_code_point(std::string_view s, size_t &i) {
++    const auto c = static_cast<uint8_t>(s[i++]);
++    if (c < 0x80)
++        return c;
++    int extra = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : c >= 0xC0 ? 1 : -1;
++    if (extra < 0)
++        return 0xFFFD;
++    char32_t cp = c & (0x3F >> extra);
++    while (extra-- > 0) {
++        if (i >= s.size() || (static_cast<uint8_t>(s[i]) & 0xC0) != 0x80)
++            return 0xFFFD;
++        cp = (cp << 6) | (static_cast<uint8_t>(s[i++]) & 0x3F);
++    }
++    return cp;
++}
++
++const Glyph *glyph_for(FontSet &set, char32_t cp, int px) {
++    if (set.fonts.empty())
++        return nullptr;
++    size_t font_index = 0;
++    int glyph = 0;
++    for (size_t i = 0; i < set.fonts.size(); i++) {
++        glyph = stbtt_FindGlyphIndex(&set.fonts[i]->info, static_cast<int>(cp));
++        if (glyph) {
++            font_index = i;
++            break;
++        }
++    }
++    const uint64_t key = (static_cast<uint64_t>(font_index) << 48) | (static_cast<uint64_t>(px) << 32) | static_cast<uint32_t>(glyph);
++    auto it = set.glyphs.find(key);
++    if (it != set.glyphs.end())
++        return &it->second;
++    const stbtt_fontinfo &info = set.fonts[font_index]->info;
++    const float scale = stbtt_ScaleForPixelHeight(&info, static_cast<float>(px));
++    Glyph g;
++    int advance = 0, lsb = 0;
++    stbtt_GetGlyphHMetrics(&info, glyph, &advance, &lsb);
++    g.advance = advance * scale;
++    unsigned char *bitmap = stbtt_GetGlyphBitmap(&info, scale, scale, glyph, &g.width, &g.height, &g.xoff, &g.yoff);
++    if (bitmap) {
++        g.alpha.assign(bitmap, bitmap + g.width * g.height);
++        stbtt_FreeBitmap(bitmap, nullptr);
++    }
++    return &set.glyphs.emplace(key, std::move(g)).first->second;
++}
++
++uint32_t pack(Color c) {
++    return static_cast<uint32_t>(c.r) | (static_cast<uint32_t>(c.g) << 8) | (static_cast<uint32_t>(c.b) << 16) | (static_cast<uint32_t>(c.a) << 24);
++}
++
++uint8_t coverage(float v) {
++    return static_cast<uint8_t>(std::clamp(v, 0.f, 1.f) * 255.f + 0.5f);
++}
++
++} // namespace
++
++bool fonts_loaded() {
++    const std::lock_guard<std::mutex> lock(fonts_mutex);
++    load_fonts();
++    return !regular_set.fonts.empty();
++}
++
++Image load_image(const std::string &path, int width, int height) {
++    Image out;
++    int w = 0, h = 0, n = 0;
++    unsigned char *data = stbi_load(path.c_str(), &w, &h, &n, 4);
++    if (!data)
++        return out;
++    if (width <= 0 || height <= 0) {
++        width = w;
++        height = h;
++    }
++    // fit, keeping the proportions
++    const float scale = std::min(static_cast<float>(width) / w, static_cast<float>(height) / h);
++    out.width = std::max(1, static_cast<int>(w * scale));
++    out.height = std::max(1, static_cast<int>(h * scale));
++    out.pixels.resize(static_cast<size_t>(out.width) * out.height);
++    for (int y = 0; y < out.height; y++) {
++        const float sy = std::clamp((y + 0.5f) / scale - 0.5f, 0.f, static_cast<float>(h - 1));
++        const int y0 = static_cast<int>(sy);
++        const int y1 = std::min(y0 + 1, h - 1);
++        const float fy = sy - y0;
++        for (int x = 0; x < out.width; x++) {
++            const float sx = std::clamp((x + 0.5f) / scale - 0.5f, 0.f, static_cast<float>(w - 1));
++            const int x0 = static_cast<int>(sx);
++            const int x1 = std::min(x0 + 1, w - 1);
++            const float fx = sx - x0;
++            uint8_t px[4];
++            for (int c = 0; c < 4; c++) {
++                const float a = data[(y0 * w + x0) * 4 + c] * (1 - fx) + data[(y0 * w + x1) * 4 + c] * fx;
++                const float b = data[(y1 * w + x0) * 4 + c] * (1 - fx) + data[(y1 * w + x1) * 4 + c] * fx;
++                px[c] = static_cast<uint8_t>(a * (1 - fy) + b * fy + 0.5f);
++            }
++            out.pixels[static_cast<size_t>(y) * out.width + x] = pack(Color{ px[0], px[1], px[2], px[3] });
++        }
++    }
++    stbi_image_free(data);
++    return out;
++}
++
++Canvas::Canvas(int width, int height)
++    : w(width)
++    , h(height)
++    , pixels(static_cast<size_t>(width) * height) {}
++
++void Canvas::blend(int x, int y, Color c, uint8_t cov) {
++    if (x < 0 || y < 0 || x >= w || y >= h || cov == 0)
++        return;
++    const uint32_t a = (static_cast<uint32_t>(c.a) * cov + 127) / 255;
++    uint32_t &dst = pixels[static_cast<size_t>(y) * w + x];
++    if (a == 255) {
++        dst = pack(Color{ c.r, c.g, c.b, 255 });
++        return;
++    }
++    const uint32_t ia = 255 - a;
++    const uint32_t r = ((dst & 0xFF) * ia + c.r * a + 127) / 255;
++    const uint32_t g = (((dst >> 8) & 0xFF) * ia + c.g * a + 127) / 255;
++    const uint32_t b = (((dst >> 16) & 0xFF) * ia + c.b * a + 127) / 255;
++    dst = r | (g << 8) | (b << 16) | 0xFF000000u;
++}
++
++void Canvas::clear_gradient(Color top, Color bottom) {
++    for (int y = 0; y < h; y++) {
++        const float t = static_cast<float>(y) / (h - 1);
++        const Color c{
++            static_cast<uint8_t>(top.r + (bottom.r - top.r) * t),
++            static_cast<uint8_t>(top.g + (bottom.g - top.g) * t),
++            static_cast<uint8_t>(top.b + (bottom.b - top.b) * t),
++            255
++        };
++        std::fill_n(&pixels[static_cast<size_t>(y) * w], w, pack(c));
++    }
++}
++
++void Canvas::fill_rect(int x, int y, int width, int height, Color c) {
++    const int x0 = std::max(x, 0), x1 = std::min(x + width, w);
++    const int y0 = std::max(y, 0), y1 = std::min(y + height, h);
++    for (int yy = y0; yy < y1; yy++)
++        for (int xx = x0; xx < x1; xx++)
++            blend(xx, yy, c, 255);
++}
++
++void Canvas::fill_round_rect(int x, int y, int width, int height, int radius, Color c) {
++    radius = std::min({ radius, width / 2, height / 2 });
++    for (int yy = std::max(y, 0); yy < std::min(y + height, h); yy++) {
++        for (int xx = std::max(x, 0); xx < std::min(x + width, w); xx++) {
++            // distance into the nearest corner's circle
++            const float px = xx + 0.5f, py = yy + 0.5f;
++            const float cx = std::clamp(px, static_cast<float>(x + radius), static_cast<float>(x + width - radius));
++            const float cy = std::clamp(py, static_cast<float>(y + radius), static_cast<float>(y + height - radius));
++            const float d = std::hypot(px - cx, py - cy);
++            blend(xx, yy, c, coverage(radius - d + 0.5f));
++        }
++    }
++}
++
++void Canvas::fill_circle(float cx, float cy, float radius, Color c) {
++    for (int yy = static_cast<int>(cy - radius - 1); yy <= static_cast<int>(cy + radius + 1); yy++)
++        for (int xx = static_cast<int>(cx - radius - 1); xx <= static_cast<int>(cx + radius + 1); xx++)
++            blend(xx, yy, c, coverage(radius - std::hypot(xx + 0.5f - cx, yy + 0.5f - cy) + 0.5f));
++}
++
++void Canvas::ring(float cx, float cy, float radius, float thickness, Color c) {
++    const float half = thickness / 2;
++    for (int yy = static_cast<int>(cy - radius - half - 1); yy <= static_cast<int>(cy + radius + half + 1); yy++)
++        for (int xx = static_cast<int>(cx - radius - half - 1); xx <= static_cast<int>(cx + radius + half + 1); xx++)
++            blend(xx, yy, c, coverage(half - std::fabs(std::hypot(xx + 0.5f - cx, yy + 0.5f - cy) - radius) + 0.5f));
++}
++
++void Canvas::line(float x0, float y0, float x1, float y1, float thickness, Color c) {
++    const float half = thickness / 2;
++    const float dx = x1 - x0, dy = y1 - y0;
++    const float len2 = std::max(dx * dx + dy * dy, 1e-6f);
++    for (int yy = static_cast<int>(std::min(y0, y1) - half - 1); yy <= static_cast<int>(std::max(y0, y1) + half + 1); yy++) {
++        for (int xx = static_cast<int>(std::min(x0, x1) - half - 1); xx <= static_cast<int>(std::max(x0, x1) + half + 1); xx++) {
++            const float px = xx + 0.5f, py = yy + 0.5f;
++            const float t = std::clamp(((px - x0) * dx + (py - y0) * dy) / len2, 0.f, 1.f);
++            const float d = std::hypot(px - (x0 + t * dx), py - (y0 + t * dy));
++            blend(xx, yy, c, coverage(half - d + 0.5f));
++        }
++    }
++}
++
++void Canvas::draw_image(const Image &image, int x, int y, uint8_t alpha) {
++    for (int yy = 0; yy < image.height; yy++) {
++        for (int xx = 0; xx < image.width; xx++) {
++            const uint32_t p = image.pixels[static_cast<size_t>(yy) * image.width + xx];
++            const Color c{ static_cast<uint8_t>(p), static_cast<uint8_t>(p >> 8), static_cast<uint8_t>(p >> 16), static_cast<uint8_t>(p >> 24) };
++            blend(x + xx, y + yy, c, alpha);
++        }
++    }
++}
++
++int Canvas::text_width(std::string_view utf8, int px, Weight weight) {
++    const std::lock_guard<std::mutex> lock(fonts_mutex);
++    FontSet &set = font_set(weight);
++    float width = 0;
++    for (size_t i = 0; i < utf8.size();) {
++        const char32_t cp = next_code_point(utf8, i);
++        if (const Glyph *g = glyph_for(set, cp, px))
++            width += g->advance;
++    }
++    return static_cast<int>(width + 0.5f);
++}
++
++int Canvas::text(int x, int y, std::string_view utf8, int px, Color c, Weight weight, int max_width) {
++    if (max_width > 0 && text_width(utf8, px, weight) > max_width) {
++        // cut it short, with an ellipsis
++        const int ellipsis = text_width("...", px, weight);
++        size_t cut = 0, i = 0;
++        std::string_view kept;
++        while (i < utf8.size()) {
++            next_code_point(utf8, i);
++            if (text_width(utf8.substr(0, i), px, weight) + ellipsis > max_width)
++                break;
++            cut = i;
++        }
++        kept = utf8.substr(0, cut);
++        const int drawn = text(x, y, kept, px, c, weight);
++        return drawn + text(x + drawn, y, "...", px, c, weight);
++    }
++    const std::lock_guard<std::mutex> lock(fonts_mutex);
++    FontSet &set = font_set(weight);
++    float pen = static_cast<float>(x);
++    for (size_t i = 0; i < utf8.size();) {
++        const char32_t cp = next_code_point(utf8, i);
++        const Glyph *g = glyph_for(set, cp, px);
++        if (!g)
++            continue;
++        const int gx = static_cast<int>(pen + 0.5f) + g->xoff;
++        const int gy = y + g->yoff;
++        for (int yy = 0; yy < g->height; yy++)
++            for (int xx = 0; xx < g->width; xx++)
++                blend(gx + xx, gy + yy, c, g->alpha[static_cast<size_t>(yy) * g->width + xx]);
++        pen += g->advance;
++    }
++    return static_cast<int>(pen - x + 0.5f);
++}
++
++void Canvas::text_centered(int cx, int y, std::string_view utf8, int px, Color c, Weight weight) {
++    text(cx - text_width(utf8, px, weight) / 2, y, utf8, px, c, weight);
++}
++
++int Canvas::text_wrapped(int x, int y, std::string_view utf8, int px, Color c, int max_width, int line_height, Weight weight) {
++    size_t start = 0;
++    while (start < utf8.size()) {
++        // the longest run of words that fits (or one word cut short)
++        size_t end = start, last_space = std::string_view::npos;
++        while (end < utf8.size() && utf8[end] != '\n') {
++            size_t next = end;
++            next_code_point(utf8, next);
++            if (text_width(utf8.substr(start, next - start), px, weight) > max_width)
++                break;
++            if (utf8[end] == ' ')
++                last_space = end;
++            end = next;
++        }
++        if (end < utf8.size() && utf8[end] != '\n' && last_space != std::string_view::npos && last_space > start)
++            end = last_space;
++        if (end == start && start < utf8.size() && utf8[start] != '\n')
++            next_code_point(utf8, end); // a single character wider than the line
++        text(x, y, utf8.substr(start, end - start), px, c, weight);
++        y += line_height;
++        start = end;
++        while (start < utf8.size() && (utf8[start] == ' ' || utf8[start] == '\n')) {
++            const bool newline = utf8[start] == '\n';
++            start++;
++            if (newline)
++                break;
++        }
++    }
++    return y;
++}
++
++void Canvas::cross_button(float cx, float cy, float r) {
++    fill_circle(cx, cy, r, rgb(0x20242c));
++    const float s = r * 0.42f;
++    line(cx - s, cy - s, cx + s, cy + s, r * 0.18f, rgb(0x8fb6ff));
++    line(cx - s, cy + s, cx + s, cy - s, r * 0.18f, rgb(0x8fb6ff));
++}
++
++void Canvas::circle_button(float cx, float cy, float r) {
++    fill_circle(cx, cy, r, rgb(0x20242c));
++    ring(cx, cy, r * 0.48f, r * 0.17f, rgb(0xff7a7a));
++}
++
++void Canvas::triangle_button(float cx, float cy, float r) {
++    fill_circle(cx, cy, r, rgb(0x20242c));
++    const float s = r * 0.55f;
++    const float t = r * 0.16f;
++    const float ax = cx, ay = cy - s * 0.95f;
++    const float bx = cx - s, by = cy + s * 0.6f;
++    const float qx = cx + s, qy = cy + s * 0.6f;
++    line(ax, ay, bx, by, t, rgb(0x4fe0b0));
++    line(bx, by, qx, qy, t, rgb(0x4fe0b0));
++    line(qx, qy, ax, ay, t, rgb(0x4fe0b0));
++}
++
++void Canvas::square_button(float cx, float cy, float r) {
++    fill_circle(cx, cy, r, rgb(0x20242c));
++    const float s = r * 0.42f;
++    const float t = r * 0.16f;
++    line(cx - s, cy - s, cx + s, cy - s, t, rgb(0xff8ad8));
++    line(cx + s, cy - s, cx + s, cy + s, t, rgb(0xff8ad8));
++    line(cx + s, cy + s, cx - s, cy + s, t, rgb(0xff8ad8));
++    line(cx - s, cy + s, cx - s, cy - s, t, rgb(0xff8ad8));
++}
++
++void Canvas::pill_button(int x, int y, std::string_view label, int px) {
++    const int tw = text_width(label, px, Weight::Bold);
++    const int height = px + 14;
++    fill_round_rect(x, y - height / 2, tw + 28, height, height / 2, rgb(0x20242c));
++    text(x + 14, y + px / 3, label, px, rgb(0xd8dde8), Weight::Bold);
++}
++
++} // namespace ps4ui
+diff --git a/vita3k/ps4/ps4_canvas.h b/vita3k/ps4/ps4_canvas.h
+new file mode 100644
+index 00000000..68141c2f
+--- /dev/null
++++ b/vita3k/ps4/ps4_canvas.h
+@@ -0,0 +1,97 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// PS4: a small software canvas for the launcher (ps4_canvas.cpp): shapes, pictures and text in the
++// console's own fonts, drawn by the CPU into a 1920x1080 RGBA picture.
++
++#pragma once
++
++#include <cstdint>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace ps4ui {
++
++// R, G, B, A in memory: VideoOut's A8B8G8R8
++struct Color {
++    uint8_t r = 0, g = 0, b = 0, a = 255;
++};
++
++constexpr Color rgb(uint32_t hex, uint8_t a = 255) {
++    return Color{ static_cast<uint8_t>(hex >> 16), static_cast<uint8_t>(hex >> 8), static_cast<uint8_t>(hex), a };
++}
++
++struct Image {
++    int width = 0;
++    int height = 0;
++    std::vector<uint32_t> pixels; // RGBA in memory
++    bool empty() const { return pixels.empty(); }
++};
++
++// Loads a PNG/JPEG, scaled to fit width x height (0 = as it is)
++Image load_image(const std::string &path, int width = 0, int height = 0);
++
++enum class Weight {
++    Regular,
++    Bold,
++};
++
++class Canvas {
++public:
++    Canvas(int width, int height);
++
++    int width() const { return w; }
++    int height() const { return h; }
++    const uint32_t *data() const { return pixels.data(); }
++
++    void clear_gradient(Color top, Color bottom);
++    void fill_rect(int x, int y, int width, int height, Color c);
++    void fill_round_rect(int x, int y, int width, int height, int radius, Color c);
++    void fill_circle(float cx, float cy, float radius, Color c);
++    void ring(float cx, float cy, float radius, float thickness, Color c);
++    void line(float x0, float y0, float x1, float y1, float thickness, Color c);
++    void draw_image(const Image &image, int x, int y, uint8_t alpha = 255);
++
++    // Text with its baseline at y; returns the width drawn. Characters the console's Latin font
++    // lacks come from its Japanese, Chinese and Korean fonts.
++    int text(int x, int y, std::string_view utf8, int px, Color c, Weight weight = Weight::Regular, int max_width = 0);
++    int text_width(std::string_view utf8, int px, Weight weight = Weight::Regular);
++    // Centered on cx
++    void text_centered(int cx, int y, std::string_view utf8, int px, Color c, Weight weight = Weight::Regular);
++    // Wrapped into lines of at most max_width; returns the y after the last line
++    int text_wrapped(int x, int y, std::string_view utf8, int px, Color c, int max_width, int line_height, Weight weight = Weight::Regular);
++
++    // The PlayStation button symbols, in their colours
++    void cross_button(float cx, float cy, float r);
++    void circle_button(float cx, float cy, float r);
++    void triangle_button(float cx, float cy, float r);
++    void square_button(float cx, float cy, float r);
++    void pill_button(int x, int y, std::string_view label, int px);
++
++private:
++    void blend(int x, int y, Color c, uint8_t coverage);
++
++    int w;
++    int h;
++    std::vector<uint32_t> pixels;
++};
++
++// Whether the console's fonts could be read (the text is missing otherwise)
++bool fonts_loaded();
++
++} // namespace ps4ui
+diff --git a/vita3k/ps4/ps4_launcher.cpp b/vita3k/ps4/ps4_launcher.cpp
+new file mode 100644
+index 00000000..d4d39cef
+--- /dev/null
++++ b/vita3k/ps4/ps4_launcher.cpp
+@@ -0,0 +1,603 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// PS4: the launcher, in place of the desktop's Qt window: the installed apps with their icons,
++// and installing what the user copied to /data/Vita3K/install (the PS Vita firmware and font
++// package .PUP files, .vpk/.zip archives, .pkg files with their zRIF or .rif license, dumped game
++// folders). Drawn by the CPU into VideoOut buffers 12-13, so it needs no Vulkan; the renderer's
++// swapchain takes over the screen with its first flip.
++
++#include "ps4_launcher.h"
++
++#include "ps4_canvas.h"
++#include "ps4_pad.h"
++#include "ps4_wsi.h"
++
++#include "archive.h"
++
++#include <app/functions.h>
++#include <app/state.h>
++#include <emuenv/state.h>
++#include <packages/functions.h>
++#include <packages/license.h>
++#include <packages/pkg.h>
++#include <util/fs.h>
++#include <util/log.h>
++#include <util/string_utils.h>
++
++#include <orbis/Pad.h>
++#include <orbis/SystemService.h>
++#include <orbis/VideoOut.h>
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstring>
++#include <map>
++#include <mutex>
++#include <thread>
++
++extern "C" {
++// (the OpenOrbis prototypes of these are wrong)
++int32_t ps4l_allocate_direct(off_t start, off_t end, size_t len, size_t align, int32_t type, off_t *phys) __asm__("sceKernelAllocateDirectMemory");
++int32_t ps4l_map_direct(void **addr, size_t len, int32_t prot, int32_t flags, off_t phys, size_t align) __asm__("sceKernelMapDirectMemory");
++size_t ps4l_direct_memory_size() __asm__("sceKernelGetDirectMemorySize");
++}
++
++namespace ps4launcher {
++
++using ps4ui::Canvas;
++using ps4ui::Color;
++using ps4ui::rgb;
++using ps4ui::Weight;
++using Clock = std::chrono::steady_clock;
++
++namespace {
++
++constexpr int W = 1920;
++constexpr int H = 1080;
++constexpr size_t BUFFER_SIZE = 8ull << 20; // 1920x1080x4 rounded up to 2 MiB pages
++constexpr int32_t WC_GARLIC = 3; // write-combined, what the display reads
++constexpr int32_t PROT_CPU_GPU_RW = 0x33;
++
++// layout
++constexpr int MARGIN = 96;
++constexpr int LIST_X = MARGIN;
++constexpr int LIST_W = 1040;
++constexpr int LIST_Y = 206;
++constexpr int ROW_H = 108;
++constexpr int VISIBLE_ROWS = 7;
++constexpr int ICON = 88;
++constexpr int PANEL_X = 1210;
++constexpr int PANEL_W = W - MARGIN - PANEL_X;
++constexpr int BIG_ICON = 300;
++
++const Color TEXT = rgb(0xf2f5fb);
++const Color MUTED = rgb(0x9aa6bd);
++const Color ACCENT = rgb(0x5fc4ff);
++const Color OK = rgb(0x4fe0b0);
++const Color WARN = rgb(0xffb35c);
++
++std::string version_text() {
++    static std::string version = [] {
++        std::string v;
++        if (FILE *f = std::fopen("/app0/version.txt", "r")) {
++            char line[32] = {};
++            if (std::fgets(line, sizeof(line), f))
++                v = line;
++            std::fclose(f);
++        }
++        while (!v.empty() && (v.back() == '\n' || v.back() == '\r' || v.back() == ' '))
++            v.pop_back();
++        return v.empty() ? std::string("dev") : "v" + v;
++    }();
++    return version;
++}
++
++// --- the screen ---
++
++uint8_t *buffers[2] = {};
++bool registered = false;
++bool splash_hidden = false;
++int current = 0;
++
++bool setup_buffers() {
++    if (registered)
++        return true;
++    const int video = ps4wsi_video_handle();
++    if (video < 0)
++        return false;
++    off_t phys = 0;
++    void *base = nullptr;
++    if (ps4l_allocate_direct(0, static_cast<off_t>(ps4l_direct_memory_size()), 2 * BUFFER_SIZE, 2 << 20, WC_GARLIC, &phys) != 0
++        || ps4l_map_direct(&base, 2 * BUFFER_SIZE, PROT_CPU_GPU_RW, 0, phys, 2 << 20) != 0) {
++        LOG_ERROR("PS4 launcher: no direct memory for its screen");
++        return false;
++    }
++    buffers[0] = static_cast<uint8_t *>(base);
++    buffers[1] = static_cast<uint8_t *>(base) + BUFFER_SIZE;
++    void *addresses[2] = { buffers[0], buffers[1] };
++    OrbisVideoOutBufferAttribute attribute;
++    sceVideoOutSetBufferAttribute(&attribute, ORBIS_VIDEO_OUT_PIXEL_FORMAT_A8B8G8R8_SRGB, ORBIS_VIDEO_OUT_TILING_MODE_LINEAR, 0, W, H, W);
++    const int set = sceVideoOutRegisterBuffers(video, ps4wsi::LAUNCHER_FIRST_BUFFER, addresses, 2, &attribute);
++    if (set < 0) {
++        LOG_ERROR("PS4 launcher: sceVideoOutRegisterBuffers failed: {:08X}", static_cast<uint32_t>(set));
++        return false;
++    }
++    registered = true;
++    return true;
++}
++
++void present(const Canvas &canvas) {
++    if (!setup_buffers())
++        return;
++    std::memcpy(buffers[current], canvas.data(), static_cast<size_t>(W) * H * 4);
++    __atomic_thread_fence(__ATOMIC_SEQ_CST); // write-combined stores out before the flip
++    sceVideoOutSubmitFlip(ps4wsi_video_handle(), ps4wsi::LAUNCHER_FIRST_BUFFER + current, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0);
++    if (!splash_hidden) {
++        // the system shows the app's splash picture until the app has one of its own
++        sceSystemServiceHideSplashScreen();
++        splash_hidden = true;
++    }
++    current ^= 1;
++}
++
++void background(Canvas &c) {
++    c.clear_gradient(rgb(0x0d2347), rgb(0x04070f));
++    // the Vita's bubbles, faintly
++    c.fill_circle(1660, 210, 420, rgb(0x2a6fd6, 18));
++    c.fill_circle(1500, 900, 300, rgb(0x5fc4ff, 12));
++    c.fill_circle(240, 1040, 260, rgb(0x2a6fd6, 14));
++}
++
++void header(Canvas &c, const app::FirmwareState &fw) {
++    const int x = c.text(MARGIN, 128, "Vita3K", 76, TEXT, Weight::Bold);
++    c.text(MARGIN + x + 18, 128, "for PS4", 38, ACCENT);
++    const std::string version = version_text();
++    c.text(W - MARGIN - c.text_width(version, 28), 92, version, 28, MUTED);
++    // firmware status chips, right to left
++    int right = W - MARGIN;
++    const auto chip = [&](const std::string &label, bool good) {
++        const int tw = c.text_width(label, 24, Weight::Bold);
++        const int cw = tw + 52;
++        right -= cw;
++        c.fill_round_rect(right, 112, cw, 40, 20, good ? rgb(0x123a2e) : rgb(0x3f2a12));
++        c.fill_circle(right + 22.f, 132.f, 7.f, good ? OK : WARN);
++        c.text(right + 38, 141, label, 24, good ? OK : WARN, Weight::Bold);
++        right -= 14;
++    };
++    chip(fw.font_package ? "Fonts" : "No fonts", fw.font_package);
++    chip(fw.main_firmware ? "Firmware" : "No firmware", fw.main_firmware);
++    c.fill_rect(MARGIN, 172, W - 2 * MARGIN, 2, rgb(0xffffff, 28));
++}
++
++void footer(Canvas &c, bool have_apps) {
++    int x = MARGIN;
++    const int y = 1024;
++    if (have_apps) {
++        c.cross_button(x + 20.f, y - 10.f, 20.f);
++        x += 50;
++        x += c.text(x, y, "Start", 30, TEXT) + 48;
++    }
++    c.triangle_button(x + 20.f, y - 10.f, 20.f);
++    x += 50;
++    x += c.text(x, y, "Install from /data/Vita3K/install", 30, TEXT) + 48;
++    c.pill_button(x, y - 10, "OPTIONS", 22);
++    x += c.text_width("OPTIONS", 22, Weight::Bold) + 40;
++    c.text(x, y, "Quit", 30, TEXT);
++}
++
++// --- the apps ---
++
++struct Item {
++    app::AppEntry entry;
++    bool icons_loaded = false;
++    ps4ui::Image small;
++    ps4ui::Image large;
++};
++
++std::vector<Item> load_items(EmuEnvState &emuenv) {
++    std::vector<Item> items;
++    for (auto &entry : app::get_apps(emuenv)) {
++        Item item;
++        item.entry = std::move(entry);
++        items.push_back(std::move(item));
++    }
++    std::sort(items.begin(), items.end(), [](const Item &a, const Item &b) {
++        return string_utils::tolower(a.entry.title) < string_utils::tolower(b.entry.title);
++    });
++    return items;
++}
++
++void ensure_icons(Item &item) {
++    if (item.icons_loaded)
++        return;
++    item.icons_loaded = true;
++    if (item.entry.icon_path.empty() || !fs::exists(fs_utils::utf8_to_path(item.entry.icon_path)))
++        return;
++    item.small = ps4ui::load_image(item.entry.icon_path, ICON, ICON);
++    item.large = ps4ui::load_image(item.entry.icon_path, BIG_ICON, BIG_ICON);
++}
++
++void icon_placeholder(Canvas &c, int x, int y, int size) {
++    c.fill_round_rect(x, y, size, size, size / 6, rgb(0x1b2a44));
++    c.text_centered(x + size / 2, y + size / 2 + size / 8, "?", size / 3, MUTED, Weight::Bold);
++}
++
++// --- installing ---
++
++struct InstallJob {
++    std::thread thread;
++    std::atomic<bool> running{ false };
++    std::atomic<bool> finished{ false };
++    std::mutex mutex;
++    std::string current;
++    float progress = 0; // of the current file, 0-1
++    int index = 0;
++    int total = 0;
++    int installed = 0;
++    std::vector<std::string> failures;
++};
++
++std::string read_zrif(const fs::path &pkg) {
++    for (const char *ext : { ".zrif", ".txt" }) {
++        fs::path candidate = pkg;
++        candidate.replace_extension(ext);
++        if (!fs::exists(candidate))
++            continue;
++        fs::ifstream in(candidate);
++        std::string token;
++        // the first word that looks like a zRIF
++        while (in >> token) {
++            if (token.rfind("KO5", 0) == 0 || token.size() > 64)
++                return token;
++        }
++    }
++    return {};
++}
++
++void install_worker(EmuEnvState &emuenv, InstallJob &job) {
++    const fs::path dir = INSTALL_DIR;
++    const fs::path done_dir = dir / "done";
++    std::vector<fs::path> licenses, pups, pkgs, archives, folders;
++    boost::system::error_code ec;
++    fs::create_directories(done_dir, ec);
++    for (const auto &e : fs::directory_iterator(dir, ec)) {
++        const fs::path &p = e.path();
++        if (p.filename() == "done")
++            continue;
++        if (fs::is_directory(p)) {
++            if (fs::exists(p / "sce_sys" / "param.sfo"))
++                folders.push_back(p);
++            continue;
++        }
++        const std::string ext = string_utils::tolower(p.extension().string());
++        if (ext == ".rif" || p.filename() == "work.bin")
++            licenses.push_back(p);
++        else if (ext == ".pup")
++            pups.push_back(p);
++        else if (ext == ".pkg")
++            pkgs.push_back(p);
++        else if (ext == ".vpk" || ext == ".zip")
++            archives.push_back(p);
++    }
++    {
++        const std::lock_guard<std::mutex> lock(job.mutex);
++        job.total = static_cast<int>(licenses.size() + pups.size() + pkgs.size() + archives.size() + folders.size());
++    }
++
++    const auto begin = [&](const fs::path &p) {
++        const std::lock_guard<std::mutex> lock(job.mutex);
++        job.current = p.filename().string();
++        job.progress = 0;
++        job.index++;
++        LOG_INFO("PS4 launcher: installing {}", p);
++    };
++    const auto set_progress = [&](float v) {
++        const std::lock_guard<std::mutex> lock(job.mutex);
++        job.progress = std::clamp(v > 1.f ? v / 100.f : v, 0.f, 1.f);
++    };
++    // successful ones move into done/, with their license file
++    const auto finish = [&](const fs::path &p, bool ok, const std::string &why) {
++        const std::lock_guard<std::mutex> lock(job.mutex);
++        if (!ok) {
++            job.failures.push_back(p.filename().string() + (why.empty() ? "" : ": " + why));
++            LOG_ERROR("PS4 launcher: {} not installed {}", p, why);
++            return;
++        }
++        job.installed++;
++        boost::system::error_code move_ec;
++        fs::rename(p, done_dir / p.filename(), move_ec);
++        for (const char *ext : { ".zrif", ".txt" }) {
++            fs::path companion = p;
++            companion.replace_extension(ext);
++            if (fs::exists(companion))
++                fs::rename(companion, done_dir / companion.filename(), move_ec);
++        }
++    };
++
++    // licenses first: the packages after them may need them
++    for (const auto &p : licenses) {
++        begin(p);
++        finish(p, copy_license(emuenv, p), "not a valid license");
++    }
++    for (const auto &p : pups) {
++        begin(p);
++        const std::string version = install_pup(emuenv.vita_fs_path, p, [&](uint32_t percent) { set_progress(percent / 100.f); });
++        finish(p, !version.empty(), "not a PS Vita firmware or font package");
++    }
++    for (const auto &p : pkgs) {
++        begin(p);
++        std::string zrif = read_zrif(p);
++        if (zrif.empty())
++            zrif = find_pkg_zrif(p, emuenv.vita_fs_path);
++        if (zrif.empty()) {
++            finish(p, false, "no license: put its zRIF in a .zrif file of the same name, or its .rif next to it");
++            continue;
++        }
++        finish(p, install_pkg(p, emuenv, zrif, set_progress), "the package couldn't be installed");
++    }
++    for (const auto &p : archives) {
++        begin(p);
++        const auto contents = install_archive(emuenv, p, [&](ArchiveContents progress) {
++            if (progress.progress)
++                set_progress(*progress.progress);
++            else if (progress.count && progress.current && *progress.count > 0)
++                set_progress(*progress.current / *progress.count);
++        });
++        const bool ok = !contents.empty() && std::all_of(contents.begin(), contents.end(), [](const ContentInfo &c) { return c.state; });
++        finish(p, ok, "nothing in it could be installed");
++    }
++    for (const auto &p : folders) {
++        begin(p);
++        finish(p, install_contents(emuenv, p) > 0, "not an app folder");
++    }
++
++    app::init_apps_list(emuenv);
++    job.finished = true;
++}
++
++std::string summary(InstallJob &job) {
++    const std::lock_guard<std::mutex> lock(job.mutex);
++    if (job.total == 0)
++        return std::string("Nothing to install: copy files to ") + INSTALL_DIR + " first";
++    std::string text = fmt::format("Installed {} of {}", job.installed, job.total);
++    for (const auto &failure : job.failures)
++        text += "\n" + failure;
++    return text;
++}
++
++void draw_install(Canvas &c, InstallJob &job) {
++    c.fill_rect(0, 0, W, H, rgb(0x000000, 150));
++    const int pw = 1100, ph = 300;
++    const int px = (W - pw) / 2, py = (H - ph) / 2;
++    c.fill_round_rect(px, py, pw, ph, 28, rgb(0x14213a));
++    std::string current;
++    float progress;
++    int index, total;
++    {
++        const std::lock_guard<std::mutex> lock(job.mutex);
++        current = job.current;
++        progress = job.progress;
++        index = job.index;
++        total = job.total;
++    }
++    c.text(px + 56, py + 92, total ? fmt::format("Installing {} of {}", std::max(index, 1), total) : std::string("Looking for files"), 44, TEXT, Weight::Bold);
++    c.text(px + 56, py + 150, current, 30, MUTED, Weight::Regular, pw - 112);
++    c.fill_round_rect(px + 56, py + 196, pw - 112, 22, 11, rgb(0xffffff, 30));
++    if (progress > 0)
++        c.fill_round_rect(px + 56, py + 196, std::max(22, static_cast<int>((pw - 112) * progress)), 22, 11, ACCENT);
++    c.text(px + 56, py + 264, fmt::format("{}%", static_cast<int>(progress * 100)), 26, MUTED);
++}
++
++void draw_list(Canvas &c, std::vector<Item> &items, int selected, int top) {
++    if (items.empty()) {
++        const int cw = W - 2 * MARGIN;
++        c.fill_round_rect(MARGIN, LIST_Y + 20, cw, 600, 32, rgb(0x14213a, 220));
++        c.text(MARGIN + 64, LIST_Y + 120, "No games yet", 52, TEXT, Weight::Bold);
++        const int y = c.text_wrapped(MARGIN + 64, LIST_Y + 200,
++            "Copy these to /data/Vita3K/install over FTP, then press Triangle:", 32, MUTED, cw - 128, 46);
++        const char *lines[] = {
++            "PSVUPDAT.PUP: the PS Vita firmware (from Sony's update page)",
++            "PSP2UPDAT.PUP: the PS Vita font package",
++            "Games: .vpk or .zip files, dumped game folders, or a .pkg with a .zrif file of the same name holding its zRIF",
++        };
++        int ly = y + 24;
++        for (const char *line : lines) {
++            c.fill_circle(MARGIN + 82.f, ly - 10.f, 6.f, ACCENT);
++            ly = c.text_wrapped(MARGIN + 104, ly, line, 30, TEXT, cw - 200, 42) + 14;
++        }
++        return;
++    }
++    for (int row = 0; row < VISIBLE_ROWS && top + row < static_cast<int>(items.size()); row++) {
++        Item &item = items[top + row];
++        const int y = LIST_Y + row * ROW_H;
++        const bool sel = top + row == selected;
++        if (sel) {
++            c.fill_round_rect(LIST_X - 16, y, LIST_W + 32, ROW_H - 8, 22, rgb(0x2a6fd6, 90));
++            c.fill_round_rect(LIST_X - 16, y + 18, 6, ROW_H - 44, 3, ACCENT);
++        }
++        ensure_icons(item);
++        const int iy = y + (ROW_H - 8 - ICON) / 2;
++        if (!item.small.empty())
++            c.draw_image(item.small, LIST_X + 8 + (ICON - item.small.width) / 2, iy + (ICON - item.small.height) / 2);
++        else
++            icon_placeholder(c, LIST_X + 8, iy, ICON);
++        const int tx = LIST_X + ICON + 36;
++        c.text(tx, y + 50, item.entry.title, 36, sel ? TEXT : rgb(0xd5dbe7), sel ? Weight::Bold : Weight::Regular, LIST_W - ICON - 60);
++        c.text(tx, y + 86, item.entry.title_id + (item.entry.app_ver.empty() ? "" : "   v" + item.entry.app_ver), 24, MUTED);
++    }
++    // where the list is, when it's longer than the screen
++    if (static_cast<int>(items.size()) > VISIBLE_ROWS) {
++        const int track_h = VISIBLE_ROWS * ROW_H - 8;
++        const int thumb_h = std::max(40, track_h * VISIBLE_ROWS / static_cast<int>(items.size()));
++        const int thumb_y = LIST_Y + (track_h - thumb_h) * top / (static_cast<int>(items.size()) - VISIBLE_ROWS);
++        c.fill_round_rect(LIST_X + LIST_W + 30, LIST_Y, 6, track_h, 3, rgb(0xffffff, 24));
++        c.fill_round_rect(LIST_X + LIST_W + 30, thumb_y, 6, thumb_h, 3, rgb(0xffffff, 90));
++    }
++    // the selected app, larger
++    Item &item = items[selected];
++    ensure_icons(item);
++    const int ix = PANEL_X + (PANEL_W - BIG_ICON) / 2;
++    if (!item.large.empty())
++        c.draw_image(item.large, ix + (BIG_ICON - item.large.width) / 2, LIST_Y + 10 + (BIG_ICON - item.large.height) / 2);
++    else
++        icon_placeholder(c, ix, LIST_Y + 10, BIG_ICON);
++    int y = c.text_wrapped(PANEL_X, LIST_Y + BIG_ICON + 80, item.entry.title, 40, TEXT, PANEL_W, 52, Weight::Bold);
++    c.text(PANEL_X, y + 6, item.entry.title_id, 28, MUTED);
++    if (!item.entry.app_ver.empty())
++        c.text(PANEL_X, y + 46, "Version " + item.entry.app_ver, 28, MUTED);
++}
++
++void draw_notice(Canvas &c, const std::string &notice) {
++    if (notice.empty())
++        return;
++    const int nw = W - 2 * MARGIN;
++    // one line per line of the notice, at most four
++    int lines = 1 + static_cast<int>(std::count(notice.begin(), notice.end(), '\n'));
++    lines = std::min(lines, 4);
++    const int nh = 30 + lines * 40;
++    const int ny = 960 - nh;
++    c.fill_round_rect(MARGIN, ny, nw, nh, 20, rgb(0x14213a, 235));
++    c.fill_round_rect(MARGIN, ny, 8, nh, 4, ACCENT);
++    c.text_wrapped(MARGIN + 36, ny + 50, notice, 28, TEXT, nw - 72, 40);
++}
++
++} // namespace
++
++void show_message(const std::string &title, const std::string &detail) {
++    Canvas c(W, H);
++    background(c);
++    const int x = c.text(MARGIN, 128, "Vita3K", 76, TEXT, Weight::Bold);
++    c.text(MARGIN + x + 18, 128, "for PS4", 38, ACCENT);
++    c.text_centered(W / 2, H / 2 - 10, title, 56, TEXT, Weight::Bold);
++    c.text_centered(W / 2, H / 2 + 60, detail, 32, MUTED);
++    present(c);
++}
++
++Choice run(EmuEnvState &emuenv, const std::string &notice_text) {
++    Canvas canvas(W, H);
++    std::vector<Item> items = load_items(emuenv);
++    app::FirmwareState fw = app::get_firmware_state(emuenv);
++    int selected = 0;
++    int top = 0;
++    // the last game started is selected again
++    static std::string last_app_path;
++    for (size_t i = 0; i < items.size(); i++) {
++        if (!last_app_path.empty() && items[i].entry.path == last_app_path)
++            selected = static_cast<int>(i);
++    }
++    std::string notice = notice_text;
++    auto notice_until = Clock::now() + std::chrono::seconds(notice.empty() ? 0 : 12);
++    if (!fw.main_firmware && notice.empty()) {
++        notice = "The PS Vita firmware isn't installed: most games need it. Copy PSVUPDAT.PUP and PSP2UPDAT.PUP to /data/Vita3K/install and press Triangle.";
++        notice_until = Clock::now() + std::chrono::hours(1);
++    }
++    InstallJob job;
++
++    // buttons held from the game don't count as presses here
++    uint32_t previous = ps4pad::read().buttons;
++    Clock::time_point repeat_at{};
++    int repeat_dir = 0;
++    bool dirty = true;
++    auto last_progress = Clock::now();
++
++    while (true) {
++        const ps4pad::Snapshot pad = ps4pad::read();
++        uint32_t buttons = pad.buttons;
++        // the left stick as the D-pad
++        if (pad.connected && pad.ly < 48)
++            buttons |= ORBIS_PAD_BUTTON_UP;
++        if (pad.connected && pad.ly > 208)
++            buttons |= ORBIS_PAD_BUTTON_DOWN;
++        const uint32_t pressed = buttons & ~previous;
++        previous = buttons;
++        const auto now = Clock::now();
++
++        if (job.running) {
++            if (job.finished) {
++                job.thread.join();
++                job.running = false;
++                items = load_items(emuenv);
++                fw = app::get_firmware_state(emuenv);
++                selected = std::min(selected, std::max(0, static_cast<int>(items.size()) - 1));
++                notice = summary(job);
++                notice_until = now + std::chrono::seconds(20);
++                dirty = true;
++            } else if (now - last_progress > std::chrono::milliseconds(100)) {
++                last_progress = now;
++                dirty = true;
++            }
++        } else {
++            int dir = (buttons & ORBIS_PAD_BUTTON_UP) ? -1 : (buttons & ORBIS_PAD_BUTTON_DOWN) ? 1 : 0;
++            bool step = false;
++            if (dir != 0 && dir != repeat_dir) {
++                step = true;
++                repeat_at = now + std::chrono::milliseconds(380);
++            } else if (dir != 0 && now >= repeat_at) {
++                step = true;
++                repeat_at = now + std::chrono::milliseconds(70);
++            }
++            repeat_dir = dir;
++            if (step && !items.empty()) {
++                selected = std::clamp(selected + dir, 0, static_cast<int>(items.size()) - 1);
++                dirty = true;
++            }
++            if ((pressed & ORBIS_PAD_BUTTON_CROSS) && !items.empty()) {
++                const Item &item = items[selected];
++                last_app_path = item.entry.path;
++                show_message("Starting", item.entry.title);
++                return Choice{ false, item.entry.path, item.entry.title };
++            }
++            if (pressed & ORBIS_PAD_BUTTON_TRIANGLE) {
++                job.finished = false;
++                job.running = true;
++                job.index = job.total = job.installed = 0;
++                job.failures.clear();
++                job.thread = std::thread([&emuenv, &job] { install_worker(emuenv, job); });
++                notice.clear();
++                dirty = true;
++            }
++            if (pressed & ORBIS_PAD_BUTTON_OPTIONS)
++                return Choice{ true, {}, {} };
++        }
++        if (!notice.empty() && now >= notice_until) {
++            notice.clear();
++            dirty = true;
++        }
++
++        if (dirty) {
++            // keep the selection in view
++            if (selected < top)
++                top = selected;
++            if (selected >= top + VISIBLE_ROWS)
++                top = selected - VISIBLE_ROWS + 1;
++            background(canvas);
++            header(canvas, fw);
++            draw_list(canvas, items, selected, top);
++            draw_notice(canvas, notice);
++            footer(canvas, !items.empty());
++            if (job.running)
++                draw_install(canvas, job);
++            present(canvas);
++            dirty = false;
++        }
++        std::this_thread::sleep_for(std::chrono::milliseconds(16));
++    }
++}
++
++} // namespace ps4launcher
+diff --git a/vita3k/ps4/ps4_launcher.h b/vita3k/ps4/ps4_launcher.h
+new file mode 100644
+index 00000000..0210098f
+--- /dev/null
++++ b/vita3k/ps4/ps4_launcher.h
+@@ -0,0 +1,44 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// PS4: the launcher (ps4_launcher.cpp), drawn by the CPU on VideoOut buffers of its own.
++
++#pragma once
++
++#include <string>
++
++struct EmuEnvState;
++
++namespace ps4launcher {
++
++// Where the user puts what they want installed (games, firmware, licenses)
++constexpr const char *INSTALL_DIR = "/data/Vita3K/install";
++
++struct Choice {
++    bool quit = false;
++    std::string app_path;
++    std::string title;
++};
++
++// Shows the installed apps until one is picked or the user quits. notice is shown for a while
++// (why the last game ended, ...).
++Choice run(EmuEnvState &emuenv, const std::string &notice);
++
++// A full-screen message on the launcher's buffers (while a game loads, or after it failed)
++void show_message(const std::string &title, const std::string &detail);
++
++} // namespace ps4launcher
+diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
+new file mode 100644
+index 00000000..7f8779be
+--- /dev/null
++++ b/vita3k/ps4/ps4_main.cpp
+@@ -0,0 +1,332 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// PS4: Vita3K's frontend, in place of main.cpp (Qt) and sdl-frontend.
++//
++//   /app0              the package: eboot.bin, version.txt, data/, shaders-builtin/, icons/
++//   /data/Vita3K       config.yml, vita3k.log, boot-trace.log, crash.log, cache/, patch/
++//   /data/Vita3K/fs    the Vita's file system (ux0, vs0, os0, sa0, pd0, ...)
++//   /data/Vita3K/install  what the launcher installs (firmware, games, licenses)
++//
++// The launcher (ps4_launcher.cpp) shows the installed apps; the picked one runs in a session drawn
++// by Vita3K's Vulkan renderer on RADV, presented through VideoOut (ps4_wsi.cpp). When the game
++// ends the app starts over (sceSystemServiceLoadExec of itself): a session leaves guest threads,
++// the guest memory and the GPU device behind, and a fresh process is the clean way back to the
++// launcher. A game starting another of its executables goes through the same restart.
++
++#include "ps4_launcher.h"
++#include "ps4_pad.h"
++#include "ps4_wsi.h"
++
++#include <app/functions.h>
++#include <app/session_controller.h>
++#include <config/functions.h>
++#include <config/state.h>
++#include <emuenv/app_launch_request.h>
++#include <emuenv/state.h>
++#include <modules/module_parent.h>
++#include <packages/sfo.h>
++#include <renderer/frame_host.h>
++#include <util/fs.h>
++#include <util/log.h>
++
++#include <SDL3/SDL_events.h>
++#include <SDL3/SDL_init.h>
++
++#include <orbis/SystemService.h>
++
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <fstream>
++#include <iterator>
++#include <optional>
++#include <thread>
++
++extern "C" void ps4_boot_trace(const char *line); // port/ps4_crashlog.cpp
++
++namespace {
++
++EmuEnvState *crash_emuenv = nullptr;
++
++} // namespace
++
++// The crash log's guest part (port/ps4_crashlog.cpp calls it after the host's): which app ran
++extern "C" void ps4_crash_guest_info() {
++    if (!crash_emuenv)
++        return;
++    FILE *f = std::fopen("/data/Vita3K/crash.log", "a");
++    if (!f)
++        return;
++    std::fprintf(f, "\n== Vita3K: %s (%s), the details are in vita3k.log\n", crash_emuenv->current_app_title.c_str(),
++        crash_emuenv->app_info.app_title_id.c_str());
++    std::fclose(f);
++}
++
++namespace {
++
++const char *const NOTICE_FILE = "/data/Vita3K/notice.txt";
++const char *const RELAUNCH_FILE = "/data/Vita3K/relaunch.txt";
++
++void trace(const std::string &line) {
++    ps4_boot_trace(line.c_str());
++}
++
++// Lets the renderer draw on VideoOut: a headless surface, which ps4_wsi.cpp turns into VideoOut buffers
++class PS4FrameHost final : public renderer::FrameHost, public renderer::VulkanSurfaceProvider {
++public:
++    renderer::DisplayHandle handle() const override {
++        return {};
++    }
++    const renderer::VulkanSurfaceProvider *vulkan_surface_provider() const override {
++        return this;
++    }
++    std::vector<const char *> instance_extensions() const override {
++        return { VK_KHR_SURFACE_EXTENSION_NAME, VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME };
++    }
++    VkSurfaceKHR create_surface(VkInstance instance) const override {
++        const auto create = reinterpret_cast<PFN_vkCreateHeadlessSurfaceEXT>(ps4_vk_get_instance_proc_addr()(instance, "vkCreateHeadlessSurfaceEXT"));
++        VkHeadlessSurfaceCreateInfoEXT info{ VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT };
++        VkSurfaceKHR surface = VK_NULL_HANDLE;
++        if (!create || create(instance, &info, nullptr, &surface) != VK_SUCCESS)
++            return VK_NULL_HANDLE;
++        return surface;
++    }
++    void destroy_surface(VkInstance instance, VkSurfaceKHR surface) const override {
++        const auto destroy = reinterpret_cast<PFN_vkDestroySurfaceKHR>(ps4_vk_get_instance_proc_addr()(instance, "vkDestroySurfaceKHR"));
++        if (destroy)
++            destroy(instance, surface, nullptr);
++    }
++    int drawable_width() const override {
++        return ps4wsi::WIDTH;
++    }
++    int drawable_height() const override {
++        return ps4wsi::HEIGHT;
++    }
++    std::vector<std::string> font_dirs() const override {
++        return { "/preinst/common/font/" };
++    }
++};
++
++void save_text(const char *path, const std::string &text) {
++    std::ofstream out(path, std::ios::trunc);
++    out << text;
++}
++
++std::string take_text(const char *path) {
++    std::ifstream in(path);
++    if (!in)
++        return {};
++    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
++    in.close();
++    std::remove(path);
++    return text;
++}
++
++// A launch request carried over the restart: app path, self path, then one argument per line
++void save_relaunch(const AppLaunchRequest &request) {
++    std::string text = request.app_path + "\n" + request.self_path + "\n";
++    for (const auto &arg : request.argv)
++        text += arg + "\n";
++    save_text(RELAUNCH_FILE, text);
++}
++
++std::optional<AppLaunchRequest> take_relaunch() {
++    const std::string text = take_text(RELAUNCH_FILE);
++    if (text.empty())
++        return std::nullopt;
++    AppLaunchRequest request;
++    request.reason = AppLaunchReason::LoadExec;
++    size_t start = 0;
++    int field = 0;
++    while (start < text.size()) {
++        size_t end = text.find('\n', start);
++        if (end == std::string::npos)
++            end = text.size();
++        const std::string line = text.substr(start, end - start);
++        if (field == 0)
++            request.app_path = line;
++        else if (field == 1)
++            request.self_path = line;
++        else
++            request.argv.push_back(line);
++        field++;
++        start = end + 1;
++    }
++    if (request.app_path.empty())
++        return std::nullopt;
++    return request;
++}
++
++[[noreturn]] void restart(const std::string &notice) {
++    if (!notice.empty())
++        save_text(NOTICE_FILE, notice);
++    trace("restarting");
++    sceSystemServiceLoadExec("/app0/eboot.bin", nullptr);
++    std::_Exit(0);
++}
++
++// Runs one app until it ends. Returns what the launcher should say about it, and the launch request
++// if the app asked for another executable.
++std::string run_session(EmuEnvState &emuenv, const AppLaunchRequest &request, std::optional<AppLaunchRequest> &next) {
++    app::AppSessionController session(emuenv);
++    PS4FrameHost frame_host;
++
++    trace("session: launching " + request.app_path);
++    if (!session.begin_launch(request, request.reason != AppLaunchReason::LoadExec))
++        return "Couldn't find " + request.app_path + " among the installed apps";
++    trace("session: renderer");
++    if (!session.initialize_renderer(frame_host)) {
++        session.stop(app::AppSessionStopReason::LaunchFailure);
++        return "The renderer couldn't start (Vulkan): see /data/Vita3K/vita3k.log";
++    }
++    trace("session: runtime");
++    if (!session.initialize_runtime()) {
++        session.stop(app::AppSessionStopReason::LaunchFailure);
++        return "The emulator couldn't start: see /data/Vita3K/vita3k.log";
++    }
++    trace("session: loading the app");
++    if (!session.load_and_run()) {
++        session.stop(app::AppSessionStopReason::LaunchFailure);
++        return "The game couldn't be loaded (is the firmware installed?): see /data/Vita3K/vita3k.log";
++    }
++    trace("session: running " + emuenv.current_app_title);
++    LOG_INFO("Game started: {} ({})", emuenv.current_app_title, request.app_path);
++
++    std::optional<AppLaunchRequest> pending = emuenv.take_app_launch_request();
++    app::LaunchRuntimeMetrics metrics{};
++    bool running = !pending.has_value();
++    auto next_flush = std::chrono::steady_clock::now();
++    while (running) {
++        const ps4pad::Snapshot pad = ps4pad::read();
++        if (ps4pad::feed(emuenv, pad)) {
++            // L3 + R3: Vita3K's pause menu (Resume / Exit), or back from it
++            if (session.is_paused())
++                session.set_pause_reason(app::AppSessionPauseReason::All, false);
++            else
++                session.set_pause_reason(app::AppSessionPauseReason::User, true);
++        }
++        if (!pending) {
++            if (auto r = emuenv.take_app_launch_request()) {
++                pending = std::move(r);
++                running = false;
++            }
++        }
++        app::update_runtime_metrics(emuenv, metrics);
++        // stop asked for by the pause menu, or the app crashed
++        if (session.stop_requested() || !session.is_running()) {
++            running = false;
++            session.reset_stop_request();
++        }
++        // nothing reads SDL's event queue: don't let it fill up
++        const auto now = std::chrono::steady_clock::now();
++        if (now >= next_flush) {
++            SDL_PumpEvents();
++            SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
++            next_flush = now + std::chrono::seconds(1);
++        }
++        if (running)
++            std::this_thread::sleep_for(std::chrono::milliseconds(4));
++    }
++
++    trace("session: stopping");
++    ps4pad::release(emuenv);
++    std::string notice;
++    if (pending && pending->reason == AppLaunchReason::ProcessExit) {
++        LOG_INFO("The app exited with code {}", pending->exit_code);
++        notice = emuenv.current_app_title + " closed";
++        session.stop(app::AppSessionStopReason::UserRequest);
++    } else if (pending) {
++        LOG_INFO("The app starts '{}'", pending->self_path);
++        next = std::move(pending);
++        session.stop(app::AppSessionStopReason::Relaunch);
++    } else {
++        notice = emuenv.current_app_title + " closed";
++        session.stop(app::AppSessionStopReason::UserRequest);
++    }
++    trace("session: stopped");
++    return notice;
++}
++
++} // namespace
++
++int main(int argc, char *argv[]) {
++    trace("main");
++    Root root_paths;
++    app::init_paths(root_paths);
++    boost::system::error_code ec;
++    fs::create_directories(root_paths.get_vita_fs_path(), ec);
++    fs::create_directories(ps4launcher::INSTALL_DIR, ec);
++    if (logging::init(root_paths, false) != Success)
++        trace("logging could not start");
++    LOG_INFO("Vita3K for PS4");
++
++    // CLI11 needs a program name (a PS4 app gets none)
++    char program[] = "vita3k";
++    char *args[] = { program, nullptr };
++    (void)argc;
++    (void)argv;
++    Config cfg{};
++    EmuEnvState emuenv;
++    crash_emuenv = &emuenv;
++    if (config::init_config(cfg, 1, args, root_paths, false) != Success) {
++        trace("config failed");
++        LOG_ERROR("Failed to initialise config");
++    }
++    // the PS4 has Vulkan (RADV) only
++    cfg.backend_renderer = "Vulkan";
++
++    ps4launcher::show_message("Vita3K", "Starting");
++    ps4pad::init();
++
++    // SDL's services Vita3K uses (no window: VideoOut; no sound: sceAudioOut)
++    if (!SDL_Init(SDL_INIT_GAMEPAD | SDL_INIT_SENSOR | SDL_INIT_HAPTIC))
++        LOG_WARN("SDL_Init: {}", SDL_GetError());
++
++    trace("app init");
++    if (!app::init(emuenv, cfg, root_paths)) {
++        trace("app init failed");
++        LOG_ERROR("Emulated environment initialization failed.");
++        ps4launcher::show_message("Vita3K couldn't start", "See /data/Vita3K/vita3k.log");
++        std::this_thread::sleep_for(std::chrono::seconds(10));
++        sceSystemServiceLoadExec("exit", nullptr);
++        return 1;
++    }
++    init_libraries(emuenv);
++    app::init_apps_list(emuenv);
++    app::load_users(emuenv);
++    app::ensure_current_user(emuenv);
++    trace("ready");
++
++    std::optional<AppLaunchRequest> next = take_relaunch();
++    std::string notice = take_text(NOTICE_FILE);
++    if (!next) {
++        const ps4launcher::Choice choice = ps4launcher::run(emuenv, notice);
++        if (choice.quit) {
++            trace("quit");
++            sceSystemServiceLoadExec("exit", nullptr);
++            return 0;
++        }
++        next = AppLaunchRequest{ .app_path = choice.app_path };
++    }
++
++    std::optional<AppLaunchRequest> following;
++    notice = run_session(emuenv, *next, following);
++    if (following)
++        save_relaunch(*following);
++    restart(notice);
++}
+diff --git a/vita3k/ps4/ps4_pad.cpp b/vita3k/ps4/ps4_pad.cpp
+new file mode 100644
+index 00000000..fcc5014c
+--- /dev/null
++++ b/vita3k/ps4/ps4_pad.cpp
+@@ -0,0 +1,264 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// PS4: the DualShock 4 through ScePad.
++//
++// While a game runs the pad goes into Vita3K's virtual keyboard state (ctrl/state.h), which both
++// the game's sceCtrl reads and Vita3K's own menus (overlay) merge in:
++//   Cross/Circle/Square/Triangle, D-pad, sticks = the Vita's, L1/R1 = L/R, OPTIONS = START,
++//   touchpad click = SELECT, touchpad = the front touch screen, L2/R2/L3/R3 = the PS TV's,
++//   L3 + R3 together = Vita3K's pause menu (Resume / Exit).
++
++#include "ps4_pad.h"
++
++#include <config/state.h>
++#include <ctrl/ctrl.h>
++#include <ctrl/state.h>
++#include <emuenv/state.h>
++#include <motion/event_handler.h>
++#include <touch/functions.h>
++#include <touch/touch.h>
++#include <util/log.h>
++
++#include <orbis/Pad.h>
++#include <orbis/UserService.h>
++
++#include <SDL3/SDL_events.h>
++#include <SDL3/SDL_sensor.h>
++
++#include <algorithm>
++#include <chrono>
++#include <mutex>
++
++namespace ps4pad {
++
++namespace {
++
++constexpr uint32_t MENU_COMBO = ORBIS_PAD_BUTTON_L3 | ORBIS_PAD_BUTTON_R3;
++constexpr float STANDARD_GRAVITY = 9.80665f;
++
++struct ButtonMap {
++    uint32_t pad;
++    uint32_t vita;
++    uint32_t vita_ext;
++};
++
++const ButtonMap BUTTONS[] = {
++    { ORBIS_PAD_BUTTON_CROSS, SCE_CTRL_CROSS, SCE_CTRL_CROSS },
++    { ORBIS_PAD_BUTTON_CIRCLE, SCE_CTRL_CIRCLE, SCE_CTRL_CIRCLE },
++    { ORBIS_PAD_BUTTON_SQUARE, SCE_CTRL_SQUARE, SCE_CTRL_SQUARE },
++    { ORBIS_PAD_BUTTON_TRIANGLE, SCE_CTRL_TRIANGLE, SCE_CTRL_TRIANGLE },
++    { ORBIS_PAD_BUTTON_UP, SCE_CTRL_UP, SCE_CTRL_UP },
++    { ORBIS_PAD_BUTTON_DOWN, SCE_CTRL_DOWN, SCE_CTRL_DOWN },
++    { ORBIS_PAD_BUTTON_LEFT, SCE_CTRL_LEFT, SCE_CTRL_LEFT },
++    { ORBIS_PAD_BUTTON_RIGHT, SCE_CTRL_RIGHT, SCE_CTRL_RIGHT },
++    { ORBIS_PAD_BUTTON_L1, SCE_CTRL_L, SCE_CTRL_L1 },
++    { ORBIS_PAD_BUTTON_R1, SCE_CTRL_R, SCE_CTRL_R1 },
++    { ORBIS_PAD_BUTTON_OPTIONS, SCE_CTRL_START, SCE_CTRL_START },
++    { ORBIS_PAD_BUTTON_TOUCH_PAD, SCE_CTRL_SELECT, SCE_CTRL_SELECT },
++    { ORBIS_PAD_BUTTON_L2, 0, SCE_CTRL_L2 },
++    { ORBIS_PAD_BUTTON_R2, 0, SCE_CTRL_R2 },
++    { ORBIS_PAD_BUTTON_L3, 0, SCE_CTRL_L3 },
++    { ORBIS_PAD_BUTTON_R3, 0, SCE_CTRL_R3 },
++};
++
++std::mutex lock;
++int user = -1;
++int handle = -1;
++std::chrono::steady_clock::time_point next_open{};
++
++// While a game runs
++bool combo_held = false;
++bool menu_suppress = false; // L3/R3 stay out of the game until both are released
++Touch fingers[2];
++uint8_t finger_count = 0;
++
++float stick(uint8_t v) {
++    return std::clamp((static_cast<int>(v) - 128) / 127.f, -1.f, 1.f);
++}
++
++// Opens the pad of the first signed-in user (and again after it went away)
++void open_pad() {
++    const auto now = std::chrono::steady_clock::now();
++    if (now < next_open)
++        return;
++    next_open = now + std::chrono::seconds(1);
++    int initial = -1;
++    if (sceUserServiceGetInitialUser(&initial) != 0 || initial < 0) {
++        OrbisUserServiceLoginUserIdList list{};
++        if (sceUserServiceGetLoginUserIdList(&list) != 0)
++            return;
++        for (int i = 0; i < ORBIS_USER_SERVICE_MAX_LOGIN_USERS; i++) {
++            if (list.userId[i] != -1 && list.userId[i] != 0) {
++                initial = list.userId[i];
++                break;
++            }
++        }
++    }
++    if (initial < 0)
++        return;
++    const int h = scePadOpen(initial, ORBIS_PAD_PORT_TYPE_STANDARD, 0, nullptr);
++    if (h < 0) {
++        LOG_WARN_ONCE("PS4 pad: scePadOpen for user {:08X} failed: {:08X}", static_cast<uint32_t>(initial), static_cast<uint32_t>(h));
++        return;
++    }
++    user = initial;
++    handle = h;
++    LOG_INFO("PS4 pad: user {:08X} on handle {}", static_cast<uint32_t>(user), handle);
++}
++
++void send_touch(EmuEnvState &emuenv, Uint32 type, const Touch &t) {
++    SDL_GamepadTouchpadEvent ev{};
++    ev.type = static_cast<SDL_EventType>(type);
++    ev.touchpad = 0;
++    ev.finger = t.id;
++    ev.x = std::clamp(t.x / TOUCHPAD_WIDTH, 0.f, 1.f);
++    ev.y = std::clamp(t.y / TOUCHPAD_HEIGHT, 0.f, 1.f);
++    ev.pressure = type == SDL_EVENT_GAMEPAD_TOUCHPAD_UP ? 0.f : 1.f;
++    handle_touchpad_event(emuenv.touch, ev);
++}
++
++void update_touch(EmuEnvState &emuenv, const Snapshot &pad) {
++    // lifted fingers
++    for (uint8_t i = 0; i < finger_count; i++) {
++        bool still = false;
++        for (uint8_t j = 0; j < pad.touch_count; j++)
++            still |= pad.touch[j].id == fingers[i].id;
++        if (!still)
++            send_touch(emuenv, SDL_EVENT_GAMEPAD_TOUCHPAD_UP, fingers[i]);
++    }
++    // new and moved fingers
++    for (uint8_t j = 0; j < pad.touch_count; j++) {
++        bool known = false;
++        for (uint8_t i = 0; i < finger_count; i++)
++            known |= pad.touch[j].id == fingers[i].id;
++        send_touch(emuenv, known ? SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION : SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN, pad.touch[j]);
++    }
++    finger_count = pad.touch_count;
++    std::copy_n(pad.touch, pad.touch_count, fingers);
++}
++
++void update_motion(EmuEnvState &emuenv, const Snapshot &pad) {
++    SDL_GamepadSensorEvent ev{};
++    ev.type = SDL_EVENT_GAMEPAD_SENSOR_UPDATE;
++    ev.sensor_timestamp = pad.timestamp * 1000; // us -> ns
++    ev.sensor = SDL_SENSOR_ACCEL;
++    for (int i = 0; i < 3; i++)
++        ev.data[i] = pad.accel[i] * STANDARD_GRAVITY;
++    handle_motion_event(emuenv, SDL_SENSOR_ACCEL, ev);
++    ev.sensor = SDL_SENSOR_GYRO;
++    for (int i = 0; i < 3; i++)
++        ev.data[i] = pad.gyro[i];
++    handle_motion_event(emuenv, SDL_SENSOR_GYRO, ev);
++}
++
++} // namespace
++
++void init() {
++    // (an error if it already was, which is fine)
++    sceUserServiceInitialize(nullptr);
++    const int32_t r = scePadInit();
++    if (r != 0)
++        LOG_ERROR("PS4 pad: scePadInit failed: {:08X}", static_cast<uint32_t>(r));
++    const std::lock_guard<std::mutex> guard(lock);
++    open_pad();
++}
++
++Snapshot read() {
++    const std::lock_guard<std::mutex> guard(lock);
++    Snapshot snap;
++    if (handle < 0) {
++        open_pad();
++        if (handle < 0)
++            return snap;
++    }
++    OrbisPadData data{};
++    if (scePadReadState(handle, &data) != 0)
++        return snap;
++    if (!data.connected)
++        return snap;
++    snap.connected = true;
++    snap.buttons = data.buttons;
++    snap.lx = data.leftStick.x;
++    snap.ly = data.leftStick.y;
++    snap.rx = data.rightStick.x;
++    snap.ry = data.rightStick.y;
++    snap.l2 = data.analogButtons.l2;
++    snap.r2 = data.analogButtons.r2;
++    snap.touch_count = std::min<uint8_t>(data.touch.fingers, 2);
++    for (uint8_t i = 0; i < snap.touch_count; i++) {
++        snap.touch[i].x = data.touch.touch[i].x;
++        snap.touch[i].y = data.touch.touch[i].y;
++        snap.touch[i].id = data.touch.touch[i].finger;
++    }
++    snap.accel[0] = data.acell.x;
++    snap.accel[1] = data.acell.y;
++    snap.accel[2] = data.acell.z;
++    snap.gyro[0] = data.vel.x;
++    snap.gyro[1] = data.vel.y;
++    snap.gyro[2] = data.vel.z;
++    snap.timestamp = data.timestamp;
++    return snap;
++}
++
++bool feed(EmuEnvState &emuenv, const Snapshot &pad) {
++    // L3 + R3: the pause menu, and neither reaches the game until both are up again
++    const bool combo = (pad.buttons & MENU_COMBO) == MENU_COMBO;
++    const bool menu = combo && !combo_held;
++    combo_held = combo;
++    if (combo)
++        menu_suppress = true;
++    else if (!(pad.buttons & MENU_COMBO))
++        menu_suppress = false;
++    const uint32_t buttons = menu_suppress ? pad.buttons & ~MENU_COMBO : pad.buttons;
++
++    uint32_t vita = 0;
++    uint32_t vita_ext = 0;
++    for (const ButtonMap &b : BUTTONS) {
++        if (buttons & b.pad) {
++            vita |= b.vita;
++            vita_ext |= b.vita_ext;
++        }
++    }
++    {
++        const std::lock_guard<std::mutex> guard(emuenv.ctrl.mutex);
++        auto &kb = emuenv.ctrl.keyboard_state;
++        kb.buttons = vita;
++        kb.buttons_ext = vita_ext;
++        const float mult = emuenv.cfg.controller_analog_multiplier;
++        kb.axes[0] = std::clamp(stick(pad.lx) * mult, -1.f, 1.f);
++        kb.axes[1] = std::clamp(stick(pad.ly) * mult, -1.f, 1.f);
++        kb.axes[2] = std::clamp(stick(pad.rx) * mult, -1.f, 1.f);
++        kb.axes[3] = std::clamp(stick(pad.ry) * mult, -1.f, 1.f);
++    }
++    update_touch(emuenv, pad);
++    if (pad.connected)
++        update_motion(emuenv, pad);
++    return menu;
++}
++
++void release(EmuEnvState &emuenv) {
++    {
++        const std::lock_guard<std::mutex> guard(emuenv.ctrl.mutex);
++        emuenv.ctrl.keyboard_state = {};
++    }
++    update_touch(emuenv, Snapshot{});
++    combo_held = false;
++    menu_suppress = false;
++}
++
++} // namespace ps4pad
+diff --git a/vita3k/ps4/ps4_pad.h b/vita3k/ps4/ps4_pad.h
+new file mode 100644
+index 00000000..ff30f0d3
+--- /dev/null
++++ b/vita3k/ps4/ps4_pad.h
+@@ -0,0 +1,60 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// PS4: the DualShock 4 through ScePad (ps4_pad.cpp).
++
++#pragma once
++
++#include <cstdint>
++
++struct EmuEnvState;
++
++namespace ps4pad {
++
++struct Touch {
++    uint16_t x = 0;
++    uint16_t y = 0;
++    uint8_t id = 0;
++};
++
++// The first signed-in user's pad
++struct Snapshot {
++    bool connected = false;
++    uint32_t buttons = 0; // ORBIS_PAD_BUTTON_*
++    uint8_t lx = 128, ly = 128, rx = 128, ry = 128;
++    uint8_t l2 = 0, r2 = 0;
++    uint8_t touch_count = 0;
++    Touch touch[2];
++    float accel[3] = {}; // in g
++    float gyro[3] = {}; // in rad/s
++    uint64_t timestamp = 0;
++};
++
++// The DS4 touchpad's size in its own units
++constexpr float TOUCHPAD_WIDTH = 1920.f;
++constexpr float TOUCHPAD_HEIGHT = 943.f;
++
++void init();
++Snapshot read();
++
++// While a game runs: buttons, sticks, the touchpad (the Vita's front touch screen) and motion into
++// Vita3K's input state. Returns true once each time L3 + R3 are pressed together.
++bool feed(EmuEnvState &emuenv, const Snapshot &pad);
++// Releases everything feed() holds (before the launcher takes over again)
++void release(EmuEnvState &emuenv);
++
++} // namespace ps4pad
+diff --git a/vita3k/ps4/ps4_stubs.c b/vita3k/ps4/ps4_stubs.c
+new file mode 100644
+index 00000000..c06ce988
+--- /dev/null
++++ b/vita3k/ps4/ps4_stubs.c
+@@ -0,0 +1,25 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// PS4: definitions the PS4 build needs and its libraries leave out.
++
++// FFmpeg 7.1 (the sysroot's, built with --disable-everything and only the codecs the rpcs3 port
++// needed): the H.264 decoder's SEI code frees AV1 film grain parameters, whose source isn't built.
++// Vita videos never carry them, so there is nothing to free.
++void ff_aom_uninit_film_grain_params(void *s) {
++    (void)s;
++}
+diff --git a/vita3k/ps4/ps4_wsi.cpp b/vita3k/ps4/ps4_wsi.cpp
+new file mode 100644
+index 00000000..efb158dc
+--- /dev/null
++++ b/vita3k/ps4/ps4_wsi.cpp
+@@ -0,0 +1,606 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// PS4: Vulkan window system integration on VideoOut (from M33's PS4VulkanWSI.cpp, itself from
++// Resonance and Crema).
++//
++// RADV (DolphinPS4's GNM port) is linked into the executable and has no WSI. This file adds
++// VK_EXT_headless_surface and VK_KHR_swapchain on top of it: the swapchain images are linear
++// R8G8B8A8 images in host-visible memory (GPU address = CPU address on the PS4), registered as
++// VideoOut buffers, and presenting queues a VideoOut flip behind the GPU work submitted so far
++// (ac_ps4_submit_flip in the Mesa winsys). Vita3K's renderer keeps using the standard
++// surface/swapchain API through ps4_vk_get_instance_proc_addr(), which its vulkan.hpp dispatcher
++// loads everything from.
++
++#include "ps4_wsi.h"
++
++#include <util/log.h>
++
++#include <orbis/SystemService.h>
++#include <orbis/VideoOut.h>
++#include <orbis/libkernel.h>
++
++#include <algorithm>
++#include <chrono>
++#include <cstdint>
++#include <cstring>
++#include <mutex>
++#include <vector>
++
++extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance instance, const char *name);
++extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_common_GetDeviceProcAddr(VkDevice device, const char *name);
++// port/mesa/ac_ps4_drm.c: queues a VideoOut flip behind the submitted GPU work (GPU-side flip)
++extern "C" int ac_ps4_submit_flip(int video, unsigned buffer, unsigned mode, int64_t arg);
++
++namespace {
++
++constexpr uint32_t MAX_IMAGES = 4;
++constexpr VkDeviceSize FRAMEBUFFER_ALIGN = 2 << 20; // VideoOut buffer alignment
++
++struct PS4Surface {
++    uint32_t magic = 0x50533453;
++};
++
++struct PS4Swapchain {
++    VkDevice device;
++    uint32_t image_count;
++    VkImage images[MAX_IMAGES]{};
++    VkDeviceMemory memory[MAX_IMAGES]{};
++    int buffer_set = -1;
++    int first_buffer = 0;
++    uint32_t next_image = 0;
++    uint32_t flip_mode = ORBIS_VIDEO_OUT_FLIP_VSYNC;
++};
++
++VkInstance instance_ = VK_NULL_HANDLE;
++VkPhysicalDevice physical_device = VK_NULL_HANDLE;
++VkDevice device_ = VK_NULL_HANDLE; // for QueueSubmit
++int video = -1;
++OrbisKernelEqueue flip_queue;
++uint64_t flips_submitted = 0;
++// VideoOut's buffer slots 0-11, as 3 banks of MAX_IMAGES (12-15 are the launcher's): a swapchain
++// takes a free bank. A bank comes free only once VideoOut lets go of it: sceVideoOutUnregisterBuffers
++// fails while one of its buffers is on screen (or still queued to be, the flips being the GPU's),
++// which is just when a renderer destroys the old swapchain after making the new one. Such a set is
++// parked (its memory kept: the screen may still be showing it) and released after the next flips.
++constexpr int BANKS = 3;
++bool bank_used[BANKS]{};
++std::vector<PS4Swapchain *> retired;
++std::mutex mutex;
++
++template <typename T>
++T device_fn(VkDevice device, const char *name) {
++    return reinterpret_cast<T>(vk_common_GetDeviceProcAddr(device, name));
++}
++
++template <typename T>
++T instance_fn(const char *name) {
++    return reinterpret_cast<T>(vk_icdGetInstanceProcAddr(instance_, name));
++}
++
++bool open_video_out() {
++    if (video >= 0)
++        return true;
++    video = sceVideoOutOpen(0xFF, 0, 0, nullptr);
++    if (video < 0) {
++        LOG_ERROR("PS4 WSI: sceVideoOutOpen failed: {:08X}", static_cast<uint32_t>(video));
++        return false;
++    }
++    sceKernelCreateEqueue(&flip_queue, "v3k flip");
++    sceVideoOutAddFlipEvent(flip_queue, video, nullptr);
++    return true;
++}
++
++// appends extensions to an enumeration result (count/properties two-call idiom)
++VkResult append_extensions(std::vector<VkExtensionProperties> &list, std::initializer_list<std::pair<const char *, uint32_t>> extra,
++    uint32_t *count, VkExtensionProperties *props) {
++    for (const auto &[name, spec_version] : extra) {
++        VkExtensionProperties p{};
++        strncpy(p.extensionName, name, VK_MAX_EXTENSION_NAME_SIZE - 1);
++        p.specVersion = spec_version;
++        list.push_back(p);
++    }
++    if (props == nullptr) {
++        *count = static_cast<uint32_t>(list.size());
++        return VK_SUCCESS;
++    }
++    const uint32_t n = std::min<uint32_t>(*count, static_cast<uint32_t>(list.size()));
++    memcpy(props, list.data(), n * sizeof(VkExtensionProperties));
++    *count = n;
++    return n < list.size() ? VK_INCOMPLETE : VK_SUCCESS;
++}
++
++std::vector<const char *> without_extensions(uint32_t count, const char *const *names, std::initializer_list<const char *> drop) {
++    std::vector<const char *> result;
++    for (uint32_t i = 0; i < count; i++)
++        if (std::none_of(drop.begin(), drop.end(), [&](const char *d) { return strcmp(names[i], d) == 0; }))
++            result.push_back(names[i]);
++    return result;
++}
++
++// --- instance level ---
++
++VKAPI_ATTR VkResult VKAPI_CALL EnumerateInstanceExtensionProperties(const char *layer, uint32_t *count, VkExtensionProperties *props) {
++    auto real = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(vk_icdGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties"));
++    uint32_t n = 0;
++    real(layer, &n, nullptr);
++    std::vector<VkExtensionProperties> list(n);
++    real(layer, &n, list.data());
++    list.resize(n);
++    return append_extensions(list, { { VK_KHR_SURFACE_EXTENSION_NAME, 25 }, { VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME, 1 } }, count, props);
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL EnumerateInstanceLayerProperties(uint32_t *count, VkLayerProperties *) {
++    *count = 0; // no layers without a loader
++    return VK_SUCCESS;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL CreateInstance(const VkInstanceCreateInfo *info, const VkAllocationCallbacks *alloc, VkInstance *instance) {
++    auto real = reinterpret_cast<PFN_vkCreateInstance>(vk_icdGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance"));
++    VkInstanceCreateInfo copy = *info;
++    auto names = without_extensions(info->enabledExtensionCount, info->ppEnabledExtensionNames,
++        { VK_KHR_SURFACE_EXTENSION_NAME, VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME });
++    copy.enabledExtensionCount = static_cast<uint32_t>(names.size());
++    copy.ppEnabledExtensionNames = names.data();
++    copy.enabledLayerCount = 0;
++    copy.ppEnabledLayerNames = nullptr;
++    VkResult r = real(&copy, alloc, instance);
++    if (r == VK_SUCCESS)
++        instance_ = *instance;
++    return r;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL EnumerateDeviceExtensionProperties(VkPhysicalDevice physical, const char *layer, uint32_t *count, VkExtensionProperties *props) {
++    auto real = instance_fn<PFN_vkEnumerateDeviceExtensionProperties>("vkEnumerateDeviceExtensionProperties");
++    uint32_t n = 0;
++    real(physical, layer, &n, nullptr);
++    std::vector<VkExtensionProperties> list(n);
++    real(physical, layer, &n, list.data());
++    list.resize(n);
++    return append_extensions(list, { { VK_KHR_SWAPCHAIN_EXTENSION_NAME, 70 } }, count, props);
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physical, const VkDeviceCreateInfo *info, const VkAllocationCallbacks *alloc, VkDevice *device) {
++    auto real = instance_fn<PFN_vkCreateDevice>("vkCreateDevice");
++    VkDeviceCreateInfo copy = *info;
++    auto names = without_extensions(info->enabledExtensionCount, info->ppEnabledExtensionNames, { VK_KHR_SWAPCHAIN_EXTENSION_NAME });
++    copy.enabledExtensionCount = static_cast<uint32_t>(names.size());
++    copy.ppEnabledExtensionNames = names.data();
++    physical_device = physical;
++    const VkResult r = real(physical, &copy, alloc, device);
++    if (r == VK_SUCCESS)
++        device_ = *device;
++    return r;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL CreateHeadlessSurfaceEXT(VkInstance, const VkHeadlessSurfaceCreateInfoEXT *, const VkAllocationCallbacks *, VkSurfaceKHR *surface) {
++    *surface = reinterpret_cast<VkSurfaceKHR>(new PS4Surface());
++    return VK_SUCCESS;
++}
++
++VKAPI_ATTR void VKAPI_CALL DestroySurfaceKHR(VkInstance, VkSurfaceKHR surface, const VkAllocationCallbacks *) {
++    delete reinterpret_cast<PS4Surface *>(surface);
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevice, uint32_t queue_family, VkSurfaceKHR, VkBool32 *supported) {
++    *supported = queue_family == 0 ? VK_TRUE : VK_FALSE; // the graphics queue family
++    return VK_SUCCESS;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice, VkSurfaceKHR, VkSurfaceCapabilitiesKHR *caps) {
++    *caps = {};
++    caps->minImageCount = 2;
++    caps->maxImageCount = 3; // render into one while one is shown and one is queued
++    caps->currentExtent = { ps4wsi::WIDTH, ps4wsi::HEIGHT };
++    caps->minImageExtent = caps->currentExtent;
++    caps->maxImageExtent = caps->currentExtent;
++    caps->maxImageArrayLayers = 1;
++    caps->supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
++    caps->currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
++    caps->supportedCompositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
++    caps->supportedUsageFlags = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++    return VK_SUCCESS;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceCapabilities2KHR(VkPhysicalDevice physical, const VkPhysicalDeviceSurfaceInfo2KHR *info, VkSurfaceCapabilities2KHR *caps) {
++    return GetPhysicalDeviceSurfaceCapabilitiesKHR(physical, info->surface, &caps->surfaceCapabilities);
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice, VkSurfaceKHR, uint32_t *count, VkSurfaceFormatKHR *formats) {
++    // VideoOut A8B8G8R8 = R8G8B8A8 in memory (verified by DolphinPS4)
++    if (formats == nullptr) {
++        *count = 1;
++        return VK_SUCCESS;
++    }
++    if (*count < 1)
++        return VK_INCOMPLETE;
++    formats[0] = { VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
++    *count = 1;
++    return VK_SUCCESS;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice, VkSurfaceKHR, uint32_t *count, VkPresentModeKHR *modes) {
++    const VkPresentModeKHR supported[] = { VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR };
++    if (modes == nullptr) {
++        *count = static_cast<uint32_t>(std::size(supported));
++        return VK_SUCCESS;
++    }
++    const uint32_t n = std::min<uint32_t>(*count, static_cast<uint32_t>(std::size(supported)));
++    memcpy(modes, supported, n * sizeof(VkPresentModeKHR));
++    *count = n;
++    return n < std::size(supported) ? VK_INCOMPLETE : VK_SUCCESS;
++}
++
++// --- device level ---
++
++uint32_t host_visible_memory_type(uint32_t type_bits) {
++    VkPhysicalDeviceMemoryProperties props;
++    instance_fn<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(physical_device, &props);
++    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++    for (uint32_t i = 0; i < props.memoryTypeCount; i++)
++        if ((type_bits & (1u << i)) && (props.memoryTypes[i].propertyFlags & want) == want)
++            return i;
++    return UINT32_MAX;
++}
++
++void free_images(PS4Swapchain *sc) {
++    auto destroy_image = device_fn<PFN_vkDestroyImage>(sc->device, "vkDestroyImage");
++    auto free_memory = device_fn<PFN_vkFreeMemory>(sc->device, "vkFreeMemory");
++    for (uint32_t i = 0; i < sc->image_count; i++) {
++        if (sc->images[i])
++            destroy_image(sc->device, sc->images[i], nullptr);
++        if (sc->memory[i])
++            free_memory(sc->device, sc->memory[i], nullptr);
++    }
++    delete sc;
++}
++
++// Gives the swapchain's buffers back to VideoOut, then frees it; parks it if VideoOut won't yet.
++void free_swapchain(PS4Swapchain *sc) {
++    if (sc->buffer_set >= 0) {
++        const int r = sceVideoOutUnregisterBuffers(video, sc->buffer_set);
++        if (r < 0) {
++            LOG_WARN("PS4 WSI: buffers {}+ still in use ({:08X}), released later", sc->first_buffer, static_cast<uint32_t>(r));
++            retired.push_back(sc);
++            return;
++        }
++        bank_used[sc->first_buffer / MAX_IMAGES] = false;
++        sc->buffer_set = -1;
++    }
++    free_images(sc);
++}
++
++// Parked swapchains VideoOut has let go of since.
++void release_retired() {
++    for (size_t i = 0; i < retired.size();) {
++        PS4Swapchain *sc = retired[i];
++        if (sceVideoOutUnregisterBuffers(video, sc->buffer_set) < 0) {
++            i++;
++            continue;
++        }
++        LOG_INFO("PS4 WSI: buffers {}+ released", sc->first_buffer);
++        bank_used[sc->first_buffer / MAX_IMAGES] = false;
++        sc->buffer_set = -1;
++        retired.erase(retired.begin() + i);
++        free_images(sc);
++    }
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *info, const VkAllocationCallbacks *, VkSwapchainKHR *swapchain) {
++    const std::lock_guard<std::mutex> lock(mutex);
++    if (!open_video_out())
++        return VK_ERROR_INITIALIZATION_FAILED;
++    auto sc = new PS4Swapchain();
++    sc->device = device;
++    sc->image_count = std::clamp<uint32_t>(info->minImageCount, 2, MAX_IMAGES);
++    sc->flip_mode = info->presentMode == VK_PRESENT_MODE_FIFO_KHR ? ORBIS_VIDEO_OUT_FLIP_VSYNC : ORBIS_VIDEO_OUT_FLIP_HSYNC;
++    auto create_image = device_fn<PFN_vkCreateImage>(device, "vkCreateImage");
++    auto get_requirements = device_fn<PFN_vkGetImageMemoryRequirements>(device, "vkGetImageMemoryRequirements");
++    auto allocate_memory = device_fn<PFN_vkAllocateMemory>(device, "vkAllocateMemory");
++    auto map_memory = device_fn<PFN_vkMapMemory>(device, "vkMapMemory");
++    auto bind_memory = device_fn<PFN_vkBindImageMemory>(device, "vkBindImageMemory");
++    auto get_layout = device_fn<PFN_vkGetImageSubresourceLayout>(device, "vkGetImageSubresourceLayout");
++    void *addresses[MAX_IMAGES]{};
++    uint32_t pitch = ps4wsi::WIDTH;
++    for (uint32_t i = 0; i < sc->image_count; i++) {
++        VkImageCreateInfo ici{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
++        ici.imageType = VK_IMAGE_TYPE_2D;
++        ici.format = VK_FORMAT_R8G8B8A8_UNORM;
++        ici.extent = { ps4wsi::WIDTH, ps4wsi::HEIGHT, 1 };
++        ici.mipLevels = 1;
++        ici.arrayLayers = 1;
++        ici.samples = VK_SAMPLE_COUNT_1_BIT;
++        ici.tiling = VK_IMAGE_TILING_LINEAR;
++        ici.usage = (info->imageUsage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) & ~VK_IMAGE_USAGE_STORAGE_BIT;
++        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++        VkResult r = create_image(device, &ici, nullptr, &sc->images[i]);
++        if (r != VK_SUCCESS) {
++            LOG_ERROR("PS4 WSI: vkCreateImage failed: {}", static_cast<int>(r));
++            free_swapchain(sc);
++            return r;
++        }
++        VkMemoryRequirements req;
++        get_requirements(device, sc->images[i], &req);
++        // VideoOut wants 2 MiB aligned buffers: over-allocate, bind at an aligned offset
++        VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
++        mai.allocationSize = req.size + FRAMEBUFFER_ALIGN;
++        mai.memoryTypeIndex = host_visible_memory_type(req.memoryTypeBits);
++        uint8_t *base = nullptr;
++        r = allocate_memory(device, &mai, nullptr, &sc->memory[i]);
++        if (r == VK_SUCCESS)
++            r = map_memory(device, sc->memory[i], 0, VK_WHOLE_SIZE, 0, reinterpret_cast<void **>(&base));
++        if (r != VK_SUCCESS) {
++            LOG_ERROR("PS4 WSI: swapchain memory failed: {}", static_cast<int>(r));
++            free_swapchain(sc);
++            return r;
++        }
++        const uintptr_t base_address = reinterpret_cast<uintptr_t>(base);
++        VkDeviceSize offset = ((base_address + FRAMEBUFFER_ALIGN - 1) & ~(FRAMEBUFFER_ALIGN - 1)) - base_address;
++        offset = (offset + req.alignment - 1) & ~(req.alignment - 1);
++        bind_memory(device, sc->images[i], sc->memory[i], offset);
++        VkImageSubresource sub{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 };
++        VkSubresourceLayout layout;
++        get_layout(device, sc->images[i], &sub, &layout);
++        addresses[i] = base + offset + layout.offset;
++        pitch = static_cast<uint32_t>(layout.rowPitch / 4);
++    }
++    OrbisVideoOutBufferAttribute attribute;
++    sceVideoOutSetBufferAttribute(&attribute, ORBIS_VIDEO_OUT_PIXEL_FORMAT_A8B8G8R8_SRGB, ORBIS_VIDEO_OUT_TILING_MODE_LINEAR, 0,
++        ps4wsi::WIDTH, ps4wsi::HEIGHT, pitch);
++    // a free bank (the old swapchain is usually still on screen while this one registers)
++    release_retired();
++    sc->buffer_set = -1;
++    int registered = -1;
++    for (int bank = 0; bank < BANKS && sc->buffer_set < 0; bank++) {
++        if (bank_used[bank])
++            continue;
++        sc->first_buffer = bank * static_cast<int>(MAX_IMAGES);
++        registered = sceVideoOutRegisterBuffers(video, sc->first_buffer, addresses, static_cast<int>(sc->image_count), &attribute);
++        if (registered >= 0) {
++            sc->buffer_set = registered;
++            bank_used[bank] = true;
++        }
++    }
++    if (sc->buffer_set < 0) {
++        LOG_ERROR("PS4 WSI: sceVideoOutRegisterBuffers failed: {:08X} ({} parked)", static_cast<uint32_t>(registered), retired.size());
++        sc->buffer_set = -1;
++        free_swapchain(sc);
++        return VK_ERROR_INITIALIZATION_FAILED;
++    }
++    LOG_INFO("PS4 WSI: swapchain of {} images {}x{} pitch {}, buffers {}+", sc->image_count, ps4wsi::WIDTH, ps4wsi::HEIGHT, pitch, sc->first_buffer);
++    *swapchain = reinterpret_cast<VkSwapchainKHR>(sc);
++    return VK_SUCCESS;
++}
++
++VKAPI_ATTR void VKAPI_CALL DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain, const VkAllocationCallbacks *) {
++    if (!swapchain)
++        return;
++    const std::lock_guard<std::mutex> lock(mutex);
++    device_fn<PFN_vkDeviceWaitIdle>(device, "vkDeviceWaitIdle")(device);
++    free_swapchain(reinterpret_cast<PS4Swapchain *>(swapchain));
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL GetSwapchainImagesKHR(VkDevice, VkSwapchainKHR swapchain, uint32_t *count, VkImage *images) {
++    auto sc = reinterpret_cast<PS4Swapchain *>(swapchain);
++    if (images == nullptr) {
++        *count = sc->image_count;
++        return VK_SUCCESS;
++    }
++    const uint32_t n = std::min(*count, sc->image_count);
++    memcpy(images, sc->images, n * sizeof(VkImage));
++    *count = n;
++    return n < sc->image_count ? VK_INCOMPLETE : VK_SUCCESS;
++}
++
++// present statistics, logged every 10 s
++struct {
++    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++    uint64_t flips = 0;
++    uint64_t wait_ns = 0;
++    uint32_t timeouts = 0;
++    int64_t last_flip_arg = 0;
++} stats;
++
++// The image about to be rendered into must be off screen: with N images in rotation it was
++// shown by flip n-N+1 and replaced on screen by flip n-N+2 (n = flips submitted).
++void wait_image_off_screen(uint32_t image_count) {
++    if (flips_submitted < image_count - 1)
++        return;
++    const int64_t needed = static_cast<int64_t>(flips_submitted - (image_count - 2));
++    const auto t0 = std::chrono::steady_clock::now();
++    bool done = false;
++    for (int tries = 0; tries < 40 && !done; tries++) {
++        OrbisVideoOutFlipStatus status{};
++        if (sceVideoOutGetFlipStatus(video, &status) < 0)
++            break;
++        stats.last_flip_arg = status.flipArg;
++        if (status.flipArg >= needed) {
++            done = true;
++            break;
++        }
++        OrbisKernelEvent ev;
++        int got = 0;
++        OrbisKernelUseconds timeout = 5000;
++        sceKernelWaitEqueue(flip_queue, &ev, 1, &got, &timeout);
++    }
++    if (!done)
++        stats.timeouts++;
++    stats.wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
++}
++
++void count_present() {
++    stats.flips++;
++    const auto now = std::chrono::steady_clock::now();
++    const double secs = std::chrono::duration<double>(now - stats.start).count();
++    if (secs < 10.0)
++        return;
++    LOG_INFO("PS4 WSI: {:.1f} flips/s, acquire waits {:.0f} ms/s, {} timeouts, flipArg {} of {} submitted",
++        stats.flips / secs, stats.wait_ns / 1e6 / secs, stats.timeouts, stats.last_flip_arg, flips_submitted);
++    stats.start = now;
++    stats.flips = 0;
++    stats.wait_ns = 0;
++    stats.timeouts = 0;
++}
++
++VkQueue graphics_queue(VkDevice device) {
++    VkQueue queue = VK_NULL_HANDLE;
++    device_fn<PFN_vkGetDeviceQueue>(device, "vkGetDeviceQueue")(device, 0, 0, &queue);
++    return queue;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t, VkSemaphore semaphore, VkFence fence, uint32_t *index) {
++    auto sc = reinterpret_cast<PS4Swapchain *>(swapchain);
++    wait_image_off_screen(sc->image_count);
++    *index = sc->next_image;
++    sc->next_image = (sc->next_image + 1) % sc->image_count;
++    // The image is free now (waited for above). The acquire semaphore is never signalled: there is one
++    // in-order queue, and QueueSubmit below drops semaphores (an empty submit signalling one loses the
++    // device on the PS4 - Crema, Resonance). A fence, if asked for, is signalled by an empty submit.
++    (void)semaphore;
++    if (fence) {
++        VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
++        const VkResult r = device_fn<PFN_vkQueueSubmit>(device, "vkQueueSubmit")(graphics_queue(device), 1, &si, fence);
++        if (r != VK_SUCCESS)
++            LOG_ERROR("PS4 WSI: acquire signal submit failed: {}", static_cast<int>(r));
++        return r;
++    }
++    return VK_SUCCESS;
++}
++
++VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *info) {
++    VkResult result = VK_SUCCESS;
++    for (uint32_t i = 0; i < info->swapchainCount; i++) {
++        auto sc = reinterpret_cast<PS4Swapchain *>(info->pSwapchains[i]);
++        // the wait semaphores were never signalled (QueueSubmit drops them): one queue, in order, the
++        // rendering was submitted before this flip
++        const uint32_t buffer = static_cast<uint32_t>(sc->first_buffer) + info->pImageIndices[i];
++        const int64_t arg = static_cast<int64_t>(flips_submitted + 1);
++        // the flip goes to the GPU behind the frame's commands: no CPU wait for the GPU or vblank
++        int r = ac_ps4_submit_flip(video, buffer, sc->flip_mode, arg);
++        const bool gpu_flip = r == 0;
++        if (!gpu_flip) {
++            // fallback: wait for the GPU on the CPU, then flip
++            device_fn<PFN_vkQueueWaitIdle>(sc->device, "vkQueueWaitIdle")(queue);
++            r = sceVideoOutSubmitFlip(video, static_cast<int>(buffer), sc->flip_mode, arg);
++        }
++        if (r < 0) {
++            LOG_ERROR("PS4 WSI: flip failed: {:08X}", static_cast<uint32_t>(r));
++            result = VK_ERROR_SURFACE_LOST_KHR;
++        } else {
++            flips_submitted++;
++            count_present();
++            if (!retired.empty()) {
++                const std::lock_guard<std::mutex> lock(mutex);
++                release_retired();
++            }
++            // the PS4 keeps its boot splash (the app's picture) over everything until the app
++            // says it has a picture of its own
++            if (flips_submitted == 1)
++                sceSystemServiceHideSplashScreen();
++            if (flips_submitted <= 3)
++                LOG_INFO("PS4 WSI: flip {} of buffer {} ({})", flips_submitted, buffer, gpu_flip ? "GPU-side" : "CPU wait");
++        }
++        if (info->pResults)
++            info->pResults[i] = r < 0 ? VK_ERROR_SURFACE_LOST_KHR : VK_SUCCESS;
++    }
++    return result;
++}
++
++// Submits without their semaphores: on the PS4 binary semaphores only lose the device, and with
++// one in-order queue (and the CPU wait for the image in AcquireNextImageKHR) they add nothing.
++VKAPI_ATTR VkResult VKAPI_CALL QueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo *submits, VkFence fence) {
++    static PFN_vkQueueSubmit real = nullptr;
++    if (!real)
++        real = device_fn<PFN_vkQueueSubmit>(device_, "vkQueueSubmit");
++    VkSubmitInfo stripped[8];
++    std::vector<VkSubmitInfo> many;
++    VkSubmitInfo *copy = stripped;
++    if (count > 8) {
++        many.resize(count);
++        copy = many.data();
++    }
++    for (uint32_t i = 0; i < count; i++) {
++        copy[i] = submits[i];
++        copy[i].waitSemaphoreCount = 0;
++        copy[i].pWaitSemaphores = nullptr;
++        copy[i].pWaitDstStageMask = nullptr;
++        copy[i].signalSemaphoreCount = 0;
++        copy[i].pSignalSemaphores = nullptr;
++    }
++    return real(queue, count, copy, fence);
++}
++
++PFN_vkVoidFunction intercept(const char *name) {
++#define PS4WSI_ENTRY(fn)               \
++    if (strcmp(name, "vk" #fn) == 0) \
++    return reinterpret_cast<PFN_vkVoidFunction>(&fn)
++    PS4WSI_ENTRY(EnumerateInstanceExtensionProperties);
++    PS4WSI_ENTRY(EnumerateInstanceLayerProperties);
++    PS4WSI_ENTRY(CreateInstance);
++    PS4WSI_ENTRY(EnumerateDeviceExtensionProperties);
++    PS4WSI_ENTRY(CreateDevice);
++    PS4WSI_ENTRY(CreateHeadlessSurfaceEXT);
++    PS4WSI_ENTRY(DestroySurfaceKHR);
++    PS4WSI_ENTRY(GetPhysicalDeviceSurfaceSupportKHR);
++    PS4WSI_ENTRY(GetPhysicalDeviceSurfaceCapabilitiesKHR);
++    PS4WSI_ENTRY(GetPhysicalDeviceSurfaceCapabilities2KHR);
++    PS4WSI_ENTRY(GetPhysicalDeviceSurfaceFormatsKHR);
++    PS4WSI_ENTRY(GetPhysicalDeviceSurfacePresentModesKHR);
++    PS4WSI_ENTRY(CreateSwapchainKHR);
++    PS4WSI_ENTRY(DestroySwapchainKHR);
++    PS4WSI_ENTRY(GetSwapchainImagesKHR);
++    PS4WSI_ENTRY(AcquireNextImageKHR);
++    PS4WSI_ENTRY(QueuePresentKHR);
++    PS4WSI_ENTRY(QueueSubmit);
++#undef PS4WSI_ENTRY
++    return nullptr;
++}
++
++VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL GetDeviceProcAddr(VkDevice device, const char *name) {
++    // vulkan.hpp's DispatchLoaderDynamic::init(device) looks vkGetDeviceProcAddr up again through
++    // itself: RADV's would then resolve the swapchain functions, and it has none (all null)
++    if (strcmp(name, "vkGetDeviceProcAddr") == 0)
++        return reinterpret_cast<PFN_vkVoidFunction>(&GetDeviceProcAddr);
++    if (auto fn = intercept(name))
++        return fn;
++    return vk_common_GetDeviceProcAddr(device, name);
++}
++
++VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL GetInstanceProcAddr(VkInstance instance, const char *name) {
++    if (strcmp(name, "vkGetInstanceProcAddr") == 0)
++        return reinterpret_cast<PFN_vkVoidFunction>(&GetInstanceProcAddr);
++    if (strcmp(name, "vkGetDeviceProcAddr") == 0)
++        return reinterpret_cast<PFN_vkVoidFunction>(&GetDeviceProcAddr);
++    if (auto fn = intercept(name))
++        return fn;
++    return vk_icdGetInstanceProcAddr(instance, name);
++}
++
++} // namespace
++
++PFN_vkGetInstanceProcAddr ps4_vk_get_instance_proc_addr() {
++    return &GetInstanceProcAddr;
++}
++
++int ps4wsi_video_handle() {
++    const std::lock_guard<std::mutex> lock(mutex);
++    return open_video_out() ? video : -1;
++}
++
++unsigned long long ps4wsi_flip_count() {
++    return flips_submitted;
++}
+diff --git a/vita3k/ps4/ps4_wsi.h b/vita3k/ps4/ps4_wsi.h
+new file mode 100644
+index 00000000..ced3b207
+--- /dev/null
++++ b/vita3k/ps4/ps4_wsi.h
+@@ -0,0 +1,42 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// PS4: Vulkan window system integration on VideoOut (ps4_wsi.cpp).
++
++#pragma once
++
++#ifndef VK_NO_PROTOTYPES
++#define VK_NO_PROTOTYPES
++#endif
++#include <vulkan/vulkan_core.h>
++
++namespace ps4wsi {
++// VideoOut's 1080p output (the system scales it for a 720p TV)
++constexpr unsigned WIDTH = 1920;
++constexpr unsigned HEIGHT = 1080;
++// VideoOut buffer slots 12-15 are the launcher's (ps4_launcher.cpp); swapchains take 0-11
++constexpr int LAUNCHER_FIRST_BUFFER = 12;
++} // namespace ps4wsi
++
++// vkGetInstanceProcAddr of the statically linked RADV, with the PS4 surface and swapchain
++// (VK_EXT_headless_surface + VK_KHR_swapchain on VideoOut) added.
++PFN_vkGetInstanceProcAddr ps4_vk_get_instance_proc_addr();
++
++// The app's VideoOut handle, opened on first use (the launcher shares it with the swapchains)
++int ps4wsi_video_handle();
++// Flips submitted by swapchains so far
++unsigned long long ps4wsi_flip_count();
+diff --git a/vita3k/renderer/src/vulkan/renderer.cpp b/vita3k/renderer/src/vulkan/renderer.cpp
+index ed8c71ad..447670e5 100644
+--- a/vita3k/renderer/src/vulkan/renderer.cpp
++++ b/vita3k/renderer/src/vulkan/renderer.cpp
+@@ -45,6 +45,12 @@
+ #include <MoltenVK/mvk_vulkan.h>
+ #endif
+ 
++#ifdef __PS4__
++// The PS4 frontend (ps4/ps4_wsi.cpp): RADV is linked in, with the VideoOut surface and swapchain
++// added on top. There is no Vulkan loader to open.
++PFN_vkGetInstanceProcAddr ps4_vk_get_instance_proc_addr();
++#endif
++
+ #ifdef __ANDROID__
+ #include <SDL3/SDL_system.h>
+ #include <dlfcn.h>
+@@ -379,6 +385,8 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
+ 
+         if (!detect_patch_bcn(&texture_cache.support_dxt))
+             return false;
++#elif defined(__PS4__)
++        VULKAN_HPP_DEFAULT_DISPATCHER.init(ps4_vk_get_instance_proc_addr());
+ #else
+         VULKAN_HPP_DEFAULT_DISPATCHER.init();
+ #endif
+@@ -406,6 +414,10 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
+             instance_extensions.push_back(vk::KHRWin32SurfaceExtensionName);
+ #elif defined(__APPLE__)
+             instance_extensions.push_back(vk::EXTMetalSurfaceExtensionName);
++#elif defined(__PS4__)
++            // the PS4 frame host always makes the surface
++            LOG_ERROR("No Vulkan surface provider");
++            return false;
+ #elif !defined(__ANDROID__)
+             if (!select_linux_surface_extension(*this, frame_host->handle(), instance_extensions))
+                 return false;
+@@ -1724,6 +1736,8 @@ renderer::VulkanDeviceInfo renderer::enumerate_vulkan_devices(const std::string
+             return info;
+ 
+         dispatch.init(vk_get_instance_proc_addr);
++#elif defined(__PS4__)
++        dispatch.init(ps4_vk_get_instance_proc_addr());
+ #else
+         dispatch.init();
+ #endif
+diff --git a/vita3k/shader/include/shader/usse_disasm.h b/vita3k/shader/include/shader/usse_disasm.h
+index 4af0f1e3..a5e4eb6c 100644
+--- a/vita3k/shader/include/shader/usse_disasm.h
++++ b/vita3k/shader/include/shader/usse_disasm.h
+@@ -25,7 +25,9 @@
+ 
+ namespace shader::usse::disasm {
+ 
+-extern thread_local std::stringstream *disasm_storage;
++// constinit: a constant-initialized thread_local needs no init function, so users don't refer to
++// one (the PS4's fake SELF refuses the weak reference to a function nothing defines)
++extern constinit thread_local std::stringstream *disasm_storage;
+ 
+ //
+ // Disasm helpers
+diff --git a/vita3k/shader/src/usse_disasm.cpp b/vita3k/shader/src/usse_disasm.cpp
+index 00c041e1..c603040d 100644
+--- a/vita3k/shader/src/usse_disasm.cpp
++++ b/vita3k/shader/src/usse_disasm.cpp
+@@ -26,7 +26,7 @@ using namespace shader::usse;
+ 
+ namespace shader::usse::disasm {
+ 
+-thread_local std::stringstream *disasm_storage = nullptr;
++constinit thread_local std::stringstream *disasm_storage = nullptr;
+ 
+ //
+ // Disasm helpers

@@ -1,0 +1,169 @@
+diff --git a/src/dynarmic/CMakeLists.txt b/src/dynarmic/CMakeLists.txt
+index 6f0813ca..c19b941b 100644
+--- a/src/dynarmic/CMakeLists.txt
++++ b/src/dynarmic/CMakeLists.txt
+@@ -480,7 +480,8 @@ elseif (APPLE)
+             backend/exception_handler_macos_mig.c
+         )
+     endif()
+-elseif (UNIX)
++elseif (UNIX OR PS4)
++    # PS4: a FreeBSD kernel (PacBrew's toolchain calls the system Generic, so UNIX is unset)
+     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+         target_link_libraries(dynarmic PRIVATE rt)
+     endif()
+diff --git a/src/dynarmic/backend/exception_handler_posix.cpp b/src/dynarmic/backend/exception_handler_posix.cpp
+index 2d6d6ea6..29ce6995 100644
+--- a/src/dynarmic/backend/exception_handler_posix.cpp
++++ b/src/dynarmic/backend/exception_handler_posix.cpp
+@@ -86,6 +86,8 @@ void RegisterHandler() {
+ }
+ 
+ SigHandler::SigHandler() {
++#ifndef __PS4__
++    // (PS4: every thread already has a signal stack of its own, from the port's pthread_create)
+     const size_t signal_stack_size = std::max<size_t>(SIGSTKSZ, 2 * 1024 * 1024);
+ 
+     signal_stack_memory = std::malloc(signal_stack_size);
+@@ -99,6 +101,7 @@ SigHandler::SigHandler() {
+         supports_fast_mem = false;
+         return;
+     }
++#endif
+ 
+     struct sigaction sa;
+     sa.sa_handler = nullptr;
+@@ -110,7 +113,8 @@ SigHandler::SigHandler() {
+         supports_fast_mem = false;
+         return;
+     }
+-#ifdef __APPLE__
++#if defined(__APPLE__) || defined(__PS4__)
++    // (the PS4's FreeBSD kernel may raise SIGBUS for protection faults)
+     if (sigaction(SIGBUS, &sa, &old_sa_bus) != 0) {
+         fmt::print(stderr, "dynarmic: POSIX SigHandler: could not set SIGBUS handler\n");
+         supports_fast_mem = false;
+diff --git a/src/dynarmic/backend/x64/block_of_code.cpp b/src/dynarmic/backend/x64/block_of_code.cpp
+index 22d9868f..30642e3f 100644
+--- a/src/dynarmic/backend/x64/block_of_code.cpp
++++ b/src/dynarmic/backend/x64/block_of_code.cpp
+@@ -20,6 +20,12 @@
+ 
+ #include <array>
+ #include <cstring>
++#ifdef __PS4__
++#    include <map>
++#    include <mutex>
++
++#    include <fmt/format.h>
++#endif
+ 
+ #include <mcl/assert.hpp>
+ #include <mcl/bit/bit_field.hpp>
+@@ -54,12 +60,72 @@ const std::array<Xbyak::Reg64, ABI_PARAM_COUNT> BlockOfCode::ABI_PARAMS = {Block
+ 
+ namespace {
+ 
++#ifdef __PS4__
++// PS4: code only runs from flexible memory, of which there are a few hundred MiB for everything,
++// and a JIT per guest thread. Each code cache is a virtual range reservation that
++// EnsureMemoryCommitted backs as the code grows, and starts small.
++constexpr size_t CONSTANT_POOL_SIZE = 512 * 1024;
++constexpr size_t PRELUDE_COMMIT_SIZE = 256 * 1024;
++constexpr size_t PS4_PAGE_SIZE = 16 * 1024;  // the PS4 maps 16 KiB pages
++constexpr size_t PS4_COMMIT_STEP = 256 * 1024;
++
++extern "C" {
++// Declared by hand: several OpenOrbis prototypes are wrong.
++int32_t sceKernelReserveVirtualRange(void** address, size_t length, int32_t flags, size_t alignment);
++int32_t sceKernelMapNamedSystemFlexibleMemory(void** address, size_t length, int32_t protection, int32_t flags, const char* name);
++int32_t sceKernelMapNamedFlexibleMemory(void** address, size_t length, int32_t protection, int32_t flags, const char* name);
++int32_t sceKernelMunmap(void* address, size_t length);
++}
++constexpr int32_t PS4_MAP_FIXED = 0x10;  // SCE_KERNEL_MAP_FIXED
++constexpr int32_t PS4_PROT_CPU_RWX = 0x7;
++
++// Executable memory at a place in a reservation: from the system pool (where the heap also is), or
++// failing that the app's regular flexible memory.
++bool PS4CommitCode(uint8_t* at, size_t size) {
++    void* addr = at;
++    if (sceKernelMapNamedSystemFlexibleMemory(&addr, size, PS4_PROT_CPU_RWX, PS4_MAP_FIXED, "dynarmic") == 0 && addr == at)
++        return true;
++    addr = at;
++    if (sceKernelMapNamedFlexibleMemory(&addr, size, PS4_PROT_CPU_RWX, PS4_MAP_FIXED, "dynarmic") == 0 && addr == at)
++        return true;
++    fmt::print(stderr, "dynarmic: no executable memory for {} KiB of code at {}\n", size >> 10, static_cast<void*>(at));
++    return false;
++}
++#else
+ constexpr size_t CONSTANT_POOL_SIZE = 2 * 1024 * 1024;
+ constexpr size_t PRELUDE_COMMIT_SIZE = 16 * 1024 * 1024;
++#endif
+ 
+ class CustomXbyakAllocator : public Xbyak::Allocator {
+ public:
+-#ifdef _WIN32
++#ifdef __PS4__
++    uint8_t* alloc(size_t size) override {
++        size = (size + PS4_PAGE_SIZE - 1) & ~(PS4_PAGE_SIZE - 1);
++        void* p = nullptr;
++        if (sceKernelReserveVirtualRange(&p, size, 0, PS4_PAGE_SIZE) != 0) {
++            throw Xbyak::Error(Xbyak::ERR_CANT_ALLOC);
++        }
++        std::lock_guard<std::mutex> guard(sizes_mutex);
++        sizes[static_cast<uint8_t*>(p)] = size;
++        return static_cast<uint8_t*>(p);
++    }
++
++    void free(uint8_t* p) override {
++        std::lock_guard<std::mutex> guard(sizes_mutex);
++        const auto iter = sizes.find(p);
++        if (iter == sizes.end())
++            return;
++        sceKernelMunmap(p, iter->second);
++        sizes.erase(iter);
++    }
++
++    // mapped executable as it is committed
++    bool useProtect() const override { return false; }
++
++private:
++    std::mutex sizes_mutex;
++    std::map<uint8_t*, size_t> sizes;
++#elif defined(_WIN32)
+     uint8_t* alloc(size_t size) override {
+         void* p = VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_READWRITE);
+         if (p == nullptr) {
+@@ -271,7 +337,18 @@ size_t BlockOfCode::SpaceRemaining() const {
+ }
+ 
+ void BlockOfCode::EnsureMemoryCommitted([[maybe_unused]] size_t codesize) {
+-#ifdef _WIN32
++#ifdef __PS4__
++    if (committed_size < size_ + codesize) {
++        const size_t wanted = (size_ + codesize + PS4_COMMIT_STEP - 1) & ~(PS4_COMMIT_STEP - 1);
++        const size_t target = std::min<size_t>(maxSize_, wanted);
++        if (target > committed_size) {
++            if (!PS4CommitCode(top_ + committed_size, target - committed_size)) {
++                throw Xbyak::Error(Xbyak::ERR_CANT_ALLOC);
++            }
++            committed_size = target;
++        }
++    }
++#elif defined(_WIN32)
+     if (committed_size < size_ + codesize) {
+         committed_size = std::min<size_t>(maxSize_, committed_size + codesize);
+ #    ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
+diff --git a/src/dynarmic/backend/x64/block_of_code.h b/src/dynarmic/backend/x64/block_of_code.h
+index 3f7573af..b4463440 100644
+--- a/src/dynarmic/backend/x64/block_of_code.h
++++ b/src/dynarmic/backend/x64/block_of_code.h
+@@ -185,7 +185,7 @@ private:
+     bool prelude_complete = false;
+     CodePtr code_begin = nullptr;
+ 
+-#ifdef _WIN32
++#if defined(_WIN32) || defined(__PS4__)
+     size_t committed_size = 0;
+ #endif
+ 
