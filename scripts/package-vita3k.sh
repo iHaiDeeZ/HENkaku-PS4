@@ -27,6 +27,9 @@ cp -r "$SRC/data" "$STAGE/data"
 cp -r "$SRC/vita3k/shaders-builtin" "$STAGE/shaders-builtin"
 cp -r "$SRC/vita3k/icons" "$STAGE/icons"
 cp "$SRC/COPYING.txt" "$STAGE/COPYING.txt"
+# The launcher's and the overlay's font until the PS Vita's font package is installed (Roboto, OFL;
+# the app can't read the PS4's own fonts in /preinst)
+cp -r "$HERE/../fonts" "$STAGE/fonts"
 # PkgTool's pkg_build crashes ("Sequence contains no elements") on empty folders.
 find "$STAGE" -type d -empty -delete
 # Vulkan (RADV on GNM) runs under the plain homebrew identity (4.5 GiB of direct memory).

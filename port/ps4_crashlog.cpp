@@ -83,10 +83,12 @@ bool readable(const void* address) {
     return true;
 }
 
-// Opened on first use: the heap may log before this file's constructor runs.
+// Opened on first use: the heap may log before this file's constructor runs. The last run's stays
+// as boot-trace.prev.log (Vita3K v00.04: a quick second start had wiped the one that mattered).
 int traceFd() {
     if (g_traceFd < 0) {
         mkdir("/data/Vita3K", 0777);
+        rename("/data/Vita3K/boot-trace.log", "/data/Vita3K/boot-trace.prev.log");
         g_traceFd = open("/data/Vita3K/boot-trace.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
     }
     return g_traceFd;

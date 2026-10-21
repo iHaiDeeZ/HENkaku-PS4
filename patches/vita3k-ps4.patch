@@ -950,23 +950,25 @@ index 040421ec..989f2107 100644
  		module-tests
  		tests/arg_layout_tests.cpp
 diff --git a/vita3k/overlay/src/font.cpp b/vita3k/overlay/src/font.cpp
-index 117569cf2..bd15b552 100644
+index 117569cf2..4c8552a5 100644
 --- a/vita3k/overlay/src/font.cpp
 +++ b/vita3k/overlay/src/font.cpp
-@@ -185,6 +185,12 @@ glyph_load_setup font::get_glyph_files(language_class class_) const {
+@@ -185,6 +185,14 @@ glyph_load_setup font::get_glyph_files(language_class class_) const {
          result.font_names.emplace_back("Roboto-Regular.ttf");
          result.font_names.emplace_back("DroidSans.ttf");
          result.font_names.emplace_back("NotoSans-Regular.ttf");
 +#elif defined(__PS4__)
-+        // the console's own (/preinst/common/font, the frame host's font directory)
++        // the console's own (/preinst/common/font, the frame host's font directory, when the app
++        // may read it), else the package's (/app0/fonts)
 +        if (bold)
 +            result.font_names.emplace_back("SST-Bold.otf");
 +        result.font_names.emplace_back("SST-Medium.otf");
 +        result.font_names.emplace_back("SST-Roman.otf");
++        result.font_names.emplace_back(bold ? "Roboto-Bold.ttf" : "Roboto-Regular.ttf");
  #elif !defined(_WIN32)
          result.font_names.emplace_back("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf");
          result.font_names.emplace_back("/usr/share/fonts/TTF/DejaVuSans.ttf");
-@@ -217,6 +223,9 @@ glyph_load_setup font::get_glyph_files(language_class class_) const {
+@@ -217,6 +225,9 @@ glyph_load_setup font::get_glyph_files(language_class class_) const {
          result.font_names.emplace_back("NotoSansCJK-Regular.ttc");
          result.font_names.emplace_back("NotoSansJP-Regular.otf");
          result.font_names.emplace_back("NotoSansSC-Regular.otf");
@@ -976,7 +978,7 @@ index 117569cf2..bd15b552 100644
  #else
          result.font_names.emplace_back("NotoSansCJK-Regular.ttc");
          result.font_names.emplace_back("NotoSansSC-Regular.otf");
-@@ -241,6 +250,8 @@ glyph_load_setup font::get_glyph_files(language_class class_) const {
+@@ -241,6 +252,8 @@ glyph_load_setup font::get_glyph_files(language_class class_) const {
  #elif defined(__ANDROID__)
          result.font_names.emplace_back("NotoSansKR-Regular.otf");
          result.font_names.emplace_back("NotoSansCJK-Regular.ttc");
@@ -1028,10 +1030,10 @@ index 00000000..9a597d5e
 +ps4_add_eboot(vita3k)
 diff --git a/vita3k/ps4/ps4_canvas.cpp b/vita3k/ps4/ps4_canvas.cpp
 new file mode 100644
-index 00000000..e8ac8c90
+index 00000000..dac5ad53
 --- /dev/null
 +++ b/vita3k/ps4/ps4_canvas.cpp
-@@ -0,0 +1,428 @@
+@@ -0,0 +1,468 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -1049,9 +1051,12 @@ index 00000000..e8ac8c90
 +// with this program; if not, write to the Free Software Foundation, Inc.,
 +// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 +
-+// PS4: the launcher's software canvas. Text comes from the console's own fonts
-+// (/preinst/common/font), rasterized with stb_truetype (implemented in overlay/src/font.cpp);
-+// pictures are decoded with stb_image (renderer/src/texture/replacement.cpp).
++// PS4: the launcher's software canvas. Text comes from the PS Vita's fonts once Vita3K has the
++// font package (sa0/data/font/pvf: Latin, Japanese, Chinese, Korean), else from the PS4's own
++// (/preinst/common/font, where the app may read it: on the test console it couldn't, and v00.04
++// drew no text at all), else from the Roboto in the package (/app0/fonts). Rasterized with
++// stb_truetype (implemented in overlay/src/font.cpp); pictures are decoded with stb_image
++// (renderer/src/texture/replacement.cpp).
 +
 +#include "ps4_canvas.h"
 +
@@ -1067,15 +1072,24 @@ index 00000000..e8ac8c90
 +#include <mutex>
 +#include <unordered_map>
 +
++extern "C" void ps4_boot_trace(const char *line); // port/ps4_crashlog.cpp
++
 +namespace ps4ui {
 +
 +namespace {
 +
-+constexpr const char *FONT_DIR = "/preinst/common/font/";
-+
 +struct Font {
 +    std::vector<uint8_t> data;
 +    stbtt_fontinfo info{};
++};
++
++// A place fonts come from: its Latin fonts (the first it has of each list) and its fonts for other
++// scripts
++struct FontSource {
++    std::string dir;
++    std::vector<const char *> regular;
++    std::vector<const char *> bold;
++    std::vector<const char *> scripts;
 +};
 +
 +struct Glyph {
@@ -1088,21 +1102,22 @@ index 00000000..e8ac8c90
 +};
 +
 +struct FontSet {
-+    std::vector<std::unique_ptr<Font>> fonts;
++    std::vector<std::shared_ptr<Font>> fonts; // Latin first, then the other scripts
 +    std::unordered_map<uint64_t, Glyph> glyphs;
 +};
 +
 +std::mutex fonts_mutex;
 +bool fonts_tried = false;
++std::string vita_font_dir; // set_vita_font_dir
 +FontSet regular_set;
 +FontSet bold_set;
 +
-+std::unique_ptr<Font> load_font(const char *name) {
-+    const std::string path = std::string(FONT_DIR) + name;
++std::shared_ptr<Font> load_font(const std::string &dir, const char *name) {
++    const std::string path = dir + name;
 +    FILE *f = std::fopen(path.c_str(), "rb");
 +    if (!f)
 +        return nullptr;
-+    auto font = std::make_unique<Font>();
++    auto font = std::make_shared<Font>();
 +    std::fseek(f, 0, SEEK_END);
 +    const long size = std::ftell(f);
 +    std::fseek(f, 0, SEEK_SET);
@@ -1116,26 +1131,45 @@ index 00000000..e8ac8c90
 +    return font;
 +}
 +
-+// The first font of each list that the console has, then the fallbacks for other scripts
++// The fonts of the first place that has them
 +void load_fonts() {
 +    if (fonts_tried)
 +        return;
 +    fonts_tried = true;
-+    const auto load_set = [](FontSet &set, std::initializer_list<const char *> primary) {
-+        for (const char *name : primary) {
-+            if (auto font = load_font(name)) {
-+                set.fonts.push_back(std::move(font));
-+                break;
++    std::vector<FontSource> sources;
++    if (!vita_font_dir.empty())
++        sources.push_back({ vita_font_dir, { "ltn0.pvf" }, { "ltn4.pvf" }, { "jpn0.pvf", "cn0.pvf", "kr0.pvf" } });
++    sources.push_back({ "/preinst/common/font/", { "SST-Roman.otf", "SST-Medium.otf" }, { "SST-Bold.otf", "SST-Medium.otf" },
++        { "SSTJpPro-Regular.otf", "DFHEI5-SONY.ttf", "SCEPS4Yoongd-Medium.otf" } });
++    sources.push_back({ "/app0/fonts/", { "Roboto-Regular.ttf" }, { "Roboto-Bold.ttf" }, {} });
++
++    const auto first = [](const FontSource &source, const std::vector<const char *> &names) -> std::shared_ptr<Font> {
++        for (const char *name : names) {
++            if (auto font = load_font(source.dir, name))
++                return font;
++        }
++        return nullptr;
++    };
++    std::string line = "launcher: no fonts, so no text";
++    for (const FontSource &source : sources) {
++        const std::shared_ptr<Font> regular = first(source, source.regular);
++        if (!regular)
++            continue;
++        const std::shared_ptr<Font> bold = first(source, source.bold);
++        regular_set.fonts.push_back(regular);
++        bold_set.fonts.push_back(bold ? bold : regular);
++        // (the sets share these: the Chinese font alone is 8 MiB)
++        for (const char *name : source.scripts) {
++            if (auto font = load_font(source.dir, name)) {
++                regular_set.fonts.push_back(font);
++                bold_set.fonts.push_back(font);
 +            }
 +        }
-+        for (const char *name : { "SSTJpPro-Regular.otf", "DFHEI5-SONY.ttf", "SCEPS4Yoongd-Medium.otf" }) {
-+            if (auto font = load_font(name))
-+                set.fonts.push_back(std::move(font));
-+        }
-+    };
-+    load_set(regular_set, { "SST-Roman.otf", "SST-Medium.otf" });
-+    load_set(bold_set, { "SST-Bold.otf", "SST-Medium.otf", "SST-Roman.otf" });
-+    LOG_INFO("PS4 launcher: {} regular and {} bold fonts", regular_set.fonts.size(), bold_set.fonts.size());
++        line = fmt::format("launcher: fonts from {} ({} with the other scripts)", source.dir, regular_set.fonts.size());
++        break;
++    }
++    LOG_INFO("PS4 {}", line);
++    ps4_boot_trace(line.c_str());
 +}
 +
 +FontSet &font_set(Weight weight) {
@@ -1204,6 +1238,14 @@ index 00000000..e8ac8c90
 +    const std::lock_guard<std::mutex> lock(fonts_mutex);
 +    load_fonts();
 +    return !regular_set.fonts.empty();
++}
++
++void set_vita_font_dir(const std::string &dir) {
++    const std::lock_guard<std::mutex> lock(fonts_mutex);
++    vita_font_dir = dir;
++    fonts_tried = false;
++    regular_set = FontSet{};
++    bold_set = FontSet{};
 +}
 +
 +Image load_image(const std::string &path, int width, int height) {
@@ -1462,10 +1504,10 @@ index 00000000..e8ac8c90
 +} // namespace ps4ui
 diff --git a/vita3k/ps4/ps4_canvas.h b/vita3k/ps4/ps4_canvas.h
 new file mode 100644
-index 00000000..68141c2f
+index 00000000..b0e6c08c
 --- /dev/null
 +++ b/vita3k/ps4/ps4_canvas.h
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,101 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -1559,8 +1601,12 @@ index 00000000..68141c2f
 +    std::vector<uint32_t> pixels;
 +};
 +
-+// Whether the console's fonts could be read (the text is missing otherwise)
++// Whether there are fonts (the text is missing otherwise)
 +bool fonts_loaded();
++
++// Where the PS Vita's fonts are (Vita3K's sa0/data/font/pvf/, from the font package): the first
++// choice for text. The fonts load again, from there if it has them, for the next text.
++void set_vita_font_dir(const std::string &dir);
 +
 +} // namespace ps4ui
 diff --git a/vita3k/ps4/ps4_download.cpp b/vita3k/ps4/ps4_download.cpp
@@ -1789,10 +1835,10 @@ index 00000000..01fdf0f1
 +} // namespace ps4download
 diff --git a/vita3k/ps4/ps4_launcher.cpp b/vita3k/ps4/ps4_launcher.cpp
 new file mode 100644
-index 00000000..da09606d
+index 00000000..8c6a502b
 --- /dev/null
 +++ b/vita3k/ps4/ps4_launcher.cpp
-@@ -0,0 +1,1238 @@
+@@ -0,0 +1,1242 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -2882,7 +2928,11 @@ index 00000000..da09606d
 +                job.thread.join();
 +                job.running = false;
 +                items = load_items(emuenv);
++                const bool had_font_package = fw.font_package;
 +                fw = app::get_firmware_state(emuenv);
++                // the text in the PS Vita's fonts, now that they're there
++                if (fw.font_package && !had_font_package)
++                    ps4ui::set_vita_font_dir(fs_utils::path_to_utf8(emuenv.vita_fs_path / "sa0" / "data" / "font" / "pvf") + "/");
 +                selected = std::min(selected, std::max(0, static_cast<int>(items.size()) - 1));
 +                if (!job.firmware) {
 +                    // back to the games, on the one just installed
@@ -3083,10 +3133,10 @@ index 00000000..0210098f
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..c6375941
+index 00000000..0254cb84
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
-@@ -0,0 +1,351 @@
+@@ -0,0 +1,354 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -3117,6 +3167,7 @@ index 00000000..c6375941
 +// the guest memory and the GPU device behind, and a fresh process is the clean way back to the
 +// launcher. A game starting another of its executables goes through the same restart.
 +
++#include "ps4_canvas.h"
 +#include "ps4_launcher.h"
 +#include "ps4_pad.h"
 +#include "ps4_wsi.h"
@@ -3208,7 +3259,7 @@ index 00000000..c6375941
 +        return ps4wsi::HEIGHT;
 +    }
 +    std::vector<std::string> font_dirs() const override {
-+        return { "/preinst/common/font/" };
++        return { "/preinst/common/font/", "/app0/fonts/" };
 +    }
 +};
 +
@@ -3357,6 +3408,8 @@ index 00000000..c6375941
 +    trace("main");
 +    Root root_paths;
 +    app::init_paths(root_paths);
++    // the launcher's text: the PS Vita's fonts once the font package is installed
++    ps4ui::set_vita_font_dir(fs_utils::path_to_utf8(root_paths.get_vita_fs_path() / "sa0" / "data" / "font" / "pvf") + "/");
 +    boost::system::error_code ec;
 +    fs::create_directories(root_paths.get_vita_fs_path(), ec);
 +    fs::create_directories(ps4launcher::INSTALL_DIR, ec);
@@ -4539,3 +4592,18 @@ index 00c041e1..c603040d 100644
  
  //
  // Disasm helpers
+diff --git a/vita3k/util/src/logging.cpp b/vita3k/util/src/logging.cpp
+index 816c6297..9115c351 100644
+--- a/vita3k/util/src/logging.cpp
++++ b/vita3k/util/src/logging.cpp
+@@ -110,8 +110,8 @@ ExitCode init(const Root &root_paths, bool use_stdout) {
+     SetConsoleTitle("Vita3K PSVita Emulator");
+ #endif
+ 
+-#ifdef __ANDROID__
+-    // needed, otherwise the log file contains nothing
++#if defined(__ANDROID__) || defined(__PS4__)
++    // needed, otherwise the log file contains nothing (PS4: the app ends without flushing it)
+     spdlog::flush_on(spdlog::level::trace);
+ #endif
+ 

@@ -4,9 +4,10 @@
 in WSL Ubuntu with the M33 / Resonance / DolphinPS4 / Crema PS4 toolchain (clang 21 + libc++ 21 on
 OpenOrbis).
 
-Status: **v00.04**. On the console v00.02 and v00.03 stopped at startup on file functions the PS4's
-C library lacks or does differently (see "How the port works", file functions); v00.04 fixes the
-second and adds the install screen. Not yet seen running.
+Status: **v00.05**. On the console v00.04 starts, shows the launcher and downloads and installs the
+firmware, but drew no text: the app can't read the PS4's fonts in `/preinst`. v00.05 draws text in
+the PS Vita's fonts (from the font package it installs) or in the Roboto it carries. No game has
+run yet.
 
 ## Using it
 
@@ -50,8 +51,8 @@ When a game ends (or Exit in the pause menu) the app restarts into the launcher.
 | `/data/Vita3K/fs` | the Vita's file system: `ux0` (apps, saves), `vs0`/`os0`/`sa0`/`pd0` (firmware) |
 | `/data/Vita3K/config.yml` | Vita3K's settings |
 | `/data/Vita3K/cache` | shader cache; `download/`: the firmware while it downloads |
-| `/data/Vita3K` | `vita3k.log`, `boot-trace.log` (startup milestones), `crash.log` |
-| `/app0` | the package: `eboot.bin`, `data/`, `shaders-builtin/`, `icons/` |
+| `/data/Vita3K` | `vita3k.log`, `boot-trace.log` (startup milestones; the run before is `boot-trace.prev.log`), `crash.log` (appended to) |
+| `/app0` | the package: `eboot.bin`, `data/`, `shaders-builtin/`, `icons/`, `fonts/` |
 
 Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
 
@@ -60,8 +61,11 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
 - **Frontend** (`vita3k/ps4/` in the patch): `ps4_main.cpp` replaces the Qt UI and the SDL window.
   The launcher (`ps4_launcher.cpp`, `ps4_canvas.cpp`: the game list and the install screen, which
   browses the install folder, `/data` and `/mnt/usbN`) is drawn by the CPU into VideoOut buffers
-  12-13 in the console's own fonts; whether it reached the screen is in `boot-trace.log`
-  (`launcher: screen ready`, `first frame`). The game runs in an `app::AppSessionController` session like
+  12-13; whether it reached the screen is in `boot-trace.log` (`launcher: screen ready`,
+  `first frame`). Its text is in the PS Vita's fonts once Vita3K has the font package
+  (`sa0/data/font/pvf`: Latin, Japanese, Chinese, Korean), else in the Roboto in the package
+  (`fonts/`); the PS4's own fonts (`/preinst/common/font`) aren't readable by the app on the test
+  console (`boot-trace.log` says which it got). The game runs in an `app::AppSessionController` session like
   the SDL frontend's. A session leaves threads, guest memory and the GPU device behind, so when the
   game ends the app restarts itself (`sceSystemServiceLoadExec`) back into the launcher; a game
   starting another executable restarts into it the same way.
@@ -117,4 +121,6 @@ Upload from Windows (Git Bash): `scripts/upload-to-console.sh out/Vita3K-vXX.YY.
 GPL-2.0-or-later, as Vita3K ([LICENSE](LICENSE)): the patches are modifications of Vita3K and
 dynarmic (0BSD). The PS4 runtime in `port/` and the toolchain scripts come from the M33 / Resonance /
 DolphinPS4 / Crema ports; `port/mesa/ac_ps4_drm.c` is the RADV winsys of the PS4 Mesa port (MIT).
+`fonts/` is Roboto 3.009 (from Vita3K's Tracy submodule), under the SIL Open Font License 1.1
+(`fonts/OFL-Roboto.txt`).
 No PS Vita firmware, Sony system files or games are included: supply your own.
