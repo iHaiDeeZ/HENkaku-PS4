@@ -5,9 +5,9 @@
 // *at APIs) and libc++'s std::filesystem go through them for every status, directory listing and
 // removal: Vita3K v00.02 died at its first create_directories ("Function not implemented").
 // With the linker's --wrap (toolchain/ps4-love-style.cmake) a name relative to a directory
-// descriptor is resolved against the path that descriptor was opened on (openat remembers each
-// directory's until it's closed), and stat, lstat, open, unlink, rmdir, chmod and utimes, which
-// the kernel has, do the work.
+// descriptor is resolved against the path that descriptor was opened on (open and openat remember
+// each directory's until it's closed), and stat, lstat, open, unlink, rmdir, chmod and utimes,
+// which the kernel has, do the work.
 
 #include <errno.h>
 #include <fcntl.h>
@@ -45,6 +45,13 @@ Dirs& dirs() {
 }
 
 constinit std::atomic<int> s_count{0};
+
+void remember(int fd, const std::string& path) {
+    Dirs& d = dirs();
+    std::lock_guard lock(d.lock);
+    if (d.paths.insert_or_assign(fd, path).second)
+        s_count++;
+}
 
 // The path a name relative to dirfd stands for; false (with errno) when dirfd isn't a directory
 // openat opened.
@@ -120,13 +127,18 @@ extern "C" int __wrap_openat(int dirfd, const char* path, int flags, ...) {
     if (fd < 0)
         return fd;
     struct stat st;
-    if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) {
-        Dirs& d = dirs();
-        std::lock_guard lock(d.lock);
-        if (d.paths.insert_or_assign(fd, full).second)
-            s_count++;
-    }
+    if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode))
+        remember(fd, full);
     return fd;
+}
+
+// From __wrap_open (ps4_crashlog.cpp): a directory opened by path. Boost opens the top of a
+// directory walk that way (its open_directory), then each folder in it relative to its parent's
+// descriptor: Vita3K v00.07 died walking an app folder ("Bad file descriptor").
+extern "C" void ps4_fileat_opened(int fd, const char* path) {
+    std::string full;
+    if (resolve(AT_FDCWD, path, full))
+        remember(fd, full);
 }
 
 extern "C" int __wrap_unlinkat(int dirfd, const char* path, int flags) {

@@ -1835,10 +1835,10 @@ index 00000000..01fdf0f1
 +} // namespace ps4download
 diff --git a/vita3k/ps4/ps4_launcher.cpp b/vita3k/ps4/ps4_launcher.cpp
 new file mode 100644
-index 00000000..8c6a502b
+index 00000000..4cb2f9cf
 --- /dev/null
 +++ b/vita3k/ps4/ps4_launcher.cpp
-@@ -0,0 +1,1242 @@
+@@ -0,0 +1,1336 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -1875,6 +1875,7 @@ index 00000000..8c6a502b
 +#include <app/functions.h>
 +#include <app/state.h>
 +#include <emuenv/state.h>
++#include <io/vfs.h>
 +#include <packages/functions.h>
 +#include <packages/license.h>
 +#include <packages/pkg.h>
@@ -2245,6 +2246,9 @@ index 00000000..8c6a502b
 +    std::vector<std::string> done; // what was installed
 +    std::vector<std::string> failures;
 +    std::string title_id; // the app installed last, which the list selects
++    // an app being decrypted before it starts: it starts when that worked
++    std::string start_app;
++    std::string start_title;
 +};
 +
 +void reset(InstallJob &job, bool firmware) {
@@ -2260,6 +2264,8 @@ index 00000000..8c6a502b
 +    job.done.clear();
 +    job.failures.clear();
 +    job.title_id.clear();
++    job.start_app.clear();
++    job.start_title.clear();
 +}
 +
 +// install_pup, which throws when a file isn't what it expects: the firmware's version, or nothing
@@ -2391,6 +2397,12 @@ index 00000000..8c6a502b
 +                break;
 +            }
 +            case Kind::GameFolder: {
++                // one of Vita3K's own (ux0/app/...): installing deletes where it goes first, which
++                // is where it is
++                if (fs_utils::path_to_utf8(p).rfind(fs_utils::path_to_utf8(emuenv.vita_fs_path), 0) == 0) {
++                    finish(p, false, "it's in Vita3K's own folders already: start it from the list");
++                    break;
++                }
 +                const bool ok = install_contents(emuenv, p) > 0;
 +                if (ok)
 +                    installed_app(emuenv.app_info.app_title_id);
@@ -2407,6 +2419,62 @@ index 00000000..8c6a502b
 +        const std::lock_guard<std::mutex> lock(job.mutex);
 +        job.failures.push_back(job.current + ": " + e.what());
 +        LOG_ERROR("PS4 launcher: installing {} stopped: {}", job.current, e.what());
++    }
++    job.finished = true;
++}
++
++// --- apps copied in still encrypted ---
++
++// A NoNpDrm dump copied into ux0/app as it was: its files are still encrypted (Vita3K decrypts a
++// dump when it installs one), so the game can't load. Decrypted, eboot.bin starts with "SCE".
++bool still_encrypted(const fs::path &app_dir) {
++    boost::system::error_code ec;
++    if (!fs::exists(app_dir / "sce_sys" / "package" / "work.bin", ec))
++        return false;
++    FILE *f = std::fopen(fs_utils::path_to_utf8(app_dir / "eboot.bin").c_str(), "rb");
++    if (!f)
++        return false;
++    char magic[4] = {};
++    const bool read = std::fread(magic, 1, sizeof(magic), f) == sizeof(magic);
++    std::fclose(f);
++    return read && std::memcmp(magic, "SCE\0", sizeof(magic)) != 0;
++}
++
++// Decrypts it in place with its work.bin, as installing the dump would have, license and all
++void decrypt_worker(EmuEnvState &emuenv, InstallJob &job, const fs::path &app_dir, const std::string &title) {
++    {
++        const std::lock_guard<std::mutex> lock(job.mutex);
++        job.total = 1;
++        job.index = 1;
++        job.heading = "Decrypting " + title;
++        job.current = "Only this once: it was copied in still encrypted";
++    }
++    ps4_boot_trace(("launcher: decrypting " + fs_utils::path_to_utf8(app_dir)).c_str());
++    bool ok = false;
++    try {
++        // (decrypt_install_nonpdrm goes by the category: a patch's license stays as it is)
++        vfs::FileBuffer sfo;
++        if (fs_utils::read_data(app_dir / "sce_sys" / "param.sfo", sfo))
++            sfo::get_param_info(emuenv.app_info, sfo, emuenv.cfg.sys_lang);
++        ok = decrypt_install_nonpdrm(emuenv, app_dir / "sce_sys" / "package" / "work.bin", app_dir, [&](float v) {
++            const std::lock_guard<std::mutex> lock(job.mutex);
++            job.progress = v;
++        });
++    } catch (const std::exception &e) {
++        LOG_ERROR("PS4 launcher: decrypting {} failed: {}", app_dir, e.what());
++    }
++    if (!ok) {
++        // what there is of the decrypted copy
++        boost::system::error_code ec;
++        fs::remove_all(fs_utils::path_concat(app_dir, "_dec"), ec);
++    }
++    ps4_boot_trace(ok ? "launcher: decrypted" : "launcher: decrypting failed");
++    const std::lock_guard<std::mutex> lock(job.mutex);
++    if (ok) {
++        job.installed = 1;
++        job.done.push_back(title);
++    } else {
++        job.failures.push_back("Couldn't decrypt " + title + ": see /data/Vita3K/vita3k.log");
 +    }
 +    job.finished = true;
 +}
@@ -2562,6 +2630,9 @@ index 00000000..8c6a502b
 +            text += (text.empty() ? "" : "\n") + failure + ". Square tries again";
 +        return text;
 +    }
++    // an app decrypted before it starts: only a failure has something to say
++    if (!job.start_app.empty())
++        return job.failures.empty() ? std::string() : job.failures.front();
 +    if (job.total == 0)
 +        return "Nothing there can be installed";
 +    if (job.failures.empty() && job.done.size() == 1)
@@ -2927,6 +2998,20 @@ index 00000000..8c6a502b
 +            if (job.finished) {
 +                job.thread.join();
 +                job.running = false;
++                // decrypted: it starts now
++                std::string start_app, start_title;
++                {
++                    const std::lock_guard<std::mutex> lock(job.mutex);
++                    if (job.installed > 0) {
++                        start_app = job.start_app;
++                        start_title = job.start_title;
++                    }
++                }
++                if (!start_app.empty()) {
++                    last_app_path = start_app;
++                    show_message("Starting", start_title);
++                    return Choice{ false, start_app, start_title };
++                }
 +                items = load_items(emuenv);
 +                const bool had_font_package = fw.font_package;
 +                fw = app::get_firmware_state(emuenv);
@@ -3020,11 +3105,20 @@ index 00000000..8c6a502b
 +            } else {
 +                if ((pressed & ORBIS_PAD_BUTTON_CROSS) && !items.empty()) {
 +                    const Item &item = items[selected];
-+                    last_app_path = item.entry.path;
-+                    show_message("Starting", item.entry.title);
-+                    return Choice{ false, item.entry.path, item.entry.title };
-+                }
-+                if (pressed & ORBIS_PAD_BUTTON_TRIANGLE) {
++                    const fs::path app_dir = emuenv.vita_fs_path / "ux0" / "app" / item.entry.path;
++                    if (!still_encrypted(app_dir)) {
++                        last_app_path = item.entry.path;
++                        show_message("Starting", item.entry.title);
++                        return Choice{ false, item.entry.path, item.entry.title };
++                    }
++                    // decrypted first, then started
++                    reset(job, false);
++                    job.start_app = item.entry.path;
++                    job.start_title = item.entry.title;
++                    job.thread = std::thread([&emuenv, &job, app_dir, title = item.entry.title] { decrypt_worker(emuenv, job, app_dir, title); });
++                    notice.clear();
++                    dirty = true;
++                } else if (pressed & ORBIS_PAD_BUTTON_TRIANGLE) {
 +                    browsing = true;
 +                    open_dir(browse_dir);
 +                    dirty = true;
@@ -3133,10 +3227,10 @@ index 00000000..0210098f
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..33b3fb9a
+index 00000000..6b45a939
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
-@@ -0,0 +1,372 @@
+@@ -0,0 +1,380 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -3157,7 +3251,8 @@ index 00000000..33b3fb9a
 +// PS4: Vita3K's frontend, in place of main.cpp (Qt) and sdl-frontend.
 +//
 +//   /app0              the package: eboot.bin, version.txt, data/, shaders-builtin/, icons/
-+//   /data/Vita3K       config.yml, vita3k.log, boot-trace.log, crash.log, cache/, patch/
++//   /data/Vita3K       config.yml, vita3k.log (and the run before's vita3k.prev.log), boot-trace.log,
++//                      crash.log, cache/, patch/
 +//   /data/Vita3K/fs    the Vita's file system (ux0, vs0, os0, sa0, pd0, ...)
 +//   /data/Vita3K/install  what the launcher installs (firmware, games, licenses)
 +//
@@ -3230,7 +3325,7 @@ index 00000000..33b3fb9a
 +    FILE *f = std::fopen("/data/Vita3K/crash.log", "a");
 +    if (!f)
 +        return;
-+    std::fprintf(f, "\n== Vita3K for PS4 %s: %s (%s), the details are in vita3k.log\n", app_version,
++    std::fprintf(f, "\n== Vita3K for PS4 %s: %s (%s), the details are in vita3k.log (vita3k.prev.log once Vita3K started again)\n", app_version,
 +        crash_emuenv->current_app_title.c_str(), crash_emuenv->app_info.app_title_id.c_str());
 +    std::fclose(f);
 +}
@@ -3348,19 +3443,23 @@ index 00000000..33b3fb9a
 +    if (!session.begin_launch(request, request.reason != AppLaunchReason::LoadExec))
 +        return "Couldn't find " + request.app_path + " among the installed apps";
 +    trace("session: renderer");
++    // (what these say is shown after the app started over: this run's log is vita3k.prev.log then)
 +    if (!session.initialize_renderer(frame_host)) {
 +        session.stop(app::AppSessionStopReason::LaunchFailure);
-+        return "The renderer couldn't start (Vulkan): see /data/Vita3K/vita3k.log";
++        trace("session: the renderer failed");
++        return "The renderer couldn't start (Vulkan): see /data/Vita3K/vita3k.prev.log";
 +    }
 +    trace("session: runtime");
 +    if (!session.initialize_runtime()) {
 +        session.stop(app::AppSessionStopReason::LaunchFailure);
-+        return "The emulator couldn't start: see /data/Vita3K/vita3k.log";
++        trace("session: the runtime failed");
++        return "The emulator couldn't start: see /data/Vita3K/vita3k.prev.log";
 +    }
 +    trace("session: loading the app");
 +    if (!session.load_and_run()) {
 +        session.stop(app::AppSessionStopReason::LaunchFailure);
-+        return "The game couldn't be loaded (is the firmware installed?): see /data/Vita3K/vita3k.log";
++        trace("session: loading the app failed");
++        return "The game couldn't be loaded: see /data/Vita3K/vita3k.prev.log";
 +    }
 +    trace("session: running " + emuenv.current_app_title);
 +    LOG_INFO("Game started: {} ({})", emuenv.current_app_title, request.app_path);
@@ -3431,6 +3530,9 @@ index 00000000..33b3fb9a
 +    boost::system::error_code ec;
 +    fs::create_directories(root_paths.get_vita_fs_path(), ec);
 +    fs::create_directories(ps4launcher::INSTALL_DIR, ec);
++    // The last run's log stays as vita3k.prev.log: after every game the app starts over, and the
++    // game's log went with it (v00.07: why PCSE00003 didn't load)
++    fs::rename(root_paths.get_log_path() / "vita3k.log", root_paths.get_log_path() / "vita3k.prev.log", ec);
 +    if (logging::init(root_paths, false) != Success)
 +        trace("logging could not start");
 +    LOG_INFO("Vita3K for PS4 {}", app_version);

@@ -4,11 +4,11 @@
 in WSL Ubuntu with the M33 / Resonance / DolphinPS4 / Crema PS4 toolchain (clang 21 + libc++ 21 on
 OpenOrbis).
 
-Status: **v00.07**. On the console the launcher works (v00.05: text, firmware download, installing
-a VPK), and starting an app gets through the renderer (Vulkan on RADV), audio and loading the
-firmware modules; v00.05 then crashed creating the first guest thread's JIT (see "CPU" below),
-which v00.06 fixes (its first test still ran v00.05: a package copied to `/data/pkg` has to be
-installed). v00.07 writes its version in `boot-trace.log` and `crash.log`. No game has run yet.
+Status: **v00.08**. On the console the launcher works (text, firmware download, installing a VPK)
+and v00.07 runs PKGj for a few seconds: renderer (Vulkan on RADV), audio, the firmware modules and
+dynarmic all work. Then a directory walk failed in the file functions (see below), fixed in v00.08.
+Games copied straight into `ux0/app` as NoNpDrm dumps (still encrypted) couldn't load; v00.08
+decrypts them the first time they start. Remember to install each new package from `/data/pkg`.
 
 ## Using it
 
@@ -28,6 +28,11 @@ installed). v00.07 writes its version in `boot-trace.log` and `crash.log`. No ga
    (`/data`) and the USB drives. What installs from the install folder moves to `install/done/`;
    anywhere else it stays.
 5. Back in the list (the game just installed is picked), press **Cross**.
+
+A NoNpDrm dump (with `sce_sys/package/work.bin`) copied straight into
+`/data/Vita3K/fs/ux0/app/` is still encrypted; the first time it starts, the launcher decrypts it
+in place (as installing it would have) and installs its license. Installing it from the install
+screen instead is the same, from anywhere but Vita3K's own folders.
 
 In the launcher, L1 / R1 move a page at a time and OPTIONS quits.
 
@@ -52,7 +57,7 @@ When a game ends (or Exit in the pause menu) the app restarts into the launcher.
 | `/data/Vita3K/fs` | the Vita's file system: `ux0` (apps, saves), `vs0`/`os0`/`sa0`/`pd0` (firmware) |
 | `/data/Vita3K/config.yml` | Vita3K's settings |
 | `/data/Vita3K/cache` | shader cache; `download/`: the firmware while it downloads |
-| `/data/Vita3K` | `vita3k.log`, `boot-trace.log` (startup milestones; the run before is `boot-trace.prev.log`), `crash.log` (appended to) |
+| `/data/Vita3K` | `vita3k.log`, `boot-trace.log` (startup milestones), `crash.log` (appended to); the run before's are `vita3k.prev.log` and `boot-trace.prev.log` (the app starts over after every game, so a game's log is there) |
 | `/app0` | the package: `eboot.bin`, `data/`, `shaders-builtin/`, `icons/`, `fonts/` |
 
 Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
@@ -99,7 +104,9 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
   `fchmodat` and `utimensat` only as stubs failing with ENOSYS, and the sysroot's Boost.Filesystem
   uses them for every status check and removal (v00.02 died at its first `create_directories`).
   Linker wraps implement them with `stat`, `lstat`, `open`, `unlink`, `rmdir`, `chmod` and `utimes`;
-  `openat` remembers which path each directory descriptor stands for. The kernel refuses relative
+  `open` (with `O_DIRECTORY`) and `openat` remember which path each directory descriptor stands for
+  (Boost opens the top of a directory walk with `open`, then the rest relative to it: v00.07 failed
+  there). The kernel refuses relative
   names (EINVAL, which Boost throws on, where elsewhere they'd just not be found: v00.03 died on
   `status("ux0/app")`), so the wraps take them from the working directory. `statvfs` is wrapped
   too: the C library's never fills in its result.

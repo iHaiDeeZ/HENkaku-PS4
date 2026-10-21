@@ -295,16 +295,19 @@ extern "C" int __real_close(int fd);
 extern "C" int ps4_netfs_is_path(const char* path);
 extern "C" int ps4_netfs_open(const char* path, int flags);
 extern "C" int ps4_netfs_close(int fd);
-extern "C" void ps4_fileat_closed(int fd);  // ps4_fileat.cpp
+extern "C" void ps4_fileat_closed(int fd);                    // ps4_fileat.cpp
+extern "C" void ps4_fileat_opened(int fd, const char* path);  // ps4_fileat.cpp
 
 extern "C" __attribute__((noinline)) int __wrap_open(const char* path, int flags, ...) {
     va_list args;
     va_start(args, flags);
     const int mode = va_arg(args, int);  // always passed on: harmless when the call had none
     va_end(args);
-    if (ps4_netfs_is_path(path))
-        return ps4_netfs_open(path, flags);
-    return __real_open(path, flags, mode);
+    const int fd = ps4_netfs_is_path(path) ? ps4_netfs_open(path, flags) : __real_open(path, flags, mode);
+    // a directory, for the *at functions relative to it
+    if (fd >= 0 && (flags & O_DIRECTORY))
+        ps4_fileat_opened(fd, path);
+    return fd;
 }
 
 extern "C" int __wrap_close(int fd) {
