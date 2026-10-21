@@ -44,7 +44,7 @@ index 2d6d6ea6..29ce6995 100644
          fmt::print(stderr, "dynarmic: POSIX SigHandler: could not set SIGBUS handler\n");
          supports_fast_mem = false;
 diff --git a/src/dynarmic/backend/x64/block_of_code.cpp b/src/dynarmic/backend/x64/block_of_code.cpp
-index 22d9868f..5e0889ea 100644
+index 22d9868f..ef435fe5 100644
 --- a/src/dynarmic/backend/x64/block_of_code.cpp
 +++ b/src/dynarmic/backend/x64/block_of_code.cpp
 @@ -20,6 +20,13 @@
@@ -61,16 +61,20 @@ index 22d9868f..5e0889ea 100644
  
  #include <mcl/assert.hpp>
  #include <mcl/bit/bit_field.hpp>
-@@ -54,12 +61,88 @@ const std::array<Xbyak::Reg64, ABI_PARAM_COUNT> BlockOfCode::ABI_PARAMS = {Block
+@@ -54,12 +61,106 @@ const std::array<Xbyak::Reg64, ABI_PARAM_COUNT> BlockOfCode::ABI_PARAMS = {Block
  
  namespace {
  
 +#ifdef __PS4__
 +// PS4: code only runs from flexible memory, of which there are a few hundred MiB for everything,
 +// and a JIT per guest thread. Each code cache is a virtual range reservation that
-+// EnsureMemoryCommitted backs as the code grows, and starts small.
++// EnsureMemoryCommitted backs as the code grows. The prelude (the run code, then the emitter's
++// fastmem fallbacks and terminal handlers: some 4700 small functions for A32, about 1.7 MiB) is
++// written without EnsureMemoryCommitted on the way, so it gets a window of this size, and
++// PreludeComplete gives back what it didn't use. (Vita3K v00.05 committed 256 KiB here and faulted
++// writing the fallbacks at 1 MiB.)
 +constexpr size_t CONSTANT_POOL_SIZE = 512 * 1024;
-+constexpr size_t PRELUDE_COMMIT_SIZE = 256 * 1024;
++constexpr size_t PRELUDE_COMMIT_SIZE = 8 * 1024 * 1024;
 +constexpr size_t PS4_PAGE_SIZE = 16 * 1024;  // the PS4 maps 16 KiB pages
 +constexpr size_t PS4_COMMIT_STEP = 256 * 1024;
 +
@@ -112,6 +116,20 @@ index 22d9868f..5e0889ea 100644
 +    sceKernelMunmap(at, size);
 +    return try_pools("after unmapping");
 +}
++
++// Gives code memory back, its place reserved again for PS4CommitCode to map over later. False (the
++// memory kept) when the place couldn't be reserved: something else could be mapped there then.
++bool PS4ReleaseCode(uint8_t* at, size_t size) {
++    if (sceKernelMunmap(at, size) != 0)
++        return false;
++    void* addr = at;
++    const int32_t r = sceKernelReserveVirtualRange(&addr, size, PS4_MAP_FIXED, PS4_PAGE_SIZE);
++    if (r == 0 && addr == at)
++        return true;
++    ps4_boot_trace(fmt::format("dynarmic: reserving {} KiB at {} again failed: {:08X}", size >> 10, static_cast<void*>(at), static_cast<uint32_t>(r)).c_str());
++    PS4CommitCode(at, size);
++    return false;
++}
 +#else
  constexpr size_t CONSTANT_POOL_SIZE = 2 * 1024 * 1024;
  constexpr size_t PRELUDE_COMMIT_SIZE = 16 * 1024 * 1024;
@@ -151,7 +169,23 @@ index 22d9868f..5e0889ea 100644
      uint8_t* alloc(size_t size) override {
          void* p = VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_READWRITE);
          if (p == nullptr) {
-@@ -271,7 +354,18 @@ size_t BlockOfCode::SpaceRemaining() const {
+@@ -233,6 +334,15 @@ BlockOfCode::BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_cod
+ void BlockOfCode::PreludeComplete() {
+     prelude_complete = true;
+     code_begin = getCurr();
++#ifdef __PS4__
++    // the prelude's window down to what it used (code memory is scarce: a JIT per guest thread)
++    const size_t used = (size_ + PS4_COMMIT_STEP - 1) & ~(PS4_COMMIT_STEP - 1);
++    if (committed_size > used && PS4ReleaseCode(top_ + used, committed_size - used))
++        committed_size = used;
++    static std::atomic<bool> traced{false};
++    if (!traced.exchange(true))
++        ps4_boot_trace(fmt::format("dynarmic: prelude {} KiB, {} KiB of code memory kept", size_ >> 10, committed_size >> 10).c_str());
++#endif
+     ClearCache();
+     DisableWriting();
+ }
+@@ -271,7 +381,18 @@ size_t BlockOfCode::SpaceRemaining() const {
  }
  
  void BlockOfCode::EnsureMemoryCommitted([[maybe_unused]] size_t codesize) {

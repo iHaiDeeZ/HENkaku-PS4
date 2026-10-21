@@ -4,10 +4,10 @@
 in WSL Ubuntu with the M33 / Resonance / DolphinPS4 / Crema PS4 toolchain (clang 21 + libc++ 21 on
 OpenOrbis).
 
-Status: **v00.05**. On the console v00.04 starts, shows the launcher and downloads and installs the
-firmware, but drew no text: the app can't read the PS4's fonts in `/preinst`. v00.05 draws text in
-the PS Vita's fonts (from the font package it installs) or in the Roboto it carries. No game has
-run yet.
+Status: **v00.06**. On the console the launcher works (v00.05: text, firmware download, installing
+a VPK), and starting an app gets through the renderer (Vulkan on RADV), audio and loading the
+firmware modules; v00.05 then crashed creating the first guest thread's JIT (see "CPU" below),
+which v00.06 fixes. No game has run yet.
 
 ## Using it
 
@@ -76,7 +76,9 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
 - **CPU**: dynarmic's x86-64 JIT (`patches/dynarmic-ps4.patch`). Only flexible memory can run code
   on the PS4 and there is a JIT per guest thread, so each 128 MiB code cache is a virtual range
   reservation committed in 256 KiB steps as code is emitted (system flexible memory, else regular),
-  with a 512 KiB constant pool. Fastmem through dynarmic's POSIX fault handler (SIGSEGV and SIGBUS).
+  with a 512 KiB constant pool. The prelude (some 4700 fastmem fallbacks, about 1.7 MiB, written
+  with no commit on the way: v00.05 faulted there) gets an 8 MiB window, cut back to what it used
+  when it's done. Fastmem through dynarmic's POSIX fault handler (SIGSEGV and SIGBUS).
 - **Guest memory** (`mem/src/mem.cpp`): the Vita's 4 GiB address space is a virtual range
   reservation; the host pages the allocator commits are backed by direct memory mapped in place
   (16 KiB pages), and given back to a free list when freed. Write tracking uses `mprotect` and the
