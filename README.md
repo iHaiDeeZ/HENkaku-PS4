@@ -4,12 +4,11 @@
 in WSL Ubuntu with the M33 / Resonance / DolphinPS4 / Crema PS4 toolchain (clang 21 + libc++ 21 on
 OpenOrbis).
 
-Status: **v00.09**. On the console the launcher works (text, firmware download, installing a VPK)
-and v00.08 runs PKGj (renderer on RADV, audio, dynarmic, and the network: it downloads its lists).
-Games copied straight into `ux0/app` as NoNpDrm dumps (still encrypted) can't load, so the launcher
-decrypts them the first time they start; in v00.08 that failed on `realpath` (see the file
-functions below), fixed in v00.09. No game has run yet. Remember to install each new package from
-`/data/pkg`.
+Status: **v00.10**. On the console the launcher works (text, firmware download, installing a VPK),
+PKGj runs (renderer on RADV, audio, dynarmic, the network), and v00.09 decrypted Mortal Kombat
+(PCSE00023) and ran it at 25-30 fps through its menus for 90 s, until the GPU hung loading a fight
+and the system killed the app. v00.10 fixes the shader translation that most likely made a loop
+endless (see "Shaders" below). Remember to install each new package from `/data/pkg`.
 
 ## Using it
 
@@ -86,6 +85,14 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
   with a 512 KiB constant pool. The prelude (some 4700 fastmem fallbacks, about 1.7 MiB, written
   with no commit on the way: v00.05 faulted there) gets an 8 MiB window, cut back to what it used
   when it's done. Fastmem through dynarmic's POSIX fault handler (SIGSEGV and SIGBUS).
+- **Shaders**: Vita3K's USSE translator turned vector instructions predicated on `!p2` into
+  unconditional ones (an upstream TODO); now they get their condition. Mortal Kombat's GPU hung
+  right after such a shader, and a loop counting with one never ends: every translated loop also
+  stops after 4096 turns on the PS4 (a GPU that never finishes gets the app killed, with no
+  trace). PS4 shader cache version 1401, so older translations are made again. A GPU hang is
+  logged by the RADV winsys in `/data/DolphinPS4/radv-ps4.log` and `gpu-hang.txt` (its paths are
+  DolphinPS4's); an empty `/data/Vita3K/radv-trace` file turns on its flight recorder and RADV's
+  per-draw trace ids (slower) to find the draw.
 - **Guest memory** (`mem/src/mem.cpp`): the Vita's 4 GiB address space is a virtual range
   reservation; the host pages the allocator commits are backed by direct memory mapped in place
   (16 KiB pages), and given back to a free list when freed. Write tracking uses `mprotect` and the

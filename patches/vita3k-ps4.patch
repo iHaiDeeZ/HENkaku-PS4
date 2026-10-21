@@ -3227,10 +3227,10 @@ index 00000000..0210098f
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..6b45a939
+index 00000000..74745987
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
-@@ -0,0 +1,380 @@
+@@ -0,0 +1,388 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -3536,6 +3536,14 @@ index 00000000..6b45a939
 +    if (logging::init(root_paths, false) != Success)
 +        trace("logging could not start");
 +    LOG_INFO("Vita3K for PS4 {}", app_version);
++    // Which draw a GPU hang is on: RADV's per-draw trace ids and the PS4 winsys' flight recorder
++    // (port/mesa/ac_ps4_drm.c, into /data/DolphinPS4/flight), when /data/Vita3K/radv-trace is there.
++    // It slows the rendering down.
++    if (fs::exists(root_paths.get_log_path() / "radv-trace", ec)) {
++        setenv("RADV_PS4_TRACE", "1", 1);
++        setenv("RADV_DEBUG", "hang", 1);
++        trace("radv: flight recorder on");
++    }
 +
 +    // CLI11 needs a program name (a PS4 app gets none)
 +    char program[] = "vita3k";
@@ -4684,6 +4692,24 @@ index ed8c71ad..447670e5 100644
  #else
          dispatch.init();
  #endif
+diff --git a/vita3k/shader/include/shader/spirv_recompiler.h b/vita3k/shader/include/shader/spirv_recompiler.h
+index f93de644..cbe7d451 100644
+--- a/vita3k/shader/include/shader/spirv_recompiler.h
++++ b/vita3k/shader/include/shader/spirv_recompiler.h
+@@ -31,7 +31,13 @@ namespace shader {
+ static constexpr int COLOR_ATTACHMENT_TEXTURE_SLOT_IMAGE = 0;
+ static constexpr int MASK_TEXTURE_SLOT_IMAGE = 1;
+ static constexpr int COLOR_ATTACHMENT_RAW_TEXTURE_SLOT_IMAGE = 3;
++#ifdef __PS4__
++// upstream's 14, then the PS4 port's translator changes (01: !p2, loop guard): shaders cached by an
++// older translation are made again
++static constexpr uint32_t CURRENT_VERSION = 1401;
++#else
+ static constexpr uint32_t CURRENT_VERSION = 14;
++#endif
+ // fragment shader using the rendering surface as a storage image (because of shader interlock) have a line
+ // layout (constant_id = GAMMA_CORRECTION_SPECIALIZATIO_ID) const bool is_srgb = false;
+ // Setting this constant to true performs gamma correction in the shader
 diff --git a/vita3k/shader/include/shader/usse_disasm.h b/vita3k/shader/include/shader/usse_disasm.h
 index 4af0f1e3..a5e4eb6c 100644
 --- a/vita3k/shader/include/shader/usse_disasm.h
@@ -4699,8 +4725,37 @@ index 4af0f1e3..a5e4eb6c 100644
  
  //
  // Disasm helpers
+diff --git a/vita3k/shader/include/shader/usse_types.h b/vita3k/shader/include/shader/usse_types.h
+index e31942f2..42665d6d 100644
+--- a/vita3k/shader/include/shader/usse_types.h
++++ b/vita3k/shader/include/shader/usse_types.h
+@@ -48,7 +48,9 @@ enum class ExtPredicate : uint8_t {
+     P3,
+     NEGP0,
+     NEGP1,
+-    PN
++    PN,
++    // Not in the instructions' 3-bit field: the vector instructions' !p2 (ExtVecPredicate)
++    NEGP2
+ };
+ 
+ enum class ExtVecPredicate : uint8_t {
+@@ -99,10 +101,9 @@ inline ExtPredicate ext_vec_predicate_to_ext(ExtVecPredicate pred) {
+     case ExtVecPredicate::NEGP1:
+         return ExtPredicate::NEGP1;
+     case ExtVecPredicate::NEGP2:
+-        // TODO
+-        assert(false);
+-        LOG_CRITICAL("ExtVecPredicate::NEGP2 case hit, report this to devs.");
+-        [[fallthrough]];
++        // (was NONE: the instruction then ran unconditionally, and a loop that counted with it
++        // could run forever - Mortal Kombat hung the PS4's GPU)
++        return ExtPredicate::NEGP2;
+     default:
+         return ExtPredicate::NONE;
+     }
 diff --git a/vita3k/shader/src/usse_disasm.cpp b/vita3k/shader/src/usse_disasm.cpp
-index 00c041e1..c603040d 100644
+index 00c041e1..19335445 100644
 --- a/vita3k/shader/src/usse_disasm.cpp
 +++ b/vita3k/shader/src/usse_disasm.cpp
 @@ -26,7 +26,7 @@ using namespace shader::usse;
@@ -4712,6 +4767,61 @@ index 00c041e1..c603040d 100644
  
  //
  // Disasm helpers
+@@ -51,6 +51,7 @@ const char *e_predicate_str(ExtPredicate p) {
+     case ExtPredicate::NEGP0: return "!p0 ";
+     case ExtPredicate::NEGP1: return "!p1 ";
+     case ExtPredicate::PN: return "pN ";
++    case ExtPredicate::NEGP2: return "!p2 ";
+     default: return "invalid";
+     }
+ }
+diff --git a/vita3k/shader/src/usse_translator_entry.cpp b/vita3k/shader/src/usse_translator_entry.cpp
+index e9f0e42f..6effc570 100644
+--- a/vita3k/shader/src/usse_translator_entry.cpp
++++ b/vita3k/shader/src/usse_translator_entry.cpp
+@@ -902,6 +902,9 @@ spv::Id USSERecompiler::get_condition_value(const std::uint8_t pred, const bool
+     } else if (predicator >= ExtPredicate::NEGP0 && predicator <= ExtPredicate::NEGP1) {
+         pred_opr.num = static_cast<int>(predicator) - static_cast<int>(ExtPredicate::NEGP0);
+         do_neg = !do_neg;
++    } else if (predicator == ExtPredicate::NEGP2) {
++        pred_opr.num = 2;
++        do_neg = !do_neg;
+     }
+ 
+     spv::Id pred_v = visitor.load(pred_opr, 0b0001);
+@@ -992,6 +995,15 @@ void USSERecompiler::compile_conditional_node(const usse::USSEConditionalNode &c
+ }
+ 
+ void USSERecompiler::compile_loop_node(const usse::USSELoopNode &loop) {
++#ifdef __PS4__
++    // A loop the translation lost its way out of (a branch it couldn't place, a predicate it didn't
++    // know) runs forever, and a GPU that never finishes gets the PS4 app killed. Every loop stops
++    // after this many turns: far more than shaders take, few enough not to stall a frame.
++    constexpr unsigned LOOP_GUARD = 4096;
++    const spv::Id u32 = b.makeUintType(32);
++    const spv::Id guard_var = b.createVariable(spv::NoPrecision, spv::StorageClassFunction, u32, "loop_guard");
++    b.createStore(b.makeUintConstant(0), guard_var);
++#endif
+     spv::Builder::LoopBlocks loops = b.makeNewLoop();
+ 
+     b.createBranch(true, &loops.head);
+@@ -1003,6 +1015,16 @@ void USSERecompiler::compile_loop_node(const usse::USSELoopNode &loop) {
+ 
+     // Emit body content
+     b.setBuildPoint(&loops.body);
++#ifdef __PS4__
++    {
++        const spv::Id turns = b.createBinOp(spv::OpIAdd, u32, b.createLoad(guard_var, spv::NoPrecision), b.makeUintConstant(1));
++        b.createStore(turns, guard_var);
++        spv::Builder::If guard(b.createBinOp(spv::OpUGreaterThan, b.makeBoolType(), turns, b.makeUintConstant(LOOP_GUARD)),
++            spv::SelectionControlMaskNone, b);
++        b.createLoopExit();
++        guard.makeEndIf();
++    }
++#endif
+ 
+     // If true
+     const usse::USSEBlockNode &content_block = *(loop.content_block());
 diff --git a/vita3k/util/src/logging.cpp b/vita3k/util/src/logging.cpp
 index 816c6297..9115c351 100644
 --- a/vita3k/util/src/logging.cpp
