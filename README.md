@@ -4,14 +4,16 @@
 in WSL Ubuntu with the M33 / Resonance / DolphinPS4 / Crema PS4 toolchain (clang 21 + libc++ 21 on
 OpenOrbis).
 
-Status: **v00.13**. On the console the launcher works (text, firmware download, installing a VPK),
+Status: **v00.14**. On the console the launcher works (text, firmware download, installing a VPK),
 PKGj runs (renderer on RADV, audio, dynarmic, the network), and Mortal Kombat (PCSE00023) plays:
 v00.12 fixed the GPU hang at the start of a fight by turning Vita3K's memory mapping off (see
-"Graphics" below). The fights ran at 30 fps where the game wants 60, so in slow motion, with
-v00.12's GPU trace mode still on. v00.13 is the first speed build: the trace mode is off again,
-the CPU emulation uses dynarmic's fast floating point (see "CPU"), the log keeps info lines and
-up, and `vita3k.log` gets a `perf:` line every 10 s that says which thread holds the game back.
-Remember to install each new package from `/data/pkg`.
+"Graphics" below). Its fights ran at 30 fps where the game wants 60 (slow motion); v00.13 (fast
+floating point in dynarmic, GPU trace mode off) brought them to 30-43. Its perf lines showed no
+thread at its limit: the game's main thread and render thread took about 12 ms of CPU each per
+frame, one after the other. v00.14 gives the guest memory 2 MiB pages and inlines the game's
+atomics (see "Guest memory" and "CPU"), times every import each game thread calls, and adds
+settings to the quick menu (L3 + R3: show FPS, volume, screen filter, resolution, ...). Remember
+to install each new package from `/data/pkg`.
 
 ## Using it
 
@@ -47,9 +49,23 @@ In the launcher, L1 / R1 move a page at a time and OPTIONS quits.
 | Touchpad click | SELECT |
 | Touchpad | front touch screen |
 | L2 / R2 / L3 / R3 | the PS TV's |
-| **L3 + R3** | Vita3K's pause menu (Resume / Exit) |
+| **L3 + R3** | the quick menu (pauses the game) |
 
-When a game ends (or Exit in the pause menu) the app restarts into the launcher.
+When a game ends (or Exit in the quick menu) the app restarts into the launcher.
+
+The quick menu (L3 + R3, Vita3K's pause menu with the PS4's settings): up / down picks a line,
+left / right (or Cross) changes a setting, Circle goes back to the game. The settings are saved
+in `config.yml`:
+
+| Setting | |
+|---|---|
+| Show FPS | off, FPS, + frame time, + min / avg / max, + graph (Vita3K's performance overlay) |
+| FPS position | the corner (or edge) it sits in |
+| Volume | 0-100% |
+| Screen filter | how the 960x544 picture is scaled to the TV: Bilinear, Nearest, Bicubic, FXAA, FSR |
+| Resolution (next start) | 960x544, 1440x816 or 1920x1088: sharper, more work for the GPU |
+| Shader compiling | in the background (no stutter; something new shows up a moment later) or before drawing |
+| Texture checks (next start) | hash each use (Vita3K's default) or watch writes (less work for the render thread; a game that changes a texture in a way that isn't caught shows the old one) |
 
 ## On the console
 
@@ -97,14 +113,20 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
   estimates in soft-float, checked every result for NaNs and switched MXCSR around NEON
   instructions; the PS4 build turns on its unsafe floating-point optimizations (yuzu's "Unsafe"
   accuracy: unfused FMA, the host's estimates, no NaN fix-ups, no standard-FPSCR switch).
-  Exclusive accesses (the global monitor) stay accurate.
+  Exclusive accesses (LDREX/STREX: the game's atomics and locks) are inline, the store a
+  `lock cmpxchg` on the guest memory, instead of a call into the global monitor under its spin
+  lock (dynarmic's fastmem exclusives, yuzu's default).
 - **Speed** (`perf:` lines in `vita3k.log`, every 10 s while a game runs): the game's frame rate,
   the emulated vblanks a second (60 when the timing holds), where the render thread's time went
   (waiting for the game's commands, showing frames, waiting for the GPU), how long the game's
   threads waited for vblanks, and every thread busier than 3% of a core with its share (guest
   threads by their own names, `render`, `pipeline compiler`, `audio mixer`, `vblank`; each reads
   its own CPU clock, as the PS4 doesn't let a thread read another's). A Vita game that misses
-  its vblank runs at 30 fps and, for most, at half speed.
+  its vblank runs at 30 fps and, for most, at half speed. After it, a line for each busy game
+  thread (`vita3k/ps4/ps4_perf.cpp`): its time in guest code (dynarmic) and its biggest imports
+  (the HLE functions it calls: their work or their waits), in ms a second and calls a second.
+  And at every game start, `PS4 memory test:` compares random reads through a 2 MiB aligned
+  mapping with a misaligned one: whether the console gives the guest memory large pages.
 - **Shaders**: Vita3K's USSE translator turned vector instructions predicated on `!p2` into
   unconditional ones (an upstream TODO); now they get their condition. Mortal Kombat's GPU hung
   right after such a shader, and a loop counting with one never ends: every translated loop also
@@ -116,8 +138,11 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
   ends the app on a hang instead of the PS4 freezing) to find the draw: `gpu-hang.txt`'s last
   trace write that was done is just before it.
 - **Guest memory** (`mem/src/mem.cpp`): the Vita's 4 GiB address space is a virtual range
-  reservation; the host pages the allocator commits are backed by direct memory mapped in place
-  (16 KiB pages), and given back to a free list when freed. Write tracking uses `mprotect` and the
+  reservation, backed 2 MiB at a time by direct memory mapped in place, 2 MiB aligned like the
+  address so the PS4 can use one large page for it; a region goes back to a free list once
+  nothing in it is allocated. Up to v00.13 it was backed 16 KiB at a time, with physical runs that
+  didn't line up with the addresses: every guest page cost four of the CPU's 4 KiB TLB entries,
+  and the JIT's loads and stores walked page tables (Jaguar's TLBs hold a few hundred entries). Write tracking uses `mprotect` and the
   fault handler (the PS4's FreeBSD signal context, `mc_err`), which hands other faults to the crash
   log.
 - **Audio**: `audio/src/impl/ps4_audio.cpp`, one sceAudioOut port (48 kHz stereo) fed by a mixer

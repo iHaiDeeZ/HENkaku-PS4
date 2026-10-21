@@ -601,10 +601,10 @@ index 00000000..4a6f7930
 +    }
 +}
 diff --git a/vita3k/cpu/src/dynarmic_cpu.cpp b/vita3k/cpu/src/dynarmic_cpu.cpp
-index 54e89f88..fd42639b 100644
+index 54e89f88..e3308cfc 100644
 --- a/vita3k/cpu/src/dynarmic_cpu.cpp
 +++ b/vita3k/cpu/src/dynarmic_cpu.cpp
-@@ -367,6 +367,20 @@ std::unique_ptr<Dynarmic::A32::Jit> DynarmicCPU::make_jit() {
+@@ -367,6 +367,26 @@ std::unique_ptr<Dynarmic::A32::Jit> DynarmicCPU::make_jit() {
      config.coprocessors[15] = cp15;
      config.processor_id = core_id;
      config.optimizations = cpu_opt ? Dynarmic::all_safe_optimizations : Dynarmic::no_optimizations;
@@ -620,6 +620,12 @@ index 54e89f88..fd42639b 100644
 +            | Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP
 +            | Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN
 +            | Dynarmic::OptimizationFlag::Unsafe_IgnoreStandardFPCRValue;
++    }
++    // LDREX/STREX (the game's atomics and locks) inline, with the store a lock cmpxchg on the
++    // guest memory, instead of a call into the monitor under its spin lock each: yuzu's default
++    if (config.fastmem_pointer) {
++        config.fastmem_exclusive_access = true;
++        config.recompile_on_exclusive_fastmem_failure = true;
 +    }
 +#endif
      config.enable_cycle_counting = false;
@@ -668,57 +674,77 @@ index 6e673d1c..f84a9a8a 100644
  
  static void reset_swapchain_cycle(DisplayState &display, Address sync_object) {
 diff --git a/vita3k/kernel/src/kernel.cpp b/vita3k/kernel/src/kernel.cpp
-index 97794b3d..45ecf805 100644
+index 97794b3d..0eb5e729 100644
 --- a/vita3k/kernel/src/kernel.cpp
 +++ b/vita3k/kernel/src/kernel.cpp
-@@ -33,6 +33,10 @@
+@@ -33,6 +33,11 @@
  #include <SDL3/SDL_mutex.h>
  #include <SDL3/SDL_thread.h>
  
 +#ifdef __PS4__
 +extern "C" void ps4_watch_thread(const char *name); // port/ps4_sampler.cpp
++extern "C" void ps4_perf_guest_thread(const char *name); // vita3k/ps4/ps4_perf.cpp
 +#endif
 +
  int CorenumAllocator::new_corenum() {
      const std::lock_guard<std::mutex> guard(lock);
  
-@@ -63,6 +67,10 @@ static int SDLCALL thread_function(void *data) {
+@@ -63,6 +68,11 @@ static int SDLCALL thread_function(void *data) {
      ThreadParams params = *static_cast<const ThreadParams *>(data);
      SDL_SignalSemaphore(params.host_may_destroy_params);
      ThreadStatePtr thread = std::move(params.thread);
 +#ifdef __PS4__
 +    // the guest's name for it in the port's thread list (the perf lines, stack dumps)
 +    ps4_watch_thread(thread->name.empty() ? "guest thread" : thread->name.c_str());
++    ps4_perf_guest_thread(thread->name.empty() ? "guest thread" : thread->name.c_str());
 +#endif
  #ifdef TRACY_ENABLE
      if (!thread->name.empty()) {
          tracy::SetThreadName(thread->name.c_str());
 diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
-index c01e4699..9c2ff22b 100644
+index c01e4699..b2befbb1 100644
 --- a/vita3k/kernel/src/thread.cpp
 +++ b/vita3k/kernel/src/thread.cpp
-@@ -32,6 +32,10 @@
+@@ -32,6 +32,13 @@
  #include <sstream>
  #include <utility>
  
 +#ifdef __PS4__
 +extern "C" void ps4_thread_cpu_tick(); // port/ps4_sampler.cpp
++// vita3k/ps4/ps4_perf.cpp: time in guest code and in each import, for the perf lines
++extern "C" void ps4_perf_code(uint64_t ticks);
++extern "C" void ps4_perf_import(uint32_t nid, uint64_t ticks);
 +#endif
 +
  // Set in the wait type of a wait that runs callbacks
  constexpr SceUInt32 WAITTYPE_CB_BIT = 0x80000000U;
  // What a thread waiting for a thread signal reports as its wait UID on a Vita, which isn't a UID
-@@ -302,6 +306,10 @@ void ThreadState::run_loop(bool top_level) {
+@@ -301,13 +308,25 @@ void ThreadState::run_loop(bool top_level) {
+             lock.unlock();
  
              // Single step or run
++#ifdef __PS4__
++            const uint64_t run_start = __builtin_ia32_rdtsc();
++#endif
              const int res = do_step ? step(*cpu) : run(*cpu);
 +#ifdef __PS4__
++            const uint64_t run_end = __builtin_ia32_rdtsc();
++            ps4_perf_code(run_end - run_start);
 +            // the thread's CPU time for the perf lines (a clock read every ~10 ms at most)
 +            ps4_thread_cpu_tick();
 +#endif
  
              // handle svc call if this was what stopped the cpu
              const bool syscall = cpu->svc_called;
+             if (syscall) {
+                 const uint32_t nid = *Ptr<uint32_t>(read_pc(*cpu) + 4).get(mem);
+                 kernel.call_import(*cpu, nid, id);
++#ifdef __PS4__
++                ps4_perf_import(nid, __builtin_ia32_rdtsc() - run_end);
++#endif
+                 clear_exclusive(*cpu);
+             }
+ 
 diff --git a/vita3k/mem/CMakeLists.txt b/vita3k/mem/CMakeLists.txt
 index 2e2bd287..659ab47a 100644
 --- a/vita3k/mem/CMakeLists.txt
@@ -733,7 +759,7 @@ index 2e2bd287..659ab47a 100644
  		mem-tests
  		tests/allocator_tests.cpp
 diff --git a/vita3k/mem/src/mem.cpp b/vita3k/mem/src/mem.cpp
-index 28bc81bf..ba83dc55 100644
+index 28bc81bf..e125fbc6 100644
 --- a/vita3k/mem/src/mem.cpp
 +++ b/vita3k/mem/src/mem.cpp
 @@ -26,6 +26,7 @@
@@ -744,16 +770,16 @@ index 28bc81bf..ba83dc55 100644
  
  #ifdef _WIN32
  #define WIN32_LEAN_AND_MEAN
-@@ -62,8 +63,188 @@ static std::string get_error_msg() {
+@@ -62,8 +63,217 @@ static std::string get_error_msg() {
  }
  #endif
  
 +#ifdef __PS4__
 +// The PS4 has no overcommit: anonymous memory is flexible memory (a few hundred MiB, shared with
 +// the eboot, the heap and the thread stacks), and mmap(PROT_NONE) can't reserve gigabytes. So the
-+// 4 GiB of guest space is a virtual range reservation, and each host page the allocator commits is
-+// backed by direct memory mapped in at its place, then given back to a free list when decommitted.
-+// The PS4 maps and protects 16 KiB pages (sysconf says 4 KiB).
++// 4 GiB of guest space is a virtual range reservation, and the host pages the allocator commits are
++// backed by direct memory mapped in at their place (2 MiB regions), given back to a free list when
++// decommitted. The PS4 maps and protects 16 KiB pages (sysconf says 4 KiB).
 +extern "C" {
 +// Declared by hand: several OpenOrbis prototypes are wrong.
 +size_t sceKernelGetDirectMemorySize();
@@ -768,16 +794,26 @@ index 28bc81bf..ba83dc55 100644
 +constexpr uint32_t PAGE = KiB(16);
 +constexpr size_t SLAB = MiB(64);
 +constexpr size_t LARGE_PAGE = MiB(2);
++constexpr size_t PAGES_PER_REGION = LARGE_PAGE / PAGE;
 +constexpr int32_t WB_ONION = 0; // SCE_KERNEL_WB_ONION
 +constexpr int32_t MAP_FIXED_FLAG = 0x10; // SCE_KERNEL_MAP_FIXED
 +constexpr int32_t PROT_CPU_RW = 0x3;
 +
++// The guest space is backed 2 MiB at a time, each region by 2 MiB of direct memory aligned like
++// its address, so the PS4 can map it with one large page. Backed 16 KiB at a time (up to v00.13),
++// the physical runs didn't line up with the addresses: every guest page took four of the CPU's
++// 4 KiB TLB entries, and the JIT's loads and stores spent their time in page walks (Jaguar's TLBs
++// hold a few hundred entries; a game's working set is tens of MiB).
 +std::mutex mutex;
 +uint8_t *base = nullptr;
-+// For each host page of the guest space: its physical page + 1, or 0 while not committed
-+std::vector<uint32_t> phys_pages;
-+// Physical pages given back, used first
-+std::vector<uint32_t> free_pages;
++// For each 2 MiB region of the guest space: its physical region + 1, or 0 while it isn't backed
++std::vector<uint32_t> region_phys;
++// For each region: how many of its 16 KiB pages the allocator has committed
++std::vector<uint16_t> region_used;
++// For each 16 KiB page: committed by the allocator (a region goes back once none of its pages is)
++std::vector<uint8_t> page_committed;
++// Physical regions given back, used first
++std::vector<uint32_t> free_regions;
 +// The rest of the newest block of direct memory
 +off_t slab = 0;
 +size_t slab_left = 0;
@@ -794,8 +830,10 @@ index 28bc81bf..ba83dc55 100644
 +        if (ret == 0) {
 +            const std::lock_guard<std::mutex> lock(mutex);
 +            base = static_cast<uint8_t *>(addr);
-+            phys_pages.assign(size / PAGE, 0);
-+            LOG_INFO("PS4: {} MiB of guest address space at {}, {} MiB of direct memory reused", size >> 20, addr, (free_pages.size() * PAGE) >> 20);
++            region_phys.assign(size / LARGE_PAGE, 0);
++            region_used.assign(size / LARGE_PAGE, 0);
++            page_committed.assign(size / PAGE, 0);
++            LOG_INFO("PS4: {} MiB of guest address space at {}, backed in 2 MiB regions, {} MiB of direct memory reused", size >> 20, addr, (free_regions.size() * LARGE_PAGE) >> 20);
 +            return base;
 +        }
 +        LOG_WARN("PS4: reserving {} MiB at 0x{:X} failed: {:08X}", size >> 20, hint, static_cast<uint32_t>(ret));
@@ -803,36 +841,34 @@ index 28bc81bf..ba83dc55 100644
 +    return nullptr;
 +}
 +
-+// Physical pages for a run of n host pages: one given back, else a contiguous piece of the newest
-+// block of direct memory, else a new block. Returns how many it found (at least 1), 0 if none.
-+size_t take(size_t n, off_t &phys) {
-+    if (!free_pages.empty()) {
-+        phys = static_cast<off_t>(free_pages.back()) * PAGE;
-+        free_pages.pop_back();
-+        return 1;
++// 2 MiB of direct memory, 2 MiB aligned: one given back, else the next piece of the newest block,
++// else a new block (64 MiB, or 2 MiB when that much isn't left in one piece).
++bool take_region(off_t &phys) {
++    if (!free_regions.empty()) {
++        phys = static_cast<off_t>(free_regions.back()) * LARGE_PAGE;
++        free_regions.pop_back();
++        return true;
 +    }
-+    if (slab_left < PAGE) {
-+        size_t size = std::max(SLAB, align(n * PAGE, LARGE_PAGE));
++    if (slab_left < LARGE_PAGE) {
++        size_t size = SLAB;
 +        off_t start = 0;
 +        int32_t ret = sceKernelAllocateDirectMemory(0, static_cast<off_t>(sceKernelGetDirectMemorySize()), size, LARGE_PAGE, WB_ONION, &start);
 +        if (ret != 0) {
-+            // what's left, in smaller pieces
-+            size = align(n * PAGE, PAGE);
-+            ret = sceKernelAllocateDirectMemory(0, static_cast<off_t>(sceKernelGetDirectMemorySize()), size, PAGE, WB_ONION, &start);
++            size = LARGE_PAGE;
++            ret = sceKernelAllocateDirectMemory(0, static_cast<off_t>(sceKernelGetDirectMemorySize()), size, LARGE_PAGE, WB_ONION, &start);
 +        }
 +        if (ret != 0) {
 +            LOG_CRITICAL("PS4: out of direct memory ({} MiB in use for guest memory, {:08X})", direct_total >> 20, static_cast<uint32_t>(ret));
-+            return 0;
++            return false;
 +        }
 +        direct_total += size;
 +        slab = start;
 +        slab_left = size;
 +    }
-+    const size_t pages = std::min<size_t>(n, slab_left / PAGE);
 +    phys = slab;
-+    slab += pages * PAGE;
-+    slab_left -= pages * PAGE;
-+    return pages;
++    slab += LARGE_PAGE;
++    slab_left -= LARGE_PAGE;
++    return true;
 +}
 +
 +// Unmaps a range of the guest space and reserves it again, so nothing else lands in it.
@@ -845,9 +881,16 @@ index 28bc81bf..ba83dc55 100644
 +
 +bool map_run(uint8_t *ptr, size_t size, off_t phys) {
 +    void *addr = ptr;
-+    // over the reservation, or failing that in its place
-+    int32_t ret = sceKernelMapDirectMemory(&addr, size, PROT_CPU_RW, MAP_FIXED_FLAG, phys, PAGE);
++    // over the reservation, or failing that in its place (and if the 2 MiB alignment is what the
++    // kernel minds, with the 16 KiB one)
++    int32_t ret = sceKernelMapDirectMemory(&addr, size, PROT_CPU_RW, MAP_FIXED_FLAG, phys, LARGE_PAGE);
 +    if (ret != 0 || addr != ptr) {
++        sceKernelMunmap(ptr, size);
++        addr = ptr;
++        ret = sceKernelMapDirectMemory(&addr, size, PROT_CPU_RW, MAP_FIXED_FLAG, phys, LARGE_PAGE);
++    }
++    if (ret != 0 || addr != ptr) {
++        LOG_WARN_ONCE("PS4: mapping guest memory 2 MiB aligned failed ({:08X}), mapping it 16 KiB aligned", static_cast<uint32_t>(ret));
 +        sceKernelMunmap(ptr, size);
 +        addr = ptr;
 +        ret = sceKernelMapDirectMemory(&addr, size, PROT_CPU_RW, MAP_FIXED_FLAG, phys, PAGE);
@@ -860,67 +903,79 @@ index 28bc81bf..ba83dc55 100644
 +    return true;
 +}
 +
-+// Backs the host pages of [ptr, ptr + size) that aren't yet (already committed ones keep their data).
++// Backs the regions of [ptr, ptr + size) that aren't yet (backed ones keep their data) and counts
++// its pages as committed.
 +bool commit(uint8_t *ptr, size_t size) {
 +    const std::lock_guard<std::mutex> lock(mutex);
 +    const size_t first = (ptr - base) / PAGE;
 +    const size_t last = (ptr + size - base + PAGE - 1) / PAGE;
-+    for (size_t page = first; page < last;) {
-+        if (phys_pages[page]) {
-+            page++;
++    if (first >= last)
++        return true;
++    for (size_t region = first / PAGES_PER_REGION; region <= (last - 1) / PAGES_PER_REGION; region++) {
++        if (region_phys[region])
 +            continue;
++        off_t phys = 0;
++        if (!take_region(phys))
++            return false;
++        if (!map_run(base + region * LARGE_PAGE, LARGE_PAGE, phys)) {
++            free_regions.push_back(static_cast<uint32_t>(phys / LARGE_PAGE));
++            return false;
 +        }
-+        size_t end = page;
-+        while (end < last && !phys_pages[end])
-+            end++;
-+        while (page < end) {
-+            off_t phys = 0;
-+            const size_t pages = take(end - page, phys);
-+            if (!pages)
-+                return false;
-+            if (!map_run(base + page * PAGE, pages * PAGE, phys)) {
-+                for (size_t i = 0; i < pages; i++)
-+                    free_pages.push_back(static_cast<uint32_t>(phys / PAGE + i));
-+                return false;
-+            }
-+            for (size_t i = 0; i < pages; i++)
-+                phys_pages[page + i] = static_cast<uint32_t>(phys / PAGE + i + 1);
-+            committed += pages * PAGE;
-+            page += pages;
++        region_phys[region] = static_cast<uint32_t>(phys / LARGE_PAGE + 1);
++    }
++    for (size_t page = first; page < last; page++) {
++        if (!page_committed[page]) {
++            page_committed[page] = 1;
++            region_used[page / PAGES_PER_REGION]++;
++            committed += PAGE;
 +        }
 +    }
 +    return true;
 +}
 +
-+// Gives the physical pages of [ptr, ptr + size) back to the free list.
++// Counts the pages of [ptr, ptr + size) as free; a region none of whose pages is committed any
++// more is unmapped and its direct memory goes back to the free list. (A freed page in a region
++// still in use stays mapped: a stray access to it isn't caught, as it wouldn't be on a Vita.)
 +void decommit(uint8_t *ptr, size_t size) {
 +    const std::lock_guard<std::mutex> lock(mutex);
 +    const size_t first = (ptr - base) / PAGE;
 +    const size_t last = (ptr + size - base + PAGE - 1) / PAGE;
++    if (first >= last)
++        return;
 +    for (size_t page = first; page < last; page++) {
-+        if (phys_pages[page]) {
-+            free_pages.push_back(phys_pages[page] - 1);
-+            phys_pages[page] = 0;
++        if (page_committed[page]) {
++            page_committed[page] = 0;
++            region_used[page / PAGES_PER_REGION]--;
 +            committed -= PAGE;
 +        }
 +    }
-+    unmap_to_reserved(base + first * PAGE, (last - first) * PAGE);
++    for (size_t region = first / PAGES_PER_REGION; region <= (last - 1) / PAGES_PER_REGION; region++) {
++        if (region_phys[region] && region_used[region] == 0) {
++            unmap_to_reserved(base + region * LARGE_PAGE, LARGE_PAGE);
++            free_regions.push_back(region_phys[region] - 1);
++            region_phys[region] = 0;
++        }
++    }
 +}
 +
-+// The whole guest space goes; its physical pages stay with us for the next one.
++// The whole guest space goes; its physical regions stay with us for the next one.
 +void release(uint8_t *ptr, size_t size) {
 +    const std::lock_guard<std::mutex> lock(mutex);
-+    for (uint32_t &phys : phys_pages) {
++    for (uint32_t &phys : region_phys) {
 +        if (phys) {
-+            free_pages.push_back(phys - 1);
++            free_regions.push_back(phys - 1);
 +            phys = 0;
 +        }
 +    }
 +    committed = 0;
 +    sceKernelMunmap(ptr, size);
 +    base = nullptr;
-+    phys_pages.clear();
-+    phys_pages.shrink_to_fit();
++    region_phys.clear();
++    region_phys.shrink_to_fit();
++    region_used.clear();
++    region_used.shrink_to_fit();
++    page_committed.clear();
++    page_committed.shrink_to_fit();
 +}
 +
 +} // namespace ps4_mem
@@ -934,7 +989,7 @@ index 28bc81bf..ba83dc55 100644
      SYSTEM_INFO system_info = {};
      GetSystemInfo(&system_info);
      state.host_page_size = system_info.dwPageSize;
-@@ -86,6 +267,13 @@ bool init(MemState &state, const bool use_page_table) {
+@@ -86,6 +296,13 @@ bool init(MemState &state, const bool use_page_table) {
              return false;
          }
      }
@@ -948,7 +1003,7 @@ index 28bc81bf..ba83dc55 100644
  #else
      // http://man7.org/linux/man-pages/man2/mmap.2.html
      const int prot = PROT_NONE;
-@@ -137,6 +325,8 @@ static void delete_memory(uint8_t *memory) {
+@@ -137,6 +354,8 @@ static void delete_memory(uint8_t *memory) {
  #ifdef _WIN32
          const BOOL ret = VirtualFree(memory, 0, MEM_RELEASE);
          assert(ret);
@@ -957,7 +1012,7 @@ index 28bc81bf..ba83dc55 100644
  #else
          munmap(memory, TOTAL_MEM_SIZE);
  #endif
-@@ -179,6 +369,11 @@ static Address alloc_inner(MemState &state, uint32_t start_page, uint32_t page_c
+@@ -179,6 +398,11 @@ static Address alloc_inner(MemState &state, uint32_t start_page, uint32_t page_c
  #ifdef _WIN32
      const void *const ret = VirtualAlloc(commit_ptr, commit_size, MEM_COMMIT, PAGE_READWRITE);
      LOG_CRITICAL_IF(!ret, "VirtualAlloc failed: {}", get_error_msg());
@@ -969,7 +1024,7 @@ index 28bc81bf..ba83dc55 100644
  #else
      const int ret = mprotect(commit_ptr, commit_size, PROT_READ | PROT_WRITE);
      LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
-@@ -520,6 +715,8 @@ void free(MemState &state, Address address) {
+@@ -520,6 +744,8 @@ void free(MemState &state, Address address) {
  #ifdef _WIN32
              const BOOL ret = VirtualFree(memory, batch_size, MEM_DECOMMIT);
              LOG_CRITICAL_IF(!ret, "VirtualFree failed: {}", get_error_msg());
@@ -978,7 +1033,7 @@ index 28bc81bf..ba83dc55 100644
  #else
              int ret = mprotect(memory, batch_size, PROT_NONE);
              LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
-@@ -536,6 +733,8 @@ void free(MemState &state, Address address) {
+@@ -536,6 +762,8 @@ void free(MemState &state, Address address) {
  #ifdef _WIN32
          const BOOL ret = VirtualFree(memory, batch_size, MEM_DECOMMIT);
          LOG_CRITICAL_IF(!ret, "VirtualFree failed: {}", get_error_msg());
@@ -987,7 +1042,7 @@ index 28bc81bf..ba83dc55 100644
  #else
          int ret = mprotect(memory, batch_size, PROT_NONE);
          LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
-@@ -602,6 +801,12 @@ static void register_access_violation_handler(const AccessViolationHandler &hand
+@@ -602,6 +830,12 @@ static void register_access_violation_handler(const AccessViolationHandler &hand
  
  #else
  
@@ -1000,7 +1055,7 @@ index 28bc81bf..ba83dc55 100644
  static void signal_handler(int sig, siginfo_t *info, void *uct) noexcept {
      auto context = static_cast<ucontext_t *>(uct);
  
-@@ -630,6 +835,9 @@ static void signal_handler(int sig, siginfo_t *info, void *uct) noexcept {
+@@ -630,6 +864,9 @@ static void signal_handler(int sig, siginfo_t *info, void *uct) noexcept {
  #else
  #ifdef __APPLE__
      const uint64_t err = context->uc_mcontext->__es.__err;
@@ -1010,7 +1065,7 @@ index 28bc81bf..ba83dc55 100644
  #else
      const uint64_t err = context->uc_mcontext.gregs[REG_ERR];
  #endif
-@@ -643,6 +851,14 @@ static void signal_handler(int sig, siginfo_t *info, void *uct) noexcept {
+@@ -643,6 +880,14 @@ static void signal_handler(int sig, siginfo_t *info, void *uct) noexcept {
          }
      }
  
@@ -1025,7 +1080,7 @@ index 28bc81bf..ba83dc55 100644
      LOG_CRITICAL("Unhandled access to 0x{:X}", reinterpret_cast<uintptr_t>(info->si_addr));
      raise(SIGTRAP);
      return;
-@@ -652,15 +868,30 @@ static void register_access_violation_handler(const AccessViolationHandler &hand
+@@ -652,15 +897,30 @@ static void register_access_violation_handler(const AccessViolationHandler &hand
      access_violation_handler = handler;
      struct sigaction sa;
      sa.sa_flags = SA_SIGINFO;
@@ -1073,6 +1128,164 @@ index 040421ec..989f2107 100644
  	add_executable(
  		module-tests
  		tests/arg_layout_tests.cpp
+diff --git a/vita3k/modules/SceGxm/SceGxm.cpp b/vita3k/modules/SceGxm/SceGxm.cpp
+index 4c864368..a1c051e8 100644
+--- a/vita3k/modules/SceGxm/SceGxm.cpp
++++ b/vita3k/modules/SceGxm/SceGxm.cpp
+@@ -48,6 +48,11 @@
+ #include <util/tracy.h>
+ TRACY_MODULE_NAME(SceGxm);
+ 
++#ifdef __PS4__
++extern "C" void ps4_watch_thread(const char *name); // port/ps4_sampler.cpp
++extern "C" void ps4_perf_guest_thread(const char *name); // vita3k/ps4/ps4_perf.cpp
++#endif
++
+ template <>
+ std::string to_debug_str<SceGxmColorFormat>(const MemState &mem, SceGxmColorFormat type) {
+     switch (type) {
+@@ -893,6 +898,11 @@ std::string to_debug_str<SceGxmTransferFlags>(const MemState &mem, SceGxmTransfe
+ }
+ 
+ static void display_entry_thread(EmuEnvState &emuenv) {
++#ifdef __PS4__
++    // runs the game's display callbacks (its vblank waits) on the guest thread SceGxmDisplayQueue
++    ps4_watch_thread("SceGxmDisplayQueue");
++    ps4_perf_guest_thread("SceGxmDisplayQueue");
++#endif
+     auto &display_queue = emuenv.gxm.display_queue;
+     const Address callback_address = emuenv.gxm.params.displayQueueCallback.address();
+     const ThreadStatePtr display_thread = emuenv.kernel.get_thread(emuenv.gxm.display_queue_thread);
+@@ -2296,6 +2306,16 @@ EXPORT(int, sceGxmDisplayQueueFinish) {
+     return 0;
+ }
+ 
++// The largest index of a draw, which every draw looks for when memory mapping is off (the PS4): a
++// plain loop the compiler vectorizes, where std::max_element keeps a position and doesn't
++template <typename T>
++static T max_index_of(const T *data, uint32_t count) {
++    T max_value = 0;
++    for (uint32_t i = 0; i < count; i++)
++        max_value = std::max(max_value, data[i]);
++    return max_value;
++}
++
+ static void gxmSetUniformBuffers(renderer::State &state, GxmState &gxm, SceGxmContext *context, const SceGxmProgram &program, std::span<UniformBuffer> buffers, const UniformBufferSizes &sizes, const MemState &mem) {
+     for (size_t i = 0; i < buffers.size(); i++) {
+         if (!buffers[i] || sizes.at(i) == 0) {
+@@ -2391,10 +2411,10 @@ static int gxmDrawElementGeneral(EmuEnvState &emuenv, const char *export_name, c
+         // we don't need to get the vertex buffer size with memory mapping
+         if (indexType == SCE_GXM_INDEX_FORMAT_U16) {
+             const uint16_t *const data = static_cast<const uint16_t *>(indices_ptr);
+-            max_index = *std::max_element(&data[0], &data[indexCount]);
++            max_index = max_index_of(data, indexCount);
+         } else {
+             const uint32_t *const data = static_cast<const uint32_t *>(indices_ptr);
+-            max_index = *std::max_element(&data[0], &data[indexCount]);
++            max_index = max_index_of(data, indexCount);
+         }
+     }
+ 
+@@ -2513,10 +2533,10 @@ EXPORT(int, sceGxmDrawPrecomputed, SceGxmContext *context, SceGxmPrecomputedDraw
+         // we don't need to get the vertex buffer size with memory mapping
+         if (draw->index_format == SCE_GXM_INDEX_FORMAT_U16) {
+             const uint16_t *const data = draw->index_data.cast<const uint16_t>().get(emuenv.mem);
+-            max_index = *std::max_element(&data[0], &data[draw->vertex_count]);
++            max_index = max_index_of(data, draw->vertex_count);
+         } else {
+             const uint32_t *const data = draw->index_data.cast<const uint32_t>().get(emuenv.mem);
+-            max_index = *std::max_element(&data[0], &data[draw->vertex_count]);
++            max_index = max_index_of(data, draw->vertex_count);
+         }
+     }
+ 
+@@ -2884,6 +2904,8 @@ EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params) {
+     // the case where displayQueueMaxPendingCount is 1 handled in sceGxmDisplayQueueAddEntry
+     const uint32_t max_queue_size = std::max(std::min(params->displayQueueMaxPendingCount, 3U) - 1, 1U);
+     emuenv.gxm.display_queue.maxPendingCount_ = max_queue_size;
++    LOG_INFO("GXM: display queue of {} (the game asked for {} pending), callback data {} bytes, parameter buffer {} KiB",
++        max_queue_size, params->displayQueueMaxPendingCount, params->displayQueueCallbackDataSize, params->parameterBufferSize >> 10);
+ 
+     const ThreadStatePtr main_thread = emuenv.kernel.get_thread(thread_id);
+     const ThreadStatePtr display_queue_thread = emuenv.kernel.create_thread(emuenv.mem, "SceGxmDisplayQueue", Ptr<void>(0), SCE_KERNEL_HIGHEST_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_DEFAULT, 0, nullptr);
+diff --git a/vita3k/overlay/include/overlay/pause_overlay.h b/vita3k/overlay/include/overlay/pause_overlay.h
+index 6c5147b7..b26597c4 100644
+--- a/vita3k/overlay/include/overlay/pause_overlay.h
++++ b/vita3k/overlay/include/overlay/pause_overlay.h
+@@ -23,6 +23,8 @@
+ #include <overlay/overlay.h>
+ #include <overlay/user_interface.h>
+ 
++#include <functional>
++#include <string>
+ #include <vector>
+ 
+ namespace overlay {
+@@ -30,14 +32,32 @@ namespace overlay {
+ enum pause_overlay_button_value : int {
+     PAUSE_BUTTON_RESUME,
+     PAUSE_BUTTON_EXIT,
++    PAUSE_BUTTON_SETTING,
+ };
+ 
+ struct pause_overlay_button {
+     rounded_rect bg;
+     label text;
+     pause_overlay_button_value value;
++    // a setting row: its value on the right, the setting's index, the value shown
++    label value_text;
++    int setting = -1;
++    int shown = -1;
+ };
+ 
++// A setting a frontend puts in the pause menu (the PS4's quick menu), between Resume and Exit:
++// "name    < value >", changed with left / right or the confirm button. get() says which of the
++// values is in use, set() applies another; both run while the menu is open.
++struct pause_menu_setting {
++    std::string name;
++    std::vector<std::string> values;
++    std::function<int()> get;
++    std::function<void(int)> set;
++};
++
++// The settings the pause menus opened from now on show
++void set_pause_menu_settings(std::vector<pause_menu_setting> settings);
++
+ struct pause_overlay : public user_interface {
+     explicit pause_overlay(app::AppSessionController &session_controller);
+ 
+@@ -52,11 +72,15 @@ private:
+     rounded_rect m_card;
+     label m_title;
+     std::vector<pause_overlay_button> m_buttons;
+-    std::atomic<pause_overlay_button_value> m_selected_button = PAUSE_BUTTON_RESUME;
++    std::vector<pause_menu_setting> m_settings;
++    // index into m_buttons
++    std::atomic<int> m_selected_button = 0;
+     std::atomic<int> m_sys_button = 0;
+     float m_focus_pulse_time = 0.f;
+ 
+     void layout();
++    void add_button(pause_overlay_button_value value, const std::string &text, int setting = -1);
++    void change_setting(int step);
+     bool is_confirm_button(pad_button button) const;
+     bool is_cancel_button(pad_button button) const;
+     void draw_focus_ring(compiled_resource &res) const;
+@@ -71,6 +95,14 @@ private:
+     static constexpr uint16_t k_button_radius = 10;
+     static constexpr uint16_t k_font_size = 16;
+     static constexpr int16_t k_text_voffset = -3;
++    // with settings: a wider card of shorter rows
++    static constexpr uint16_t k_settings_card_w = 540;
++    static constexpr uint16_t k_settings_button_w = 500;
++    static constexpr uint16_t k_settings_button_h = 32;
++    static constexpr uint16_t k_settings_button_gap = 6;
++    static constexpr uint16_t k_settings_padding = 20;
++    static constexpr uint16_t k_settings_font_size = 15;
++    static constexpr uint16_t k_settings_text_inset = 16;
+ 
+     static constexpr color4f k_color_bg_dim{ 0.f, 0.f, 0.f, 0.47f };
+     static constexpr color4f k_color_card_bg{ 0.145f, 0.157f, 0.176f, 0.95f };
 diff --git a/vita3k/overlay/src/font.cpp b/vita3k/overlay/src/font.cpp
 index 117569cf2..4c8552a5 100644
 --- a/vita3k/overlay/src/font.cpp
@@ -1111,12 +1324,295 @@ index 117569cf2..4c8552a5 100644
  #elif !defined(_WIN32)
          result.font_names.emplace_back("NotoSansKR-Regular.otf");
          result.font_names.emplace_back("NotoSansCJK-Regular.ttc");
+diff --git a/vita3k/overlay/src/pause_overlay.cpp b/vita3k/overlay/src/pause_overlay.cpp
+index 3e2404bb..ea2bb9a4 100644
+--- a/vita3k/overlay/src/pause_overlay.cpp
++++ b/vita3k/overlay/src/pause_overlay.cpp
+@@ -24,16 +24,29 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <mutex>
+ 
+ namespace overlay {
+ 
+ namespace {
+ constexpr const char *k_pause_overlay_font = "ltn.pvf";
++
++std::mutex s_settings_mutex;
++std::vector<pause_menu_setting> s_settings;
++} // namespace
++
++void set_pause_menu_settings(std::vector<pause_menu_setting> settings) {
++    const std::lock_guard<std::mutex> lock(s_settings_mutex);
++    s_settings = std::move(settings);
+ }
+ 
+ pause_overlay::pause_overlay(app::AppSessionController &session_controller)
+     : m_session_controller(session_controller) {
+     visible = true;
++    {
++        const std::lock_guard<std::mutex> lock(s_settings_mutex);
++        m_settings = s_settings;
++    }
+ 
+     m_bg_dimmer.set_pos(0, 0);
+     m_bg_dimmer.set_size(virtual_width, virtual_height);
+@@ -50,64 +63,83 @@ pause_overlay::pause_overlay(app::AppSessionController &session_controller)
+     m_title.fore_color = k_color_text;
+     m_title.back_color = { 0.f, 0.f, 0.f, 0.f };
+ 
+-    pause_overlay_button resume_button;
+-    resume_button.bg.back_color = k_color_btn_normal;
+-    resume_button.bg.border_radius = k_button_radius;
+-    resume_button.bg.border_color = { 0.f, 0.f, 0.f, 0.f };
+-    resume_button.text.set_text(lang::get(lang::str::resume));
+-    resume_button.text.set_font(k_pause_overlay_font, k_font_size, true);
+-    resume_button.text.align_text(overlay_element::center);
+-    resume_button.text.fore_color = k_color_text;
+-    resume_button.text.back_color = { 0.f, 0.f, 0.f, 0.f };
+-    resume_button.value = PAUSE_BUTTON_RESUME;
+-    m_buttons.push_back(std::move(resume_button));
+-
+-    pause_overlay_button exit_button;
+-    exit_button.bg.back_color = k_color_btn_normal;
+-    exit_button.bg.border_radius = k_button_radius;
+-    exit_button.bg.border_color = { 0.f, 0.f, 0.f, 0.f };
+-    exit_button.text.set_text(lang::get(lang::str::exit));
+-    exit_button.text.set_font(k_pause_overlay_font, k_font_size, true);
+-    exit_button.text.align_text(overlay_element::center);
+-    exit_button.text.fore_color = k_color_text;
+-    exit_button.text.back_color = { 0.f, 0.f, 0.f, 0.f };
+-    exit_button.value = PAUSE_BUTTON_EXIT;
+-    m_buttons.push_back(std::move(exit_button));
++    add_button(PAUSE_BUTTON_RESUME, lang::get(lang::str::resume));
++    for (size_t i = 0; i < m_settings.size(); i++)
++        add_button(PAUSE_BUTTON_SETTING, m_settings[i].name, static_cast<int>(i));
++    add_button(PAUSE_BUTTON_EXIT, lang::get(lang::str::exit));
+ 
+     layout();
+ }
+ 
++void pause_overlay::add_button(pause_overlay_button_value value, const std::string &text, int setting) {
++    const uint16_t font_size = m_settings.empty() ? k_font_size : k_settings_font_size;
++    pause_overlay_button button;
++    button.bg.back_color = k_color_btn_normal;
++    button.bg.border_radius = k_button_radius;
++    button.bg.border_color = { 0.f, 0.f, 0.f, 0.f };
++    button.text.set_text(text);
++    button.text.set_font(k_pause_overlay_font, font_size, true);
++    // a setting's name on the left and its value on the right; Resume and Exit centred
++    button.text.align_text(setting >= 0 ? overlay_element::left : overlay_element::center);
++    button.text.fore_color = k_color_text;
++    button.text.back_color = { 0.f, 0.f, 0.f, 0.f };
++    button.value = value;
++    button.setting = setting;
++    if (setting >= 0) {
++        button.value_text.set_font(k_pause_overlay_font, font_size, true);
++        button.value_text.align_text(overlay_element::right);
++        button.value_text.fore_color = k_color_focus_ring;
++        button.value_text.back_color = { 0.f, 0.f, 0.f, 0.f };
++    }
++    m_buttons.push_back(std::move(button));
++}
++
+ void pause_overlay::layout() {
+-    const int16_t card_x = static_cast<int16_t>((virtual_width - k_card_w) / 2);
+-    const int16_t card_y = static_cast<int16_t>((virtual_height - k_card_h) / 2);
++    const bool with_settings = !m_settings.empty();
++    const uint16_t button_w = with_settings ? k_settings_button_w : k_button_w;
++    const uint16_t button_h = with_settings ? k_settings_button_h : k_button_h;
++    const uint16_t button_gap = with_settings ? k_settings_button_gap : k_button_gap;
++    const uint16_t font_size = with_settings ? k_settings_font_size : k_font_size;
++    const uint16_t total_buttons_h = static_cast<uint16_t>(m_buttons.size() * button_h
++        + (m_buttons.size() > 1 ? (m_buttons.size() - 1) * button_gap : 0));
++    const uint16_t card_w = with_settings ? k_settings_card_w : k_card_w;
++    const uint16_t card_h = with_settings ? static_cast<uint16_t>(total_buttons_h + 2 * k_settings_padding) : k_card_h;
++
++    const int16_t card_x = static_cast<int16_t>((virtual_width - card_w) / 2);
++    const int16_t card_y = static_cast<int16_t>((virtual_height - card_h) / 2);
+ 
+     m_card.set_pos(card_x, card_y);
+-    m_card.set_size(k_card_w, k_card_h);
++    m_card.set_size(card_w, card_h);
+ 
+     // Place the title right above the card
+     m_title.set_pos(static_cast<int16_t>(0),
+         static_cast<int16_t>(card_y - k_title_font_size - 15));
+     m_title.set_size(virtual_width, k_title_font_size + 4);
+ 
+-    const int16_t button_x = static_cast<int16_t>(card_x + (k_card_w - k_button_w) / 2);
+-    const uint16_t total_buttons_h = static_cast<uint16_t>(m_buttons.size() * k_button_h
+-        + (m_buttons.size() > 1 ? (m_buttons.size() - 1) * k_button_gap : 0));
+-    int16_t button_y = static_cast<int16_t>(card_y + (k_card_h - total_buttons_h) / 2);
++    const int16_t button_x = static_cast<int16_t>(card_x + (card_w - button_w) / 2);
++    int16_t button_y = static_cast<int16_t>(card_y + (card_h - total_buttons_h) / 2);
+ 
+     for (auto &button : m_buttons) {
+         button.bg.set_pos(button_x, button_y);
+-        button.bg.set_size(k_button_w, k_button_h);
+-
+-        button.text.set_pos(button_x,
+-            static_cast<int16_t>(button_y + (k_button_h - k_font_size) / 2 + k_text_voffset));
+-        button.text.set_size(k_button_w, k_font_size);
++        button.bg.set_size(button_w, button_h);
++
++        const int16_t text_y = static_cast<int16_t>(button_y + (button_h - font_size) / 2 + k_text_voffset);
++        if (button.setting >= 0) {
++            const uint16_t half = button_w / 2;
++            button.text.set_pos(static_cast<int16_t>(button_x + k_settings_text_inset), text_y);
++            button.text.set_size(static_cast<uint16_t>(half - k_settings_text_inset), font_size);
++            button.value_text.set_pos(static_cast<int16_t>(button_x + half), text_y);
++            button.value_text.set_size(static_cast<uint16_t>(half - k_settings_text_inset), font_size);
++        } else {
++            button.text.set_pos(button_x, text_y);
++            button.text.set_size(button_w, font_size);
++        }
+ 
+-        button_y = static_cast<int16_t>(button_y + k_button_h + k_button_gap);
++        button_y = static_cast<int16_t>(button_y + button_h + button_gap);
+     }
+ 
+     if (!m_buttons.empty()) {
+-        m_selected_button = (pause_overlay_button_value)std::clamp(static_cast<int>(m_selected_button), 0,
+-            static_cast<int>(m_buttons.size()) - 1);
++        m_selected_button = std::clamp(m_selected_button.load(), 0, static_cast<int>(m_buttons.size()) - 1);
+     }
+ }
+ 
+@@ -124,6 +156,22 @@ bool pause_overlay::poll_dialog(DialogState &dialog, int date_format, int sys_bu
+     return true;
+ }
+ 
++// The selected setting's next (step 1) or previous (step -1) value, wrapping around
++void pause_overlay::change_setting(int step) {
++    const int selected = m_selected_button;
++    if (selected < 0 || selected >= static_cast<int>(m_buttons.size()))
++        return;
++    const int index = m_buttons[selected].setting;
++    if (index < 0)
++        return;
++    const pause_menu_setting &setting = m_settings[index];
++    const int count = static_cast<int>(setting.values.size());
++    if (count == 0 || !setting.get || !setting.set)
++        return;
++    const int current = std::clamp(setting.get(), 0, count - 1);
++    setting.set((current + step + count) % count);
++}
++
+ void pause_overlay::on_button_pressed(pad_button button_press, bool is_auto_repeat) {
+     static_cast<void>(is_auto_repeat);
+ 
+@@ -133,18 +181,26 @@ void pause_overlay::on_button_pressed(pad_button button_press, bool is_auto_repe
+     switch (button_press) {
+     case pad_button::dpad_up:
+     case pad_button::ls_up:
+-        m_selected_button = (pause_overlay_button_value)std::max(0, static_cast<int>(m_selected_button) - 1);
++        m_selected_button = std::max(0, m_selected_button.load() - 1);
+         break;
+     case pad_button::dpad_down:
+     case pad_button::ls_down:
+-        m_selected_button = (pause_overlay_button_value)std::min(static_cast<int>(m_buttons.size()) - 1, static_cast<int>(m_selected_button) + 1);
++        m_selected_button = std::min(static_cast<int>(m_buttons.size()) - 1, m_selected_button.load() + 1);
++        break;
++    case pad_button::dpad_left:
++    case pad_button::ls_left:
++        change_setting(-1);
++        break;
++    case pad_button::dpad_right:
++    case pad_button::ls_right:
++        change_setting(1);
+         break;
+     case pad_button::circle:
+     case pad_button::cross:
+         [[fallthrough]]; // Its better to handle X and O below, since they can depend on settings
+     default: {
+         if (is_confirm_button(button_press)) {
+-            switch (m_selected_button) {
++            switch (m_buttons[m_selected_button].value) {
+             case PAUSE_BUTTON_RESUME:
+                 m_session_controller.set_pause_reason(app::AppSessionPauseReason::All, false);
+                 break;
+@@ -152,13 +208,15 @@ void pause_overlay::on_button_pressed(pad_button button_press, bool is_auto_repe
+                 m_session_controller.set_pause_reason(app::AppSessionPauseReason::All, false);
+                 m_session_controller.request_stop();
+                 break;
++            case PAUSE_BUTTON_SETTING:
++                change_setting(1);
++                break;
+             default:
+                 break;
+-                return;
+             }
+-        }
+-        if (is_cancel_button(button_press)) {
+-            // Handle cancel button here
++        } else if (is_cancel_button(button_press)) {
++            // back to the game, as Resume
++            m_session_controller.set_pause_reason(app::AppSessionPauseReason::All, false);
+         }
+         break;
+     }
+@@ -177,7 +235,7 @@ void pause_overlay::on_touch_pressed(float vx, float vy) {
+         const auto &btn = m_buttons[i];
+         if (vx >= btn.bg.x && vx <= btn.bg.x + btn.bg.w
+             && vy >= btn.bg.y && vy <= btn.bg.y + btn.bg.h) {
+-            m_selected_button = btn.value;
++            m_selected_button = static_cast<int>(i);
+             on_button_pressed(confirm_button, false);
+             return;
+         }
+@@ -194,12 +252,25 @@ compiled_resource pause_overlay::get_compiled() {
+     result.add(m_card.get_compiled());
+     result.add(m_title.get_compiled());
+ 
+-    for (auto &button : m_buttons) {
+-        button.bg.back_color = (button.value == m_selected_button)
++    const int selected = m_selected_button;
++    for (size_t i = 0; i < m_buttons.size(); i++) {
++        auto &button = m_buttons[i];
++        button.bg.back_color = (static_cast<int>(i) == selected)
+             ? k_color_btn_selected
+             : k_color_btn_normal;
+         result.add(button.bg.get_compiled());
+         result.add(button.text.get_compiled());
++
++        if (button.setting >= 0) {
++            const pause_menu_setting &setting = m_settings[button.setting];
++            const int count = static_cast<int>(setting.values.size());
++            const int current = (count > 0 && setting.get) ? std::clamp(setting.get(), 0, count - 1) : -1;
++            if (current != button.shown) {
++                button.shown = current;
++                button.value_text.set_text(current >= 0 ? "<  " + setting.values[current] + "  >" : std::string());
++            }
++            result.add(button.value_text.get_compiled());
++        }
+     }
+ 
+     draw_focus_ring(result);
+@@ -220,12 +291,13 @@ bool pause_overlay::is_cancel_button(pad_button button) const {
+ }
+ 
+ void pause_overlay::draw_focus_ring(compiled_resource &res) const {
+-    if (m_buttons.empty() || m_selected_button < 0
+-        || m_selected_button >= static_cast<int>(m_buttons.size())) {
++    const int selected_index = m_selected_button;
++    if (m_buttons.empty() || selected_index < 0
++        || selected_index >= static_cast<int>(m_buttons.size())) {
+         return;
+     }
+ 
+-    const auto &selected = m_buttons[m_selected_button];
++    const auto &selected = m_buttons[selected_index];
+     const float pulse = 0.5f + 0.5f * std::sin(m_focus_pulse_time * 3.0f);
+     const float a = 0.85f + 0.15f * pulse;
+ 
 diff --git a/vita3k/ps4/ps4.cmake b/vita3k/ps4/ps4.cmake
 new file mode 100644
-index 00000000..9a597d5e
+index 00000000..4b7cb5d3
 --- /dev/null
 +++ b/vita3k/ps4/ps4.cmake
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,37 @@
 +# PS4: Vita3K's frontend for the console, included from vita3k/CMakeLists.txt once the vita3k target
 +# exists. Built with the port's toolchain (toolchain/ps4-vita3k.cmake, and ps4-love-style.cmake as
 +# the project include: PS4_RUNTIME_SOURCES, ps4_link_mesa, ps4_add_eboot).
@@ -1131,6 +1627,8 @@ index 00000000..9a597d5e
 +	ps4/ps4_launcher.h
 +	ps4/ps4_pad.cpp
 +	ps4/ps4_pad.h
++	ps4/ps4_perf.cpp
++	ps4/ps4_perf.h
 +	ps4/ps4_wsi.cpp
 +	ps4/ps4_wsi.h
 +	ps4/ps4_stubs.c
@@ -3351,10 +3849,10 @@ index 00000000..0210098f
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..8557ae57
+index 00000000..36b1d5d9
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
-@@ -0,0 +1,438 @@
+@@ -0,0 +1,549 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -3389,6 +3887,7 @@ index 00000000..8557ae57
 +#include "ps4_canvas.h"
 +#include "ps4_launcher.h"
 +#include "ps4_pad.h"
++#include "ps4_perf.h"
 +#include "ps4_wsi.h"
 +
 +#include <app/functions.h>
@@ -3399,6 +3898,7 @@ index 00000000..8557ae57
 +#include <emuenv/app_launch_request.h>
 +#include <emuenv/state.h>
 +#include <modules/module_parent.h>
++#include <overlay/pause_overlay.h>
 +#include <packages/sfo.h>
 +#include <renderer/frame_host.h>
 +#include <util/fs.h>
@@ -3409,15 +3909,21 @@ index 00000000..8557ae57
 +
 +#include <orbis/SystemService.h>
 +
++#include <algorithm>
 +#include <chrono>
++#include <cmath>
 +#include <cstdio>
 +#include <cstdlib>
 +#include <cstring>
 +#include <exception>
 +#include <fstream>
++#include <functional>
 +#include <iterator>
++#include <mutex>
 +#include <optional>
++#include <string>
 +#include <thread>
++#include <vector>
 +
 +extern "C" void ps4_boot_trace(const char *line); // port/ps4_crashlog.cpp
 +// port/ps4_sampler.cpp: threads' own CPU time and the wait counters
@@ -3429,7 +3935,8 @@ index 00000000..8557ae57
 +// Every 10 s in the log while a game runs: its frame rate, the emulated vblanks (60 a second when
 +// the timing holds), where the render thread's time went (waiting for the game's commands,
 +// showing frames, waiting for the GPU), how long the game's threads waited for vblanks, and every
-+// thread busier than 3% of a core (its own CPU time, busiest first): what holds a game back.
++// thread busier than 3% of a core (its own CPU time, busiest first): what holds a game back. Then
++// a line for each busy guest thread: its time in guest code and in its biggest imports.
 +class PerfLine {
 +public:
 +    void update(const EmuEnvState &emuenv, const std::chrono::steady_clock::time_point now) {
@@ -3445,12 +3952,17 @@ index 00000000..8557ae57
 +            waits[i] = total;
 +        }
 +        const uint64_t vblank_count = emuenv.display.vblank_count.load();
++        const uint64_t tsc = __builtin_ia32_rdtsc();
 +        if (started) {
 +            LOG_INFO("perf: {} fps, {:.0f} vblanks/s; render thread: waits for the game {} ms/s, shows frames {} ms/s, waits for the GPU {} ms/s; the game waits for vblanks {} ms/s; busy: {}",
 +                emuenv.fps, (vblank_count - vblanks) / seconds, ms[1], ms[2], ms[3], ms[0], busy);
++            ps4perf::report(seconds, (tsc - last_tsc) / (seconds * 1000.0));
++        } else {
++            ps4perf::report(0, 0);
 +        }
 +        started = true;
 +        vblanks = vblank_count;
++        last_tsc = tsc;
 +        last = now;
 +        next = now + std::chrono::seconds(10);
 +    }
@@ -3459,8 +3971,103 @@ index 00000000..8557ae57
 +    bool started = false;
 +    std::chrono::steady_clock::time_point last{}, next{};
 +    uint64_t vblanks = 0;
++    uint64_t last_tsc = 0;
 +    long long waits[4] = {};
 +};
++
++// The quick menu (L3 + R3): Vita3K's pause menu, with the settings worth changing on the PS4
++// between Resume and Exit. A change goes through Vita3K's settings like the PC's settings dialog:
++// saved in config.yml, and applied at once where Vita3K can (the resolution and the texture checks
++// at the next start). The menu reads the settings on the render thread while a change replaces
++// emuenv.cfg (strings and all) on the overlay's input thread: both take quick_menu_mutex.
++std::mutex quick_menu_mutex;
++
++void install_quick_menu(EmuEnvState &emuenv) {
++    using overlay::pause_menu_setting;
++    const auto change = [&emuenv](const std::function<void(Config &)> &edit) {
++        const std::lock_guard<std::mutex> lock(quick_menu_mutex);
++        Config desired;
++        desired = emuenv.cfg;
++        edit(desired);
++        app::commit_settings(emuenv, desired);
++    };
++    std::vector<pause_menu_setting> settings;
++
++    // Vita3K's performance overlay (its detail levels)
++    settings.push_back({ "Show FPS", { "Off", "FPS", "FPS + frame time", "FPS + min/avg/max", "FPS + graph" },
++        [&emuenv] {
++            const std::lock_guard<std::mutex> lock(quick_menu_mutex);
++            return emuenv.cfg.performance_overlay ? emuenv.cfg.performance_overlay_detail + 1 : 0;
++        },
++        [change](int value) {
++            change([value](Config &cfg) {
++                cfg.performance_overlay = value > 0;
++                if (value > 0)
++                    cfg.performance_overlay_detail = value - 1;
++            });
++        } });
++    settings.push_back({ "FPS position", { "Top left", "Top centre", "Top right", "Bottom left", "Bottom centre", "Bottom right" },
++        [&emuenv] {
++            const std::lock_guard<std::mutex> lock(quick_menu_mutex);
++            return emuenv.cfg.performance_overlay_position;
++        },
++        [change](int value) { change([value](Config &cfg) { cfg.performance_overlay_position = value; }); } });
++
++    std::vector<std::string> volumes;
++    for (int volume = 0; volume <= 100; volume += 10)
++        volumes.push_back(std::to_string(volume) + "%");
++    settings.push_back({ "Volume", volumes,
++        [&emuenv] {
++            const std::lock_guard<std::mutex> lock(quick_menu_mutex);
++            return (emuenv.cfg.audio_volume + 5) / 10;
++        },
++        [change](int value) { change([value](Config &cfg) { cfg.audio_volume = value * 10; }); } });
++
++    // How the 960x544 picture is scaled to the TV (FSR: AMD's upscaler, on the GPU)
++    static const std::vector<std::string> filters = { "Bilinear", "Nearest", "Bicubic", "FXAA", "FSR" };
++    settings.push_back({ "Screen filter", filters,
++        [&emuenv] {
++            const std::lock_guard<std::mutex> lock(quick_menu_mutex);
++            const auto it = std::find(filters.begin(), filters.end(), emuenv.cfg.screen_filter);
++            return it == filters.end() ? 0 : static_cast<int>(it - filters.begin());
++        },
++        [change](int value) { change([value](Config &cfg) { cfg.screen_filter = filters[value]; }); } });
++
++    // Rendering above the Vita's resolution: sharper on the TV, more work for the GPU
++    static const float multipliers[] = { 1.0f, 1.5f, 2.0f };
++    settings.push_back({ "Resolution (next start)", { "960x544", "1440x816", "1920x1088" },
++        [&emuenv] {
++            const std::lock_guard<std::mutex> lock(quick_menu_mutex);
++            int best = 0;
++            for (int i = 0; i < 3; i++) {
++                if (std::abs(emuenv.cfg.resolution_multiplier - multipliers[i]) < std::abs(emuenv.cfg.resolution_multiplier - multipliers[best]))
++                    best = i;
++            }
++            return best;
++        },
++        [change](int value) { change([value](Config &cfg) { cfg.resolution_multiplier = multipliers[value]; }); } });
++
++    // In the background: no stutter while a new shader compiles, the thing it draws shows up a
++    // little later; before drawing: everything right away, with a stutter
++    settings.push_back({ "Shader compiling", { "In the background", "Before drawing" },
++        [&emuenv] {
++            const std::lock_guard<std::mutex> lock(quick_menu_mutex);
++            return emuenv.cfg.async_pipeline_compilation ? 0 : 1;
++        },
++        [change](int value) { change([value](Config &cfg) { cfg.async_pipeline_compilation = value == 0; }); } });
++
++    // How the texture cache sees a texture change: hashing its data at every use (Vita3K's
++    // default, the render thread's time), or write-protecting the big ones (faster; a game that
++    // changes textures in ways that aren't caught shows old ones)
++    settings.push_back({ "Texture checks (next start)", { "Hash each use", "Watch writes" },
++        [&emuenv] {
++            const std::lock_guard<std::mutex> lock(quick_menu_mutex);
++            return emuenv.cfg.hashless_texture_cache ? 1 : 0;
++        },
++        [change](int value) { change([value](Config &cfg) { cfg.hashless_texture_cache = value == 1; }); } });
++
++    overlay::set_pause_menu_settings(std::move(settings));
++}
 +
 +EmuEnvState *crash_emuenv = nullptr;
 +// The package's version (/app0/version.txt), in the logs: an app installed over an older one is
@@ -3604,6 +4211,8 @@ index 00000000..8557ae57
 +    PS4FrameHost frame_host;
 +
 +    trace("session: launching " + request.app_path);
++    ps4perf::benchmark_large_pages();
++    install_quick_menu(emuenv);
 +    if (!session.begin_launch(request, request.reason != AppLaunchReason::LoadExec))
 +        return "Couldn't find " + request.app_path + " among the installed apps";
 +    trace("session: renderer");
@@ -4129,6 +4738,320 @@ index 00000000..ff30f0d3
 +void release(EmuEnvState &emuenv);
 +
 +} // namespace ps4pad
+diff --git a/vita3k/ps4/ps4_perf.cpp b/vita3k/ps4/ps4_perf.cpp
+new file mode 100644
+index 00000000..5346e640
+--- /dev/null
++++ b/vita3k/ps4/ps4_perf.cpp
+@@ -0,0 +1,264 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// PS4: where the game's threads spend their time, call by call, and how the PS4 maps memory.
++//
++// Every guest thread's JIT loop (kernel/src/thread.cpp) hands over the time of each run of guest
++// code (dynarmic, up to the next import) and of each import it calls (the HLE function: its own
++// work, or its wait), with the import's NID. ps4perf::report() puts each busy thread's split in
++// the log next to the perf line: which imports a thread waits in, and how much of its time is
++// emulated code. The time is the TSC's (rdtsc: invariant on the Jaguar cores), wall time.
++
++#include "ps4_perf.h"
++
++#include <nids/functions.h>
++#include <util/log.h>
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <random>
++#include <string>
++#include <vector>
++
++#include <sys/types.h>
++
++namespace {
++
++constexpr int kMaxThreads = 64;
++constexpr int kSlots = 256; // per thread, open addressing on the NID
++
++struct ImportSlot {
++    std::atomic<uint32_t> nid{ 0 };
++    std::atomic<uint64_t> ticks{ 0 };
++    std::atomic<uint64_t> calls{ 0 };
++};
++
++struct GuestThread {
++    char name[32] = {};
++    std::atomic<bool> ready{ false };
++    std::atomic<uint64_t> code_ticks{ 0 };
++    std::atomic<uint64_t> code_runs{ 0 };
++    ImportSlot slots[kSlots];
++};
++
++GuestThread g_threads[kMaxThreads];
++std::atomic<int> g_count{ 0 };
++constinit thread_local GuestThread *t_thread = nullptr;
++
++// Only the owning thread writes its counters: plain adds, published with relaxed stores
++void add(std::atomic<uint64_t> &counter, uint64_t value) {
++    counter.store(counter.load(std::memory_order_relaxed) + value, std::memory_order_relaxed);
++}
++
++} // namespace
++
++extern "C" void ps4_perf_guest_thread(const char *name) {
++    const int index = g_count.fetch_add(1);
++    if (index >= kMaxThreads) {
++        t_thread = nullptr;
++        return;
++    }
++    GuestThread &thread = g_threads[index];
++    snprintf(thread.name, sizeof(thread.name), "%s", name ? name : "?");
++    thread.ready.store(true, std::memory_order_release);
++    t_thread = &thread;
++}
++
++extern "C" void ps4_perf_code(uint64_t ticks) {
++    GuestThread *const thread = t_thread;
++    if (!thread)
++        return;
++    add(thread->code_ticks, ticks);
++    add(thread->code_runs, 1);
++}
++
++extern "C" void ps4_perf_import(uint32_t nid, uint64_t ticks) {
++    GuestThread *const thread = t_thread;
++    if (!thread || nid == 0)
++        return;
++    const uint32_t start = (nid * 0x9E3779B1u) >> 24;
++    for (int probe = 0; probe < kSlots; probe++) {
++        ImportSlot &slot = thread->slots[(start + probe) & (kSlots - 1)];
++        const uint32_t slot_nid = slot.nid.load(std::memory_order_relaxed);
++        if (slot_nid == nid) {
++            add(slot.ticks, ticks);
++            add(slot.calls, 1);
++            return;
++        }
++        if (slot_nid == 0) {
++            slot.ticks.store(ticks, std::memory_order_relaxed);
++            slot.calls.store(1, std::memory_order_relaxed);
++            slot.nid.store(nid, std::memory_order_release);
++            return;
++        }
++    }
++}
++
++namespace ps4perf {
++
++namespace {
++
++struct Snapshot {
++    uint64_t code_ticks = 0;
++    uint64_t code_runs = 0;
++    uint64_t ticks[kSlots] = {};
++    uint64_t calls[kSlots] = {};
++};
++Snapshot g_previous[kMaxThreads];
++
++} // namespace
++
++void report(double seconds, double ticks_per_ms) {
++    // the first call only takes the counters as they are
++    const bool log = seconds > 0 && ticks_per_ms > 0;
++    if (!log)
++        seconds = ticks_per_ms = 1;
++    const int count = std::min(g_count.load(), kMaxThreads);
++    for (int i = 0; i < count; i++) {
++        GuestThread &thread = g_threads[i];
++        if (!thread.ready.load(std::memory_order_acquire))
++            continue;
++        Snapshot &previous = g_previous[i];
++
++        struct Entry {
++            uint32_t nid;
++            double ms;
++            double calls;
++        };
++        std::vector<Entry> entries;
++        double imports_ms = 0, import_calls = 0;
++        for (int s = 0; s < kSlots; s++) {
++            ImportSlot &slot = thread.slots[s];
++            const uint32_t nid = slot.nid.load(std::memory_order_acquire);
++            if (nid == 0)
++                continue;
++            const uint64_t ticks = slot.ticks.load(std::memory_order_relaxed);
++            const uint64_t calls = slot.calls.load(std::memory_order_relaxed);
++            const double ms = (ticks - previous.ticks[s]) / ticks_per_ms / seconds;
++            const double per_second = (calls - previous.calls[s]) / seconds;
++            previous.ticks[s] = ticks;
++            previous.calls[s] = calls;
++            imports_ms += ms;
++            import_calls += per_second;
++            if (ms >= 1.0)
++                entries.push_back({ nid, ms, per_second });
++        }
++        const uint64_t code_ticks = thread.code_ticks.load(std::memory_order_relaxed);
++        const uint64_t code_runs = thread.code_runs.load(std::memory_order_relaxed);
++        const double code_ms = (code_ticks - previous.code_ticks) / ticks_per_ms / seconds;
++        previous.code_ticks = code_ticks;
++        previous.code_runs = code_runs;
++
++        // the threads that did something: more than 5% of the time in code and imports together
++        if (!log || code_ms + imports_ms < 50)
++            continue;
++        std::sort(entries.begin(), entries.end(), [](const Entry &a, const Entry &b) { return a.ms > b.ms; });
++        std::string line;
++        for (size_t e = 0; e < std::min<size_t>(entries.size(), 8); e++) {
++            char part[128];
++            snprintf(part, sizeof(part), "%s%s %.0f (%.0f/s)", e ? ", " : "", import_name(entries[e].nid), entries[e].ms, entries[e].calls);
++            line += part;
++        }
++        LOG_INFO("perf: {}: guest code {:.0f} ms/s, imports {:.0f} ms/s ({:.0f} calls/s): {}", thread.name, code_ms, imports_ms, import_calls, line);
++    }
++}
++
++// --- Large pages ---------------------------------------------------------------------------
++
++extern "C" {
++// Declared by hand, as in mem/src/mem.cpp
++size_t sceKernelGetDirectMemorySize();
++int32_t sceKernelAllocateDirectMemory(off_t search_start, off_t search_end, size_t length, size_t alignment, int32_t memory_type, off_t *physical_out);
++int32_t sceKernelReleaseDirectMemory(off_t start, size_t length);
++int32_t sceKernelMapDirectMemory(void **address, size_t length, int32_t protection, int32_t flags, off_t direct_memory_start, size_t alignment);
++int32_t sceKernelReserveVirtualRange(void **address, size_t length, int32_t flags, size_t alignment);
++int32_t sceKernelMunmap(void *address, size_t length);
++}
++
++namespace {
++
++// Average latency of dependent loads following a random cycle through the cache lines of
++// [memory, memory + size): mostly cache misses, each with a TLB miss unless large pages cover it.
++double chase_ns(const uint8_t *memory, size_t steps) {
++    uint32_t offset = 0;
++    const auto start = std::chrono::steady_clock::now();
++    for (size_t i = 0; i < steps; i++)
++        offset = *reinterpret_cast<const volatile uint32_t *>(memory + offset);
++    const auto end = std::chrono::steady_clock::now();
++    // keeps the chain
++    if (offset == 0xFFFFFFFF)
++        LOG_INFO("");
++    return std::chrono::duration<double, std::nano>(end - start).count() / steps;
++}
++
++} // namespace
++
++void benchmark_large_pages() {
++    constexpr size_t SIZE = 32 * 1024 * 1024;
++    constexpr size_t LARGE_PAGE = 2 * 1024 * 1024;
++    constexpr size_t PAGE = 16 * 1024;
++    constexpr size_t LINE = 64;
++    constexpr int32_t MAP_FIXED_FLAG = 0x10;
++    constexpr int32_t PROT_CPU_RW = 0x3;
++
++    off_t phys = 0;
++    if (sceKernelAllocateDirectMemory(0, static_cast<off_t>(sceKernelGetDirectMemorySize()), SIZE, LARGE_PAGE, 0, &phys) != 0) {
++        LOG_INFO("PS4 memory test: no direct memory for it");
++        return;
++    }
++    // one range, room for both mappings of the same memory: 2 MiB aligned, and 16 KiB off that
++    void *range = nullptr;
++    const size_t range_size = 2 * SIZE + 2 * LARGE_PAGE;
++    if (sceKernelReserveVirtualRange(&range, range_size, 0, LARGE_PAGE) != 0) {
++        sceKernelReleaseDirectMemory(phys, SIZE);
++        LOG_INFO("PS4 memory test: no address space for it");
++        return;
++    }
++    sceKernelMunmap(range, range_size);
++    void *aligned = range;
++    void *shifted = static_cast<uint8_t *>(range) + SIZE + LARGE_PAGE + PAGE;
++    const bool mapped = sceKernelMapDirectMemory(&aligned, SIZE, PROT_CPU_RW, MAP_FIXED_FLAG, phys, LARGE_PAGE) == 0
++        && sceKernelMapDirectMemory(&shifted, SIZE, PROT_CPU_RW, MAP_FIXED_FLAG, phys, PAGE) == 0;
++    if (mapped) {
++        // a random cycle through the lines, written through the first mapping
++        const uint32_t lines = SIZE / LINE;
++        std::vector<uint32_t> order(lines);
++        for (uint32_t i = 0; i < lines; i++)
++            order[i] = i;
++        std::mt19937 random(1234);
++        std::shuffle(order.begin() + 1, order.end(), random);
++        uint8_t *const memory = static_cast<uint8_t *>(aligned);
++        for (uint32_t i = 0; i < lines; i++)
++            *reinterpret_cast<uint32_t *>(memory + order[i] * LINE) = order[(i + 1) % lines] * LINE;
++        constexpr size_t STEPS = 200000;
++        chase_ns(static_cast<const uint8_t *>(aligned), STEPS / 4); // warm up
++        const double large = chase_ns(static_cast<const uint8_t *>(aligned), STEPS);
++        const double small = chase_ns(static_cast<const uint8_t *>(shifted), STEPS);
++        LOG_INFO("PS4 memory test: random reads over 32 MiB take {:.0f} ns mapped 2 MiB aligned, {:.0f} ns mapped 16 KiB off ({})",
++            large, small, large < small * 0.85 ? "large pages help: the guest memory uses them" : "no difference: no large pages?");
++    } else {
++        LOG_INFO("PS4 memory test: mapping failed");
++    }
++    sceKernelMunmap(range, range_size);
++    sceKernelReleaseDirectMemory(phys, SIZE);
++}
++
++} // namespace ps4perf
+diff --git a/vita3k/ps4/ps4_perf.h b/vita3k/ps4/ps4_perf.h
+new file mode 100644
+index 00000000..16d557c9
+--- /dev/null
++++ b/vita3k/ps4/ps4_perf.h
+@@ -0,0 +1,38 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#pragma once
++
++#include <cstdint>
++
++// Called by the emulator's libraries (declared there by hand): a guest thread starts (its name in
++// the report), a run of guest code ended, an import returned (its NID). Ticks are the TSC's.
++extern "C" void ps4_perf_guest_thread(const char *name);
++extern "C" void ps4_perf_code(uint64_t ticks);
++extern "C" void ps4_perf_import(uint32_t nid, uint64_t ticks);
++
++namespace ps4perf {
++
++// One log line per guest thread busy in the last `seconds`: its time in guest code and in its
++// biggest imports (ms a second, calls a second)
++void report(double seconds, double ticks_per_ms);
++
++// Logs how fast random reads are through a 2 MiB aligned mapping and a misaligned one of the same
++// direct memory: whether the PS4 gives the guest memory large pages
++void benchmark_large_pages();
++
++} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_stubs.c b/vita3k/ps4/ps4_stubs.c
 new file mode 100644
 index 00000000..c06ce988
