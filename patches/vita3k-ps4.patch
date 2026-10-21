@@ -3227,10 +3227,10 @@ index 00000000..0210098f
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..02df6814
+index 00000000..6c179065
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
-@@ -0,0 +1,393 @@
+@@ -0,0 +1,389 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -3536,19 +3536,15 @@ index 00000000..02df6814
 +    if (logging::init(root_paths, false) != Success)
 +        trace("logging could not start");
 +    LOG_INFO("Vita3K for PS4 {}", app_version);
-+    // RADV without HTILE (depth compression): Mortal Kombat hung the GPU twice starting a fight, both
-+    // times in the draws right after RADV initialized and fast-cleared the HTILE of a new
-+    // depth-stencil buffer (Dolphin, which works, has no stencil), and once the whole PS4 froze.
-+    // Then which draw a GPU hang is on: RADV's per-draw trace ids and the PS4 winsys' flight
-+    // recorder (port/mesa/ac_ps4_drm.c, into /data/DolphinPS4/flight), when /data/Vita3K/radv-trace
-+    // is there; it slows the rendering down.
-+    std::string radv_debug = "nohiz";
++    // Which draw a GPU hang is on: RADV's per-draw trace ids (RADV_DEBUG=hang, which also ends the
++    // app when a submission doesn't finish, rather than the whole PS4 freezing) and the PS4
++    // winsys' flight recorder (port/mesa/ac_ps4_drm.c, into /data/DolphinPS4/flight), when
++    // /data/Vita3K/radv-trace is there; it slows the rendering down.
 +    if (fs::exists(root_paths.get_log_path() / "radv-trace", ec)) {
 +        setenv("RADV_PS4_TRACE", "1", 1);
-+        radv_debug += ",hang";
++        setenv("RADV_DEBUG", "hang", 1);
++        trace("radv: RADV_DEBUG=hang, flight recorder on");
 +    }
-+    setenv("RADV_DEBUG", radv_debug.c_str(), 1);
-+    trace("radv: RADV_DEBUG=" + radv_debug);
 +
 +    // CLI11 needs a program name (a PS4 app gets none)
 +    char program[] = "vita3k";
@@ -4652,7 +4648,7 @@ index 00000000..ced3b207
 +// Flips submitted by swapchains so far
 +unsigned long long ps4wsi_flip_count();
 diff --git a/vita3k/renderer/src/vulkan/renderer.cpp b/vita3k/renderer/src/vulkan/renderer.cpp
-index ed8c71ad..447670e5 100644
+index ed8c71ad..cad2e91a 100644
 --- a/vita3k/renderer/src/vulkan/renderer.cpp
 +++ b/vita3k/renderer/src/vulkan/renderer.cpp
 @@ -45,6 +45,12 @@
@@ -4688,7 +4684,24 @@ index ed8c71ad..447670e5 100644
  #elif !defined(__ANDROID__)
              if (!select_linux_surface_extension(*this, frame_host->handle(), instance_extensions))
                  return false;
-@@ -1724,6 +1736,8 @@ renderer::VulkanDeviceInfo renderer::enumerate_vulkan_devices(const std::string
+@@ -713,6 +725,16 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
+         // we need to make a copy of the vertex buffer for moltenvk, so disable memory mapping
+         support_memory_mapping = false;
+ #endif
++#ifdef __PS4__
++        // Memory mapping has shaders read guest memory through buffer device addresses, which ACO
++        // compiles to FLAT instructions on GFX7, and on the PS4 the kernel sets the FLAT apertures
++        // (SH_MEM_BASES) up for its own GNM shaders (a PS4 PCSX2 port's first FLAT store hung the
++        // GPU). Mortal Kombat hung the GPU three times at the same kind of draw: the first of a
++        // fight whose vertex shader needs scratch, likely a skinned model reading memory. Without
++        // memory mapping, guest memory is read through descriptors (MUBUF), as on GPUs without
++        // buffer device addresses.
++        support_memory_mapping = false;
++#endif
+ 
+ #ifdef __ANDROID__
+         support_android_buffer_import &= SDL_GetAndroidSDKVersion() >= 26;
+@@ -1724,6 +1746,8 @@ renderer::VulkanDeviceInfo renderer::enumerate_vulkan_devices(const std::string
              return info;
  
          dispatch.init(vk_get_instance_proc_addr);

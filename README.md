@@ -4,12 +4,12 @@
 in WSL Ubuntu with the M33 / Resonance / DolphinPS4 / Crema PS4 toolchain (clang 21 + libc++ 21 on
 OpenOrbis).
 
-Status: **v00.11**. On the console the launcher works (text, firmware download, installing a VPK),
+Status: **v00.12**. On the console the launcher works (text, firmware download, installing a VPK),
 PKGj runs (renderer on RADV, audio, dynarmic, the network), and Mortal Kombat (PCSE00023) runs
-its menus at 20-30 fps. Starting a fight the GPU hangs (v00.09: the app was killed; v00.10, with
-the shader fixes below: the whole PS4 froze), both times in the draws right after RADV set up the
-HTILE of a new depth-stencil buffer; v00.11 runs RADV without HTILE (`RADV_DEBUG=nohiz`).
-Remember to install each new package from `/data/pkg`.
+its menus at 20-30 fps. Starting a fight the GPU hung, three times: v00.11's trace (RADV's
+per-draw markers) put it at the first draw of the fight whose vertex shader needs scratch, after
+four that finished; HTILE turned out not to matter. v00.12 turns Vita3K's memory mapping off (see
+"Graphics" below). Remember to install each new package from `/data/pkg`.
 
 ## Using it
 
@@ -79,7 +79,11 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
 - **Graphics**: Vita3K's Vulkan renderer on DolphinPS4's RADV port, linked in. `ps4_wsi.cpp` (M33's
   WSI) adds `VK_EXT_headless_surface` and `VK_KHR_swapchain` on VideoOut (linear 1920x1080 images,
   GPU-side flips); the renderer gets its entry points from `ps4_vk_get_instance_proc_addr()` and
-  its surface from the PS4 frame host (`renderer::FrameHost`).
+  its surface from the PS4 frame host (`renderer::FrameHost`). Memory mapping is off on the PS4:
+  with it, shaders read guest memory through buffer device addresses, which ACO compiles to FLAT
+  instructions on GFX7, and the PS4 kernel sets the FLAT apertures up for GNM (a PS4 PCSX2 port's
+  first FLAT store hung the GPU; Mortal Kombat's fights hung it at a skinned model). Guest memory
+  then goes through descriptors, as on GPUs without buffer device addresses.
 - **CPU**: dynarmic's x86-64 JIT (`patches/dynarmic-ps4.patch`). Only flexible memory can run code
   on the PS4 and there is a JIT per guest thread, so each 128 MiB code cache is a virtual range
   reservation committed in 256 KiB steps as code is emitted (system flexible memory, else regular),
@@ -93,9 +97,9 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
   trace). PS4 shader cache version 1401, so older translations are made again. A GPU hang is
   logged by the RADV winsys in `/data/DolphinPS4/radv-ps4.log` and `gpu-hang.txt` (its paths are
   DolphinPS4's); an empty `/data/Vita3K/radv-trace` file turns on its flight recorder
-  (`/data/DolphinPS4/flight`) and RADV's per-draw trace ids (slower) to find the draw. RADV runs
-  with `RADV_DEBUG=nohiz` (no depth compression): Mortal Kombat's fights hung the GPU right after
-  HTILE fast clears of a depth-stencil buffer.
+  (`/data/DolphinPS4/flight`) and RADV's per-draw trace ids (`RADV_DEBUG=hang`, slower; it also
+  ends the app on a hang instead of the PS4 freezing) to find the draw: `gpu-hang.txt`'s last
+  trace write that was done is just before it.
 - **Guest memory** (`mem/src/mem.cpp`): the Vita's 4 GiB address space is a virtual range
   reservation; the host pages the allocator commits are backed by direct memory mapped in place
   (16 KiB pages), and given back to a free list when freed. Write tracking uses `mprotect` and the
