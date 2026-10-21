@@ -12,11 +12,11 @@ MSG="${1:-PS4 port work}"
 
 DYN="$SRC/external/dynarmic"
 DYN_BASE="$(git -C "$SRC" ls-tree "$BASE" external/dynarmic | awk '{print $3}')"
-git -C "$DYN" diff "$DYN_BASE" > "$HERE/../patches/dynarmic-ps4.patch"
+git -C "$DYN" diff --binary "$DYN_BASE" > "$HERE/../patches/dynarmic-ps4.patch"
 
 # the submodule stays at upstream's commit in the parent (its changes travel as their own patch)
 git -C "$SRC" add -A -- . ':!external/dynarmic'
 git -C "$SRC" diff --cached --quiet || git -C "$SRC" commit -q -m "$MSG"
-git -C "$SRC" diff "$BASE" HEAD -- . ':!external/dynarmic' > "$HERE/../patches/vita3k-ps4.patch"
+git -C "$SRC" diff --binary "$BASE" HEAD -- . ':!external/dynarmic' > "$HERE/../patches/vita3k-ps4.patch"
 echo "patches/vita3k-ps4.patch: $(grep -c '^diff --git' "$HERE/../patches/vita3k-ps4.patch") files"
 echo "patches/dynarmic-ps4.patch: $(grep -c '^diff --git' "$HERE/../patches/dynarmic-ps4.patch") files"

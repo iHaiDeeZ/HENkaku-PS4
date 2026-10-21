@@ -26,6 +26,8 @@ echo "$VERSION" > "$STAGE/version.txt"
 cp -r "$SRC/data" "$STAGE/data"
 cp -r "$SRC/vita3k/shaders-builtin" "$STAGE/shaders-builtin"
 cp -r "$SRC/vita3k/icons" "$STAGE/icons"
+# the HENkaku menu's icon (an ensō drawn by scripts/make-henkaku-icon.py)
+cp "$HERE/../assets/henkaku.png" "$STAGE/icons/henkaku.png"
 cp "$SRC/COPYING.txt" "$STAGE/COPYING.txt"
 # The launcher's and the overlay's font until the PS Vita's font package is installed (Roboto, OFL;
 # the app can't read the PS4's own fonts in /preinst)

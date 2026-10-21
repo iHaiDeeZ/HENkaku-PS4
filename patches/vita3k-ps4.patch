@@ -674,22 +674,23 @@ index 6e673d1c..f84a9a8a 100644
  
  static void reset_swapchain_cycle(DisplayState &display, Address sync_object) {
 diff --git a/vita3k/kernel/src/kernel.cpp b/vita3k/kernel/src/kernel.cpp
-index 97794b3d..0eb5e729 100644
+index 97794b3d..2ee78719 100644
 --- a/vita3k/kernel/src/kernel.cpp
 +++ b/vita3k/kernel/src/kernel.cpp
-@@ -33,6 +33,11 @@
+@@ -33,6 +33,12 @@
  #include <SDL3/SDL_mutex.h>
  #include <SDL3/SDL_thread.h>
  
 +#ifdef __PS4__
 +extern "C" void ps4_watch_thread(const char *name); // port/ps4_sampler.cpp
 +extern "C" void ps4_perf_guest_thread(const char *name); // vita3k/ps4/ps4_perf.cpp
++extern "C" void ps4_place_guest_thread(); // vita3k/ps4/ps4_main.cpp: which cores
 +#endif
 +
  int CorenumAllocator::new_corenum() {
      const std::lock_guard<std::mutex> guard(lock);
  
-@@ -63,6 +68,11 @@ static int SDLCALL thread_function(void *data) {
+@@ -63,6 +69,12 @@ static int SDLCALL thread_function(void *data) {
      ThreadParams params = *static_cast<const ThreadParams *>(data);
      SDL_SignalSemaphore(params.host_may_destroy_params);
      ThreadStatePtr thread = std::move(params.thread);
@@ -697,6 +698,7 @@ index 97794b3d..0eb5e729 100644
 +    // the guest's name for it in the port's thread list (the perf lines, stack dumps)
 +    ps4_watch_thread(thread->name.empty() ? "guest thread" : thread->name.c_str());
 +    ps4_perf_guest_thread(thread->name.empty() ? "guest thread" : thread->name.c_str());
++    ps4_place_guest_thread();
 +#endif
  #ifdef TRACY_ENABLE
      if (!thread->name.empty()) {
@@ -1209,83 +1211,168 @@ index 4c864368..a1c051e8 100644
      const ThreadStatePtr main_thread = emuenv.kernel.get_thread(thread_id);
      const ThreadStatePtr display_queue_thread = emuenv.kernel.create_thread(emuenv.mem, "SceGxmDisplayQueue", Ptr<void>(0), SCE_KERNEL_HIGHEST_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_DEFAULT, 0, nullptr);
 diff --git a/vita3k/overlay/include/overlay/pause_overlay.h b/vita3k/overlay/include/overlay/pause_overlay.h
-index 6c5147b7..b26597c4 100644
+index 6c5147b7..e91a910c 100644
 --- a/vita3k/overlay/include/overlay/pause_overlay.h
 +++ b/vita3k/overlay/include/overlay/pause_overlay.h
-@@ -23,6 +23,8 @@
+@@ -23,21 +23,50 @@
  #include <overlay/overlay.h>
  #include <overlay/user_interface.h>
  
 +#include <functional>
++#include <memory>
++#include <mutex>
 +#include <string>
  #include <vector>
  
  namespace overlay {
-@@ -30,14 +32,32 @@ namespace overlay {
- enum pause_overlay_button_value : int {
-     PAUSE_BUTTON_RESUME,
-     PAUSE_BUTTON_EXIT,
-+    PAUSE_BUTTON_SETTING,
- };
  
- struct pause_overlay_button {
-     rounded_rect bg;
-     label text;
-     pause_overlay_button_value value;
-+    // a setting row: its value on the right, the setting's index, the value shown
-+    label value_text;
-+    int setting = -1;
-+    int shown = -1;
- };
- 
-+// A setting a frontend puts in the pause menu (the PS4's quick menu), between Resume and Exit:
-+// "name    < value >", changed with left / right or the confirm button. get() says which of the
-+// values is in use, set() applies another; both run while the menu is open.
-+struct pause_menu_setting {
+-enum pause_overlay_button_value : int {
+-    PAUSE_BUTTON_RESUME,
+-    PAUSE_BUTTON_EXIT,
++// A line a frontend adds to the pause menu (the PS4's HENkaku menu): a section heading, a choice
++// ("name    < value >": left / right or the confirm button change it), a page (opens its own
++// lines; the cancel button comes back) or an action.
++struct pause_menu_item {
++    enum class kind : uint8_t {
++        section,
++        choice,
++        page,
++        action,
++    };
++    kind type = kind::choice;
 +    std::string name;
++    // dimmed next to the name: when a choice takes effect, what a page holds
++    std::string note;
++    // a choice: its values, which one is in use, and how another is applied (both run while the
++    // menu is open)
 +    std::vector<std::string> values;
 +    std::function<int()> get;
 +    std::function<void(int)> set;
-+};
-+
-+// The settings the pause menus opened from now on show
-+void set_pause_menu_settings(std::vector<pause_menu_setting> settings);
++    // a page's lines
++    std::vector<pause_menu_item> items;
++    // an action
++    std::function<void()> run;
+ };
+ 
+-struct pause_overlay_button {
+-    rounded_rect bg;
+-    label text;
+-    pause_overlay_button_value value;
++// A frontend's pause menu: its name and icon (a PNG) at the top, its lines between Resume and
++// Exit. Without one, the menu is Resume and Exit.
++struct pause_menu {
++    std::string title;
++    std::string icon_path;
++    std::vector<pause_menu_item> items;
+ };
+ 
++// The menu the pause overlays opened from now on show
++void set_pause_menu(pause_menu menu);
 +
  struct pause_overlay : public user_interface {
      explicit pause_overlay(app::AppSessionController &session_controller);
  
-@@ -52,11 +72,15 @@ private:
+@@ -47,36 +76,85 @@ struct pause_overlay : public user_interface {
+     void on_touch_pressed(float vx, float vy) override;
+ 
+ private:
++    enum class row_kind : uint8_t {
++        resume,
++        exit,
++        section,
++        choice,
++        page,
++        action,
++    };
++    struct row {
++        row_kind type = row_kind::resume;
++        const pause_menu_item *item = nullptr;
++        rounded_rect bg;
++        label text;
++        label value_text;
++        int shown = -1;
++        bool visible = false;
++    };
++    // an open page (nullptr: the first one) and its selection
++    struct page_state {
++        const pause_menu_item *page = nullptr;
++        int selected = 0;
++        int top = 0;
++    };
++
+     app::AppSessionController &m_session_controller;
++    pause_menu m_menu;
++    std::unique_ptr<image_info> m_icon;
++    image_view m_icon_view;
+     rounded_rect m_bg_dimmer;
      rounded_rect m_card;
++    rounded_rect m_separator;
      label m_title;
-     std::vector<pause_overlay_button> m_buttons;
+-    std::vector<pause_overlay_button> m_buttons;
 -    std::atomic<pause_overlay_button_value> m_selected_button = PAUSE_BUTTON_RESUME;
-+    std::vector<pause_menu_setting> m_settings;
-+    // index into m_buttons
-+    std::atomic<int> m_selected_button = 0;
++    label m_subtitle;
++    label m_hint;
++    std::vector<row> m_rows;
++    std::vector<page_state> m_pages;
++    // the rows change on the input thread (a page opens) while the render thread draws them
++    std::recursive_mutex m_mutex;
      std::atomic<int> m_sys_button = 0;
      float m_focus_pulse_time = 0.f;
  
++    void build_rows();
      void layout();
-+    void add_button(pause_overlay_button_value value, const std::string &text, int setting = -1);
-+    void change_setting(int step);
++    void move(int step);
++    void change(int step);
++    void confirm();
++    void back();
++    bool selectable(int index) const;
      bool is_confirm_button(pad_button button) const;
      bool is_cancel_button(pad_button button) const;
-     void draw_focus_ring(compiled_resource &res) const;
-@@ -71,6 +95,14 @@ private:
-     static constexpr uint16_t k_button_radius = 10;
-     static constexpr uint16_t k_font_size = 16;
-     static constexpr int16_t k_text_voffset = -3;
-+    // with settings: a wider card of shorter rows
-+    static constexpr uint16_t k_settings_card_w = 540;
-+    static constexpr uint16_t k_settings_button_w = 500;
-+    static constexpr uint16_t k_settings_button_h = 32;
-+    static constexpr uint16_t k_settings_button_gap = 6;
-+    static constexpr uint16_t k_settings_padding = 20;
-+    static constexpr uint16_t k_settings_font_size = 15;
-+    static constexpr uint16_t k_settings_text_inset = 16;
+-    void draw_focus_ring(compiled_resource &res) const;
++    void draw_focus_ring(compiled_resource &res, const row &selected) const;
  
-     static constexpr color4f k_color_bg_dim{ 0.f, 0.f, 0.f, 0.47f };
-     static constexpr color4f k_color_card_bg{ 0.145f, 0.157f, 0.176f, 0.95f };
+-    static constexpr uint16_t k_card_w = 360;
+-    static constexpr uint16_t k_card_h = 182;
+-    static constexpr uint16_t k_card_radius = 8;
+-    static constexpr uint16_t k_title_font_size = 20;
+-    static constexpr uint16_t k_button_w = 280;
+-    static constexpr uint16_t k_button_h = 46;
+-    static constexpr uint16_t k_button_gap = 12;
+-    static constexpr uint16_t k_button_radius = 10;
+-    static constexpr uint16_t k_font_size = 16;
++    static constexpr uint16_t k_card_w = 580;
++    static constexpr uint16_t k_card_radius = 10;
++    static constexpr uint16_t k_margin = 24;
++    static constexpr uint16_t k_header_h = 62;
++    static constexpr uint16_t k_footer_h = 34;
++    static constexpr uint16_t k_icon_size = 38;
++    static constexpr uint16_t k_title_font_size = 21;
++    static constexpr uint16_t k_row_w = 540;
++    static constexpr uint16_t k_row_h = 30;
++    static constexpr uint16_t k_section_h = 26;
++    static constexpr uint16_t k_row_gap = 3;
++    static constexpr uint16_t k_row_radius = 7;
++    static constexpr uint16_t k_font_size = 15;
++    static constexpr uint16_t k_section_font_size = 13;
++    static constexpr uint16_t k_hint_font_size = 12;
++    static constexpr uint16_t k_text_inset = 14;
++    static constexpr uint16_t k_rows_max_h = 360;
+     static constexpr int16_t k_text_voffset = -3;
+ 
+-    static constexpr color4f k_color_bg_dim{ 0.f, 0.f, 0.f, 0.47f };
+-    static constexpr color4f k_color_card_bg{ 0.145f, 0.157f, 0.176f, 0.95f };
+-    static constexpr color4f k_color_btn_normal{ 1.f, 1.f, 1.f, 0.078f };
++    static constexpr color4f k_color_bg_dim{ 0.f, 0.f, 0.f, 0.55f };
++    static constexpr color4f k_color_card_bg{ 0.075f, 0.09f, 0.13f, 0.96f };
++    static constexpr color4f k_color_separator{ 1.f, 1.f, 1.f, 0.12f };
++    static constexpr color4f k_color_btn_normal{ 1.f, 1.f, 1.f, 0.05f };
+     static constexpr color4f k_color_btn_selected{ 1.f, 1.f, 1.f, 0.14f };
+     static constexpr color4f k_color_text{ 1.f, 1.f, 1.f, 1.f };
++    static constexpr color4f k_color_muted{ 0.62f, 0.67f, 0.76f, 1.f };
++    static constexpr color4f k_color_section{ 0.42f, 0.78f, 1.f, 1.f };
+     static constexpr color4f k_color_focus_ring{ 0.180f, 0.765f, 0.878f, 1.f };
+     static constexpr uint8_t k_focus_ring_thickness = 2;
+ };
 diff --git a/vita3k/overlay/src/font.cpp b/vita3k/overlay/src/font.cpp
 index 117569cf2..4c8552a5 100644
 --- a/vita3k/overlay/src/font.cpp
@@ -1325,10 +1412,16 @@ index 117569cf2..4c8552a5 100644
          result.font_names.emplace_back("NotoSansKR-Regular.otf");
          result.font_names.emplace_back("NotoSansCJK-Regular.ttc");
 diff --git a/vita3k/overlay/src/pause_overlay.cpp b/vita3k/overlay/src/pause_overlay.cpp
-index 3e2404bb..ea2bb9a4 100644
+index 3e2404bb..1cafc9d8 100644
 --- a/vita3k/overlay/src/pause_overlay.cpp
 +++ b/vita3k/overlay/src/pause_overlay.cpp
-@@ -24,16 +24,29 @@
+@@ -19,21 +19,36 @@
+ 
+ #include <lang/state.h>
+ #include <overlay/types.h>
++#include <util/fs.h>
+ #include <util/log.h>
+ #include <util/system.h>
  
  #include <algorithm>
  #include <cmath>
@@ -1338,30 +1431,42 @@ index 3e2404bb..ea2bb9a4 100644
  
  namespace {
  constexpr const char *k_pause_overlay_font = "ltn.pvf";
++constexpr color4f k_transparent{ 0.f, 0.f, 0.f, 0.f };
 +
-+std::mutex s_settings_mutex;
-+std::vector<pause_menu_setting> s_settings;
++std::mutex s_menu_mutex;
++pause_menu s_menu;
 +} // namespace
 +
-+void set_pause_menu_settings(std::vector<pause_menu_setting> settings) {
-+    const std::lock_guard<std::mutex> lock(s_settings_mutex);
-+    s_settings = std::move(settings);
++void set_pause_menu(pause_menu menu) {
++    const std::lock_guard<std::mutex> lock(s_menu_mutex);
++    s_menu = std::move(menu);
  }
  
  pause_overlay::pause_overlay(app::AppSessionController &session_controller)
      : m_session_controller(session_controller) {
      visible = true;
 +    {
-+        const std::lock_guard<std::mutex> lock(s_settings_mutex);
-+        m_settings = s_settings;
++        const std::lock_guard<std::mutex> lock(s_menu_mutex);
++        m_menu = s_menu;
 +    }
  
      m_bg_dimmer.set_pos(0, 0);
      m_bg_dimmer.set_size(virtual_width, virtual_height);
-@@ -50,64 +63,83 @@ pause_overlay::pause_overlay(app::AppSessionController &session_controller)
-     m_title.fore_color = k_color_text;
-     m_title.back_color = { 0.f, 0.f, 0.f, 0.f };
+@@ -42,73 +57,179 @@ pause_overlay::pause_overlay(app::AppSessionController &session_controller)
  
+     m_card.back_color = k_color_card_bg;
+     m_card.border_radius = k_card_radius;
++    m_separator.back_color = k_color_separator;
++    m_separator.border_radius = 0;
+ 
+-    const auto &active_app_title = m_session_controller.get_active_app_title();
+-    m_title.set_text(active_app_title.empty() ? "" : active_app_title);
+     m_title.set_font(k_pause_overlay_font, k_title_font_size, true);
+-    m_title.align_text(overlay_element::center);
++    m_title.align_text(overlay_element::left);
+     m_title.fore_color = k_color_text;
+-    m_title.back_color = { 0.f, 0.f, 0.f, 0.f };
+-
 -    pause_overlay_button resume_button;
 -    resume_button.bg.back_color = k_color_btn_normal;
 -    resume_button.bg.border_radius = k_button_radius;
@@ -1385,234 +1490,453 @@ index 3e2404bb..ea2bb9a4 100644
 -    exit_button.text.back_color = { 0.f, 0.f, 0.f, 0.f };
 -    exit_button.value = PAUSE_BUTTON_EXIT;
 -    m_buttons.push_back(std::move(exit_button));
-+    add_button(PAUSE_BUTTON_RESUME, lang::get(lang::str::resume));
-+    for (size_t i = 0; i < m_settings.size(); i++)
-+        add_button(PAUSE_BUTTON_SETTING, m_settings[i].name, static_cast<int>(i));
-+    add_button(PAUSE_BUTTON_EXIT, lang::get(lang::str::exit));
++    m_title.back_color = k_transparent;
++
++    // the game, at the right of the heading
++    m_subtitle.set_text(m_session_controller.get_active_app_title());
++    m_subtitle.set_font(k_pause_overlay_font, k_section_font_size, false);
++    m_subtitle.align_text(overlay_element::right);
++    m_subtitle.fore_color = k_color_muted;
++    m_subtitle.back_color = k_transparent;
++
++    m_hint.set_font(k_pause_overlay_font, k_hint_font_size, false);
++    m_hint.align_text(overlay_element::center);
++    m_hint.fore_color = k_color_muted;
++    m_hint.back_color = k_transparent;
++
++    if (!m_menu.icon_path.empty() && fs::exists(fs_utils::utf8_to_path(m_menu.icon_path))) {
++        m_icon = std::make_unique<image_info>(m_menu.icon_path);
++        if (m_icon->get_data())
++            m_icon_view.set_raw_image(m_icon.get());
++        else
++            m_icon.reset();
++    }
  
++    m_pages.push_back({});
++    build_rows();
      layout();
  }
  
-+void pause_overlay::add_button(pause_overlay_button_value value, const std::string &text, int setting) {
-+    const uint16_t font_size = m_settings.empty() ? k_font_size : k_settings_font_size;
-+    pause_overlay_button button;
-+    button.bg.back_color = k_color_btn_normal;
-+    button.bg.border_radius = k_button_radius;
-+    button.bg.border_color = { 0.f, 0.f, 0.f, 0.f };
-+    button.text.set_text(text);
-+    button.text.set_font(k_pause_overlay_font, font_size, true);
-+    // a setting's name on the left and its value on the right; Resume and Exit centred
-+    button.text.align_text(setting >= 0 ? overlay_element::left : overlay_element::center);
-+    button.text.fore_color = k_color_text;
-+    button.text.back_color = { 0.f, 0.f, 0.f, 0.f };
-+    button.value = value;
-+    button.setting = setting;
-+    if (setting >= 0) {
-+        button.value_text.set_font(k_pause_overlay_font, font_size, true);
-+        button.value_text.align_text(overlay_element::right);
-+        button.value_text.fore_color = k_color_focus_ring;
-+        button.value_text.back_color = { 0.f, 0.f, 0.f, 0.f };
-+    }
-+    m_buttons.push_back(std::move(button));
-+}
-+
- void pause_overlay::layout() {
+-void pause_overlay::layout() {
 -    const int16_t card_x = static_cast<int16_t>((virtual_width - k_card_w) / 2);
 -    const int16_t card_y = static_cast<int16_t>((virtual_height - k_card_h) / 2);
-+    const bool with_settings = !m_settings.empty();
-+    const uint16_t button_w = with_settings ? k_settings_button_w : k_button_w;
-+    const uint16_t button_h = with_settings ? k_settings_button_h : k_button_h;
-+    const uint16_t button_gap = with_settings ? k_settings_button_gap : k_button_gap;
-+    const uint16_t font_size = with_settings ? k_settings_font_size : k_font_size;
-+    const uint16_t total_buttons_h = static_cast<uint16_t>(m_buttons.size() * button_h
-+        + (m_buttons.size() > 1 ? (m_buttons.size() - 1) * button_gap : 0));
-+    const uint16_t card_w = with_settings ? k_settings_card_w : k_card_w;
-+    const uint16_t card_h = with_settings ? static_cast<uint16_t>(total_buttons_h + 2 * k_settings_padding) : k_card_h;
-+
-+    const int16_t card_x = static_cast<int16_t>((virtual_width - card_w) / 2);
-+    const int16_t card_y = static_cast<int16_t>((virtual_height - card_h) / 2);
- 
-     m_card.set_pos(card_x, card_y);
+-
+-    m_card.set_pos(card_x, card_y);
 -    m_card.set_size(k_card_w, k_card_h);
-+    m_card.set_size(card_w, card_h);
- 
-     // Place the title right above the card
-     m_title.set_pos(static_cast<int16_t>(0),
-         static_cast<int16_t>(card_y - k_title_font_size - 15));
-     m_title.set_size(virtual_width, k_title_font_size + 4);
- 
+-
+-    // Place the title right above the card
+-    m_title.set_pos(static_cast<int16_t>(0),
+-        static_cast<int16_t>(card_y - k_title_font_size - 15));
+-    m_title.set_size(virtual_width, k_title_font_size + 4);
+-
 -    const int16_t button_x = static_cast<int16_t>(card_x + (k_card_w - k_button_w) / 2);
 -    const uint16_t total_buttons_h = static_cast<uint16_t>(m_buttons.size() * k_button_h
 -        + (m_buttons.size() > 1 ? (m_buttons.size() - 1) * k_button_gap : 0));
 -    int16_t button_y = static_cast<int16_t>(card_y + (k_card_h - total_buttons_h) / 2);
-+    const int16_t button_x = static_cast<int16_t>(card_x + (card_w - button_w) / 2);
-+    int16_t button_y = static_cast<int16_t>(card_y + (card_h - total_buttons_h) / 2);
++// The open page's lines: the first page has Resume and Exit around the frontend's
++void pause_overlay::build_rows() {
++    m_rows.clear();
++    const auto add = [&](row_kind type, const pause_menu_item *item, const std::string &text) {
++        row r;
++        r.type = type;
++        r.item = item;
++        const bool section = type == row_kind::section;
++        r.bg.back_color = k_color_btn_normal;
++        r.bg.border_radius = k_row_radius;
++        r.bg.border_color = k_transparent;
++        r.text.set_text(text);
++        r.text.set_font(k_pause_overlay_font, section ? k_section_font_size : k_font_size, true);
++        r.text.align_text(overlay_element::left);
++        r.text.fore_color = section ? k_color_section : k_color_text;
++        r.text.back_color = k_transparent;
++        if (type == row_kind::choice || type == row_kind::page) {
++            r.value_text.set_font(k_pause_overlay_font, k_font_size, type == row_kind::choice);
++            r.value_text.align_text(overlay_element::right);
++            r.value_text.fore_color = type == row_kind::choice ? k_color_focus_ring : k_color_muted;
++            r.value_text.back_color = k_transparent;
++            if (type == row_kind::page)
++                r.value_text.set_text(item->note.empty() ? std::string(">") : item->note + "   >");
++        }
++        m_rows.push_back(std::move(r));
++    };
++    const auto add_item = [&](const pause_menu_item &item) {
++        switch (item.type) {
++        case pause_menu_item::kind::section:
++            add(row_kind::section, &item, item.name);
++            break;
++        case pause_menu_item::kind::choice:
++            add(row_kind::choice, &item, item.note.empty() ? item.name : item.name + "  (" + item.note + ")");
++            break;
++        case pause_menu_item::kind::page:
++            add(row_kind::page, &item, item.name);
++            break;
++        case pause_menu_item::kind::action:
++            add(row_kind::action, &item, item.name);
++            break;
++        }
++    };
++
++    const page_state &page = m_pages.back();
++    if (!page.page) {
++        add(row_kind::resume, nullptr, lang::get(lang::str::resume));
++        for (const pause_menu_item &item : m_menu.items)
++            add_item(item);
++        add(row_kind::exit, nullptr, lang::get(lang::str::exit));
++    } else {
++        for (const pause_menu_item &item : page.page->items)
++            add_item(item);
++    }
  
-     for (auto &button : m_buttons) {
-         button.bg.set_pos(button_x, button_y);
+-    for (auto &button : m_buttons) {
+-        button.bg.set_pos(button_x, button_y);
 -        button.bg.set_size(k_button_w, k_button_h);
--
++    // the heading: the menu's name, then the pages open ("HENkaku > Settings > Display")
++    std::string title = m_menu.title.empty() ? std::string("Vita3K") : m_menu.title;
++    for (const page_state &open : m_pages) {
++        if (open.page)
++            title += "  >  " + open.page->name;
++    }
++    m_title.set_text(title);
++    m_hint.set_text(m_pages.size() > 1 ? "Cross: select     Left / Right: change     Circle: back"
++                                       : "Cross: select     Left / Right: change     Circle: back to the game");
++
++    // on a line that can be picked
++    page_state &current = m_pages.back();
++    current.selected = std::clamp(current.selected, 0, std::max(0, static_cast<int>(m_rows.size()) - 1));
++    if (!selectable(current.selected))
++        move(1);
++}
+ 
 -        button.text.set_pos(button_x,
 -            static_cast<int16_t>(button_y + (k_button_h - k_font_size) / 2 + k_text_voffset));
 -        button.text.set_size(k_button_w, k_font_size);
-+        button.bg.set_size(button_w, button_h);
-+
-+        const int16_t text_y = static_cast<int16_t>(button_y + (button_h - font_size) / 2 + k_text_voffset);
-+        if (button.setting >= 0) {
-+            const uint16_t half = button_w / 2;
-+            button.text.set_pos(static_cast<int16_t>(button_x + k_settings_text_inset), text_y);
-+            button.text.set_size(static_cast<uint16_t>(half - k_settings_text_inset), font_size);
-+            button.value_text.set_pos(static_cast<int16_t>(button_x + half), text_y);
-+            button.value_text.set_size(static_cast<uint16_t>(half - k_settings_text_inset), font_size);
-+        } else {
-+            button.text.set_pos(button_x, text_y);
-+            button.text.set_size(button_w, font_size);
-+        }
++bool pause_overlay::selectable(int index) const {
++    return index >= 0 && index < static_cast<int>(m_rows.size()) && m_rows[index].type != row_kind::section;
++}
  
 -        button_y = static_cast<int16_t>(button_y + k_button_h + k_button_gap);
-+        button_y = static_cast<int16_t>(button_y + button_h + button_gap);
++void pause_overlay::layout() {
++    const std::lock_guard<std::recursive_mutex> lock(m_mutex);
++    page_state &page = m_pages.back();
++    const int count = static_cast<int>(m_rows.size());
++    const auto height_of = [&](int i) { return static_cast<int>(m_rows[i].type == row_kind::section ? k_section_h : k_row_h); };
++    // the height of rows [first, last]
++    const auto span = [&](int first, int last) {
++        int h = 0;
++        for (int i = first; i <= last; i++)
++            h += height_of(i) + (i > first ? k_row_gap : 0);
++        return h;
++    };
++
++    // the selection in view, with the heading of its section when that's right above it
++    if (page.selected < page.top)
++        page.top = page.selected;
++    if (page.top > 0 && page.top == page.selected && m_rows[page.top - 1].type == row_kind::section)
++        page.top--;
++    while (page.top < page.selected && span(page.top, page.selected) > k_rows_max_h)
++        page.top++;
++    int last = page.top - 1;
++    while (last + 1 < count && span(page.top, last + 1) <= k_rows_max_h)
++        last++;
++    const int rows_h = last >= page.top ? span(page.top, last) : 0;
++
++    const uint16_t card_h = static_cast<uint16_t>(k_header_h + 10 + rows_h + 10 + k_footer_h);
++    const int16_t card_x = static_cast<int16_t>((virtual_width - k_card_w) / 2);
++    const int16_t card_y = static_cast<int16_t>((virtual_height - card_h) / 2);
++    m_card.set_pos(card_x, card_y);
++    m_card.set_size(k_card_w, card_h);
++
++    const int16_t icon_x = static_cast<int16_t>(card_x + 18);
++    const int16_t icon_y = static_cast<int16_t>(card_y + (k_header_h - k_icon_size) / 2);
++    m_icon_view.set_pos(icon_x, icon_y);
++    m_icon_view.set_size(k_icon_size, k_icon_size);
++    const int16_t title_x = static_cast<int16_t>(m_icon ? icon_x + k_icon_size + 12 : card_x + 20);
++    m_title.set_pos(title_x, static_cast<int16_t>(card_y + (k_header_h - k_title_font_size) / 2 + k_text_voffset));
++    m_title.set_size(static_cast<uint16_t>(card_x + k_card_w - 20 - title_x), k_title_font_size + 4);
++    m_subtitle.set_pos(static_cast<int16_t>(card_x + k_card_w / 2), static_cast<int16_t>(card_y + (k_header_h - k_section_font_size) / 2 + k_text_voffset));
++    m_subtitle.set_size(static_cast<uint16_t>(k_card_w / 2 - 20), k_section_font_size + 4);
++    m_separator.set_pos(static_cast<int16_t>(card_x + 16), static_cast<int16_t>(card_y + k_header_h - 1));
++    m_separator.set_size(static_cast<uint16_t>(k_card_w - 32), 1);
++
++    const int16_t row_x = static_cast<int16_t>(card_x + (k_card_w - k_row_w) / 2);
++    int16_t y = static_cast<int16_t>(card_y + k_header_h + 10);
++    for (int i = 0; i < count; i++) {
++        row &r = m_rows[i];
++        r.visible = i >= page.top && i <= last;
++        if (!r.visible)
++            continue;
++        const uint16_t h = static_cast<uint16_t>(height_of(i));
++        const uint16_t font = r.type == row_kind::section ? k_section_font_size : k_font_size;
++        r.bg.set_pos(row_x, y);
++        r.bg.set_size(k_row_w, h);
++        const int16_t text_y = static_cast<int16_t>(y + (h - font) / 2 + k_text_voffset);
++        const uint16_t inset = r.type == row_kind::section ? 4 : k_text_inset;
++        r.text.set_pos(static_cast<int16_t>(row_x + inset), text_y);
++        r.text.set_size(static_cast<uint16_t>(k_row_w * 3 / 5 - inset), font + 4);
++        r.value_text.set_pos(static_cast<int16_t>(row_x + k_row_w * 2 / 5), text_y);
++        r.value_text.set_size(static_cast<uint16_t>(k_row_w * 3 / 5 - k_text_inset), font + 4);
++        y = static_cast<int16_t>(y + h + k_row_gap);
      }
  
-     if (!m_buttons.empty()) {
+-    if (!m_buttons.empty()) {
 -        m_selected_button = (pause_overlay_button_value)std::clamp(static_cast<int>(m_selected_button), 0,
 -            static_cast<int>(m_buttons.size()) - 1);
-+        m_selected_button = std::clamp(m_selected_button.load(), 0, static_cast<int>(m_buttons.size()) - 1);
-     }
+-    }
++    m_hint.set_pos(card_x, static_cast<int16_t>(card_y + card_h - k_footer_h + (k_footer_h - k_hint_font_size) / 2 + k_text_voffset));
++    m_hint.set_size(k_card_w, k_hint_font_size + 4);
  }
  
-@@ -124,6 +156,22 @@ bool pause_overlay::poll_dialog(DialogState &dialog, int date_format, int sys_bu
+ bool pause_overlay::poll_dialog(DialogState &dialog, int date_format, int sys_button) {
+@@ -124,61 +245,128 @@ bool pause_overlay::poll_dialog(DialogState &dialog, int date_format, int sys_bu
      return true;
  }
  
-+// The selected setting's next (step 1) or previous (step -1) value, wrapping around
-+void pause_overlay::change_setting(int step) {
-+    const int selected = m_selected_button;
-+    if (selected < 0 || selected >= static_cast<int>(m_buttons.size()))
++// To the next line that can be picked, up (step -1) or down
++void pause_overlay::move(int step) {
++    page_state &page = m_pages.back();
++    for (int i = page.selected + step; i >= 0 && i < static_cast<int>(m_rows.size()); i += step) {
++        if (selectable(i)) {
++            page.selected = i;
++            return;
++        }
++    }
++    // nothing further that way: the first line that can be picked, if the current one can't
++    if (!selectable(page.selected)) {
++        for (int i = 0; i < static_cast<int>(m_rows.size()); i++) {
++            if (selectable(i)) {
++                page.selected = i;
++                return;
++            }
++        }
++    }
++}
++
++// Left / right: the selected choice's previous / next value; right opens a page, left goes back
++void pause_overlay::change(int step) {
++    const page_state &page = m_pages.back();
++    if (!selectable(page.selected))
 +        return;
-+    const int index = m_buttons[selected].setting;
-+    if (index < 0)
++    const row &r = m_rows[page.selected];
++    if (r.type == row_kind::choice) {
++        const pause_menu_item &item = *r.item;
++        const int count = static_cast<int>(item.values.size());
++        if (count == 0 || !item.get || !item.set)
++            return;
++        const int current = std::clamp(item.get(), 0, count - 1);
++        item.set((current + step + count) % count);
++    } else if (r.type == row_kind::page && step > 0) {
++        confirm();
++    } else if (step < 0 && m_pages.size() > 1) {
++        back();
++    }
++}
++
++void pause_overlay::confirm() {
++    page_state &page = m_pages.back();
++    if (!selectable(page.selected))
 +        return;
-+    const pause_menu_setting &setting = m_settings[index];
-+    const int count = static_cast<int>(setting.values.size());
-+    if (count == 0 || !setting.get || !setting.set)
-+        return;
-+    const int current = std::clamp(setting.get(), 0, count - 1);
-+    setting.set((current + step + count) % count);
++    const row &r = m_rows[page.selected];
++    switch (r.type) {
++    case row_kind::resume:
++        m_session_controller.set_pause_reason(app::AppSessionPauseReason::All, false);
++        break;
++    case row_kind::exit:
++        m_session_controller.set_pause_reason(app::AppSessionPauseReason::All, false);
++        m_session_controller.request_stop();
++        break;
++    case row_kind::choice:
++        change(1);
++        break;
++    case row_kind::page:
++        m_pages.push_back({ r.item, 0, 0 });
++        build_rows();
++        layout();
++        break;
++    case row_kind::action:
++        if (r.item->run)
++            r.item->run();
++        break;
++    case row_kind::section:
++        break;
++    }
++}
++
++// The page before, or back to the game from the first one
++void pause_overlay::back() {
++    if (m_pages.size() > 1) {
++        m_pages.pop_back();
++        build_rows();
++        layout();
++    } else {
++        m_session_controller.set_pause_reason(app::AppSessionPauseReason::All, false);
++    }
 +}
 +
  void pause_overlay::on_button_pressed(pad_button button_press, bool is_auto_repeat) {
      static_cast<void>(is_auto_repeat);
+-
+-    if (m_buttons.empty())
++    const std::lock_guard<std::recursive_mutex> lock(m_mutex);
++    if (m_rows.empty())
+         return;
  
-@@ -133,18 +181,26 @@ void pause_overlay::on_button_pressed(pad_button button_press, bool is_auto_repe
      switch (button_press) {
      case pad_button::dpad_up:
      case pad_button::ls_up:
 -        m_selected_button = (pause_overlay_button_value)std::max(0, static_cast<int>(m_selected_button) - 1);
-+        m_selected_button = std::max(0, m_selected_button.load() - 1);
++        move(-1);
          break;
      case pad_button::dpad_down:
      case pad_button::ls_down:
 -        m_selected_button = (pause_overlay_button_value)std::min(static_cast<int>(m_buttons.size()) - 1, static_cast<int>(m_selected_button) + 1);
-+        m_selected_button = std::min(static_cast<int>(m_buttons.size()) - 1, m_selected_button.load() + 1);
-+        break;
-+    case pad_button::dpad_left:
-+    case pad_button::ls_left:
-+        change_setting(-1);
-+        break;
-+    case pad_button::dpad_right:
-+    case pad_button::ls_right:
-+        change_setting(1);
++        move(1);
          break;
-     case pad_button::circle:
-     case pad_button::cross:
-         [[fallthrough]]; // Its better to handle X and O below, since they can depend on settings
-     default: {
-         if (is_confirm_button(button_press)) {
+-    case pad_button::circle:
+-    case pad_button::cross:
+-        [[fallthrough]]; // Its better to handle X and O below, since they can depend on settings
+-    default: {
+-        if (is_confirm_button(button_press)) {
 -            switch (m_selected_button) {
-+            switch (m_buttons[m_selected_button].value) {
-             case PAUSE_BUTTON_RESUME:
-                 m_session_controller.set_pause_reason(app::AppSessionPauseReason::All, false);
-                 break;
-@@ -152,13 +208,15 @@ void pause_overlay::on_button_pressed(pad_button button_press, bool is_auto_repe
-                 m_session_controller.set_pause_reason(app::AppSessionPauseReason::All, false);
-                 m_session_controller.request_stop();
-                 break;
-+            case PAUSE_BUTTON_SETTING:
-+                change_setting(1);
-+                break;
-             default:
-                 break;
+-            case PAUSE_BUTTON_RESUME:
+-                m_session_controller.set_pause_reason(app::AppSessionPauseReason::All, false);
+-                break;
+-            case PAUSE_BUTTON_EXIT:
+-                m_session_controller.set_pause_reason(app::AppSessionPauseReason::All, false);
+-                m_session_controller.request_stop();
+-                break;
+-            default:
+-                break;
 -                return;
-             }
+-            }
 -        }
 -        if (is_cancel_button(button_press)) {
 -            // Handle cancel button here
-+        } else if (is_cancel_button(button_press)) {
-+            // back to the game, as Resume
-+            m_session_controller.set_pause_reason(app::AppSessionPauseReason::All, false);
-         }
+-        }
++    case pad_button::dpad_left:
++    case pad_button::ls_left:
++        change(-1);
++        break;
++    case pad_button::dpad_right:
++    case pad_button::ls_right:
++        change(1);
++        break;
++    default:
++        // X and O: which confirms depends on the system setting
++        if (is_confirm_button(button_press))
++            confirm();
++        else if (is_cancel_button(button_press))
++            back();
          break;
+-    }
      }
-@@ -177,7 +235,7 @@ void pause_overlay::on_touch_pressed(float vx, float vy) {
-         const auto &btn = m_buttons[i];
-         if (vx >= btn.bg.x && vx <= btn.bg.x + btn.bg.w
-             && vy >= btn.bg.y && vy <= btn.bg.y + btn.bg.h) {
+ }
+ 
+ void pause_overlay::on_touch_pressed(float vx, float vy) {
+-    if (m_buttons.empty())
+-        return;
+-
+-    const auto confirm_button = (m_sys_button == SCE_SYSTEM_PARAM_ENTER_BUTTON_CIRCLE)
+-        ? pad_button::circle
+-        : pad_button::cross;
+-
+-    for (size_t i = 0; i < m_buttons.size(); i++) {
+-        const auto &btn = m_buttons[i];
+-        if (vx >= btn.bg.x && vx <= btn.bg.x + btn.bg.w
+-            && vy >= btn.bg.y && vy <= btn.bg.y + btn.bg.h) {
 -            m_selected_button = btn.value;
-+            m_selected_button = static_cast<int>(i);
-             on_button_pressed(confirm_button, false);
+-            on_button_pressed(confirm_button, false);
++    const std::lock_guard<std::recursive_mutex> lock(m_mutex);
++    for (size_t i = 0; i < m_rows.size(); i++) {
++        const row &r = m_rows[i];
++        if (r.visible && selectable(static_cast<int>(i)) && vx >= r.bg.x && vx <= r.bg.x + r.bg.w
++            && vy >= r.bg.y && vy <= r.bg.y + r.bg.h) {
++            m_pages.back().selected = static_cast<int>(i);
++            confirm();
              return;
          }
-@@ -194,12 +252,25 @@ compiled_resource pause_overlay::get_compiled() {
-     result.add(m_card.get_compiled());
-     result.add(m_title.get_compiled());
+     }
+@@ -190,19 +378,43 @@ compiled_resource pause_overlay::get_compiled() {
+     if (!visible)
+         return result;
  
++    const std::lock_guard<std::recursive_mutex> lock(m_mutex);
+     result.add(m_bg_dimmer.get_compiled());
+     result.add(m_card.get_compiled());
++    if (m_icon)
++        result.add(m_icon_view.get_compiled());
+     result.add(m_title.get_compiled());
+-
 -    for (auto &button : m_buttons) {
 -        button.bg.back_color = (button.value == m_selected_button)
-+    const int selected = m_selected_button;
-+    for (size_t i = 0; i < m_buttons.size(); i++) {
-+        auto &button = m_buttons[i];
-+        button.bg.back_color = (static_cast<int>(i) == selected)
-             ? k_color_btn_selected
-             : k_color_btn_normal;
-         result.add(button.bg.get_compiled());
-         result.add(button.text.get_compiled());
+-            ? k_color_btn_selected
+-            : k_color_btn_normal;
+-        result.add(button.bg.get_compiled());
+-        result.add(button.text.get_compiled());
++    if (m_pages.size() == 1)
++        result.add(m_subtitle.get_compiled());
++    result.add(m_separator.get_compiled());
 +
-+        if (button.setting >= 0) {
-+            const pause_menu_setting &setting = m_settings[button.setting];
-+            const int count = static_cast<int>(setting.values.size());
-+            const int current = (count > 0 && setting.get) ? std::clamp(setting.get(), 0, count - 1) : -1;
-+            if (current != button.shown) {
-+                button.shown = current;
-+                button.value_text.set_text(current >= 0 ? "<  " + setting.values[current] + "  >" : std::string());
++    const int selected = m_pages.back().selected;
++    for (size_t i = 0; i < m_rows.size(); i++) {
++        row &r = m_rows[i];
++        if (!r.visible)
++            continue;
++        if (r.type != row_kind::section) {
++            r.bg.back_color = static_cast<int>(i) == selected ? k_color_btn_selected : k_color_btn_normal;
++            result.add(r.bg.get_compiled());
++        }
++        result.add(r.text.get_compiled());
++        if (r.type == row_kind::choice) {
++            const pause_menu_item &item = *r.item;
++            const int count = static_cast<int>(item.values.size());
++            const int current = (count > 0 && item.get) ? std::clamp(item.get(), 0, count - 1) : -1;
++            if (current != r.shown) {
++                r.shown = current;
++                r.value_text.set_text(current >= 0 ? "<  " + item.values[current] + "  >" : std::string());
 +            }
-+            result.add(button.value_text.get_compiled());
++            result.add(r.value_text.get_compiled());
++        } else if (r.type == row_kind::page) {
++            result.add(r.value_text.get_compiled());
 +        }
      }
  
-     draw_focus_ring(result);
-@@ -220,12 +291,13 @@ bool pause_overlay::is_cancel_button(pad_button button) const {
+-    draw_focus_ring(result);
++    if (selectable(selected) && m_rows[selected].visible)
++        draw_focus_ring(result, m_rows[selected]);
++    result.add(m_hint.get_compiled());
+ 
+     return result;
+ }
+@@ -219,13 +431,7 @@ bool pause_overlay::is_cancel_button(pad_button button) const {
+     return button == pad_button::circle;
  }
  
- void pause_overlay::draw_focus_ring(compiled_resource &res) const {
+-void pause_overlay::draw_focus_ring(compiled_resource &res) const {
 -    if (m_buttons.empty() || m_selected_button < 0
 -        || m_selected_button >= static_cast<int>(m_buttons.size())) {
-+    const int selected_index = m_selected_button;
-+    if (m_buttons.empty() || selected_index < 0
-+        || selected_index >= static_cast<int>(m_buttons.size())) {
-         return;
-     }
- 
+-        return;
+-    }
+-
 -    const auto &selected = m_buttons[m_selected_button];
-+    const auto &selected = m_buttons[selected_index];
++void pause_overlay::draw_focus_ring(compiled_resource &res, const row &selected) const {
      const float pulse = 0.5f + 0.5f * std::sin(m_focus_pulse_time * 3.0f);
      const float a = 0.85f + 0.15f * pulse;
  
+@@ -235,7 +441,7 @@ void pause_overlay::draw_focus_ring(compiled_resource &res) const {
+     ring.back_color = { k_color_focus_ring.r, k_color_focus_ring.g, k_color_focus_ring.b, 0.15f * a };
+     ring.border_size = k_focus_ring_thickness;
+     ring.border_color = { k_color_focus_ring.r, k_color_focus_ring.g, k_color_focus_ring.b, a };
+-    ring.border_radius = k_button_radius;
++    ring.border_radius = k_row_radius;
+     res.add(ring.get_compiled());
+ }
+ 
 diff --git a/vita3k/ps4/ps4.cmake b/vita3k/ps4/ps4.cmake
 new file mode 100644
-index 00000000..4b7cb5d3
+index 00000000..14dfe225
 --- /dev/null
 +++ b/vita3k/ps4/ps4.cmake
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,39 @@
 +# PS4: Vita3K's frontend for the console, included from vita3k/CMakeLists.txt once the vita3k target
 +# exists. Built with the port's toolchain (toolchain/ps4-vita3k.cmake, and ps4-love-style.cmake as
 +# the project include: PS4_RUNTIME_SOURCES, ps4_link_mesa, ps4_add_eboot).
@@ -1629,6 +1953,8 @@ index 00000000..4b7cb5d3
 +	ps4/ps4_pad.h
 +	ps4/ps4_perf.cpp
 +	ps4/ps4_perf.h
++	ps4/ps4_settings.cpp
++	ps4/ps4_settings.h
 +	ps4/ps4_wsi.cpp
 +	ps4/ps4_wsi.h
 +	ps4/ps4_stubs.c
@@ -1652,10 +1978,10 @@ index 00000000..4b7cb5d3
 +ps4_add_eboot(vita3k)
 diff --git a/vita3k/ps4/ps4_canvas.cpp b/vita3k/ps4/ps4_canvas.cpp
 new file mode 100644
-index 00000000..dac5ad53
+index 00000000..75d4a6e8
 --- /dev/null
 +++ b/vita3k/ps4/ps4_canvas.cpp
-@@ -0,0 +1,468 @@
+@@ -0,0 +1,486 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -2001,6 +2327,24 @@ index 00000000..dac5ad53
 +    }
 +}
 +
++void Canvas::draw_image_circle(const Image &image, float cx, float cy, float radius, uint8_t alpha) {
++    const int left = static_cast<int>(cx - image.width / 2.f);
++    const int top = static_cast<int>(cy - image.height / 2.f);
++    for (int yy = static_cast<int>(cy - radius - 1); yy <= static_cast<int>(cy + radius + 1); yy++) {
++        for (int xx = static_cast<int>(cx - radius - 1); xx <= static_cast<int>(cx + radius + 1); xx++) {
++            const int ix = xx - left, iy = yy - top;
++            if (ix < 0 || iy < 0 || ix >= image.width || iy >= image.height)
++                continue;
++            const uint8_t edge = coverage(radius - std::hypot(xx + 0.5f - cx, yy + 0.5f - cy) + 0.5f);
++            if (edge == 0)
++                continue;
++            const uint32_t p = image.pixels[static_cast<size_t>(iy) * image.width + ix];
++            const Color c{ static_cast<uint8_t>(p), static_cast<uint8_t>(p >> 8), static_cast<uint8_t>(p >> 16), static_cast<uint8_t>(p >> 24) };
++            blend(xx, yy, c, static_cast<uint8_t>(edge * alpha / 255));
++        }
++    }
++}
++
 +int Canvas::text_width(std::string_view utf8, int px, Weight weight) {
 +    const std::lock_guard<std::mutex> lock(fonts_mutex);
 +    FontSet &set = font_set(weight);
@@ -2126,10 +2470,10 @@ index 00000000..dac5ad53
 +} // namespace ps4ui
 diff --git a/vita3k/ps4/ps4_canvas.h b/vita3k/ps4/ps4_canvas.h
 new file mode 100644
-index 00000000..b0e6c08c
+index 00000000..9c33893b
 --- /dev/null
 +++ b/vita3k/ps4/ps4_canvas.h
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,103 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -2198,6 +2542,8 @@ index 00000000..b0e6c08c
 +    void ring(float cx, float cy, float radius, float thickness, Color c);
 +    void line(float x0, float y0, float x1, float y1, float thickness, Color c);
 +    void draw_image(const Image &image, int x, int y, uint8_t alpha = 255);
++    // Centered on (cx, cy), inside a circle of that radius (a bubble), its edge smoothed
++    void draw_image_circle(const Image &image, float cx, float cy, float radius, uint8_t alpha = 255);
 +
 +    // Text with its baseline at y; returns the width drawn. Characters the console's Latin font
 +    // lacks come from its Japanese, Chinese and Korean fonts.
@@ -2457,10 +2803,10 @@ index 00000000..01fdf0f1
 +} // namespace ps4download
 diff --git a/vita3k/ps4/ps4_launcher.cpp b/vita3k/ps4/ps4_launcher.cpp
 new file mode 100644
-index 00000000..4cb2f9cf
+index 00000000..b2c4102f
 --- /dev/null
 +++ b/vita3k/ps4/ps4_launcher.cpp
-@@ -0,0 +1,1336 @@
+@@ -0,0 +1,1985 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -2490,6 +2836,7 @@ index 00000000..4cb2f9cf
 +#include "ps4_canvas.h"
 +#include "ps4_download.h"
 +#include "ps4_pad.h"
++#include "ps4_settings.h"
 +#include "ps4_wsi.h"
 +
 +#include "archive.h"
@@ -2516,6 +2863,7 @@ index 00000000..4cb2f9cf
 +#include <chrono>
 +#include <cstdint>
 +#include <cstring>
++#include <ctime>
 +#include <functional>
 +#include <iterator>
 +#include <map>
@@ -2528,6 +2876,8 @@ index 00000000..4cb2f9cf
 +int32_t ps4l_allocate_direct(off_t start, off_t end, size_t len, size_t align, int32_t type, off_t *phys) __asm__("sceKernelAllocateDirectMemory");
 +int32_t ps4l_map_direct(void **addr, size_t len, int32_t prot, int32_t flags, off_t phys, size_t align) __asm__("sceKernelMapDirectMemory");
 +size_t ps4l_direct_memory_size() __asm__("sceKernelGetDirectMemorySize");
++// UTC to the console's time zone (the clock in the status bar)
++int32_t ps4l_utc_to_local(time_t utc, time_t *local, void *tsec, uint32_t *dst) __asm__("sceKernelConvertUtcToLocaltime");
 +void ps4_boot_trace(const char *line); // port/ps4_crashlog.cpp
 +}
 +
@@ -2681,6 +3031,7 @@ index 00000000..4cb2f9cf
 +    Square,
 +    Triangle,
 +    Options,
++    DPad,
 +};
 +
 +struct Hint {
@@ -2714,6 +3065,10 @@ index 00000000..4cb2f9cf
 +            c.pill_button(x, y - 10, "OPTIONS", 22);
 +            x += c.text_width("OPTIONS", 22, Weight::Bold) + 40;
 +            break;
++        case Pad::DPad:
++            c.pill_button(x, y - 10, "LEFT / RIGHT", 22);
++            x += c.text_width("LEFT / RIGHT", 22, Weight::Bold) + 40;
++            break;
 +        }
 +        x += c.text(x, y, hint.label, 30, TEXT) + 48;
 +    }
@@ -2726,6 +3081,12 @@ index 00000000..4cb2f9cf
 +    bool icons_loaded = false;
 +    ps4ui::Image small;
 +    ps4ui::Image large;
++    // the home screen's bubble (at the selected bubble's size)
++    ps4ui::Image bubble;
++    // its LiveArea: the background and the start gate's picture (sce_sys/livearea/contents)
++    bool livearea_loaded = false;
++    ps4ui::Image livearea_bg;
++    ps4ui::Image livearea_gate;
 +};
 +
 +std::vector<Item> load_items(EmuEnvState &emuenv) {
@@ -2749,6 +3110,7 @@ index 00000000..4cb2f9cf
 +        return;
 +    item.small = ps4ui::load_image(item.entry.icon_path, ICON, ICON);
 +    item.large = ps4ui::load_image(item.entry.icon_path, BIG_ICON, BIG_ICON);
++    item.bubble = ps4ui::load_image(item.entry.icon_path, 224, 224);
 +}
 +
 +void icon_placeholder(Canvas &c, int x, int y, int size) {
@@ -3529,6 +3891,431 @@ index 00000000..4cb2f9cf
 +    c.text_wrapped(MARGIN + 36, ny + 50, notice, 28, TEXT, nw - 72, 40);
 +}
 +
++// --- the PS Vita's home screen: bubbles ---
++
++constexpr int PER_PAGE = 10;
++constexpr float BUBBLE_R = 100.f;
++constexpr float BUBBLE_SEL_R = 112.f;
++constexpr float HOME_CX = 920.f;
++
++struct Slot {
++    float x, y;
++    int row;
++};
++// rows of 3, 4 and 3 bubbles, staggered as on the PS Vita's home screen; pages one under another
++const Slot SLOTS[PER_PAGE] = {
++    { HOME_CX - 300, 300, 0 },
++    { HOME_CX, 300, 0 },
++    { HOME_CX + 300, 300, 0 },
++    { HOME_CX - 450, 545, 1 },
++    { HOME_CX - 150, 545, 1 },
++    { HOME_CX + 150, 545, 1 },
++    { HOME_CX + 450, 545, 1 },
++    { HOME_CX - 300, 790, 2 },
++    { HOME_CX, 790, 2 },
++    { HOME_CX + 300, 790, 2 },
++};
++
++// what a bubble opens: the HENkaku settings, the install browser, or a game (its LiveArea)
++enum class TileKind {
++    Henkaku,
++    Install,
++    Game,
++};
++
++struct Tile {
++    TileKind kind;
++    int item = -1;
++};
++
++// The system's bubbles first, as on a Vita, then the games
++std::vector<Tile> make_tiles(const std::vector<Item> &items) {
++    std::vector<Tile> tiles{ { TileKind::Henkaku }, { TileKind::Install } };
++    for (int i = 0; i < static_cast<int>(items.size()); i++)
++        tiles.push_back({ TileKind::Game, i });
++    return tiles;
++}
++
++// Where a direction leads from bubble `index`: left / right along the order, up / down to the
++// nearest bubble of the row above or below, across pages
++int bubble_step(int index, int count, int dx, int dy) {
++    if (count <= 0)
++        return 0;
++    if (dx != 0)
++        return std::clamp(index + dx, 0, count - 1);
++    const int page = index / PER_PAGE;
++    const int slot = index % PER_PAGE;
++    int target_page = page;
++    int target_row = SLOTS[slot].row + dy;
++    if (target_row < 0) {
++        if (page == 0)
++            return index;
++        target_page--;
++        target_row = 2;
++    } else if (target_row > 2) {
++        if ((page + 1) * PER_PAGE >= count)
++            return index;
++        target_page++;
++        target_row = 0;
++    }
++    int best = -1;
++    float best_distance = 1e9f;
++    for (int s = 0; s < PER_PAGE; s++) {
++        const int i = target_page * PER_PAGE + s;
++        if (SLOTS[s].row != target_row || i >= count)
++            continue;
++        const float distance = std::fabs(SLOTS[s].x - SLOTS[slot].x);
++        if (distance < best_distance) {
++            best_distance = distance;
++            best = i;
++        }
++    }
++    // a short last page: its last bubble
++    if (best < 0)
++        return dy > 0 && target_page * PER_PAGE < count ? count - 1 : index;
++    return best;
++}
++
++std::string tile_title(const Tile &tile, const std::vector<Item> &items) {
++    switch (tile.kind) {
++    case TileKind::Henkaku:
++        return "HENkaku";
++    case TileKind::Install:
++        return "Install";
++    case TileKind::Game:
++        return items[tile.item].entry.title;
++    }
++    return {};
++}
++
++// The PS Vita's own blue, lighter at the top, with soft light
++void vita_background(Canvas &c) {
++    c.clear_gradient(rgb(0x2463b4), rgb(0x07173a));
++    c.fill_circle(1560, -260, 980, rgb(0x8cc8ff, 30));
++    c.fill_circle(150, 1180, 760, rgb(0x2f7ae0, 34));
++    c.fill_circle(1780, 1020, 400, rgb(0xb4dcff, 18));
++    c.fill_circle(520, 140, 260, rgb(0xffffff, 10));
++}
++
++// Text centered on cx, cut to max_width
++void centered_text(Canvas &c, float cx, int y, const std::string &text, int px, Color color, Weight weight, int max_width) {
++    const int width = std::min(c.text_width(text, px, weight), max_width);
++    c.text(static_cast<int>(cx) - width / 2, y, text, px, color, weight, max_width);
++}
++
++// The local time, as the Vita's status bar shows it
++std::string clock_text() {
++    time_t now = std::time(nullptr);
++    time_t local = now;
++    uint32_t tsec[4] = {};
++    uint32_t dst = 0;
++    if (ps4l_utc_to_local(now, &local, tsec, &dst) != 0)
++        local = now;
++    std::tm tm{};
++    gmtime_r(&local, &tm);
++    char text[16];
++    std::snprintf(text, sizeof(text), "%02d:%02d", tm.tm_hour, tm.tm_min);
++    return text;
++}
++
++// The status bar: HENkaku at the left, the firmware's state and the time at the right
++void status_bar(Canvas &c, const app::FirmwareState &fw, const ps4ui::Image &henkaku) {
++    c.fill_rect(0, 0, W, 66, rgb(0x000000, 64));
++    int x = 30;
++    if (!henkaku.empty()) {
++        c.draw_image(henkaku, x, 33 - henkaku.height / 2);
++        x += henkaku.width + 14;
++    }
++    x += c.text(x, 46, "HENkaku", 30, TEXT, Weight::Bold) + 16;
++    c.text(x, 46, "Vita3K " + version_text(), 24, rgb(0xc8d6ee));
++    int right = W - 36;
++    const std::string time = clock_text();
++    right -= c.text_width(time, 32, Weight::Bold);
++    c.text(right, 47, time, 32, TEXT, Weight::Bold);
++    if (!fw.main_firmware || !fw.font_package) {
++        const std::string missing = !fw.main_firmware ? "No PS Vita firmware" : "No font package";
++        right -= c.text_width(missing, 24, Weight::Bold) + 40;
++        c.fill_circle(right - 16.f, 38.f, 7.f, WARN);
++        c.text(right, 46, missing, 24, WARN, Weight::Bold);
++    }
++}
++
++// A tray with an arrow into it: the install bubble
++void install_glyph(Canvas &c, float x, float y, float r) {
++    const Color white = rgb(0xffffff);
++    const float s = r / 100.f;
++    c.line(x, y - 52 * s, x, y + 16 * s, 15 * s, white);
++    c.line(x - 34 * s, y - 16 * s, x, y + 20 * s, 15 * s, white);
++    c.line(x + 34 * s, y - 16 * s, x, y + 20 * s, 15 * s, white);
++    c.line(x - 54 * s, y + 18 * s, x - 54 * s, y + 52 * s, 13 * s, white);
++    c.line(x + 54 * s, y + 18 * s, x + 54 * s, y + 52 * s, 13 * s, white);
++    c.line(x - 54 * s, y + 52 * s, x + 54 * s, y + 52 * s, 13 * s, white);
++}
++
++void draw_bubble(Canvas &c, const Tile &tile, std::vector<Item> &items, float x, float y, float r, const ps4ui::Image &henkaku) {
++    switch (tile.kind) {
++    case TileKind::Game: {
++        Item &item = items[tile.item];
++        ensure_icons(item);
++        if (!item.bubble.empty()) {
++            c.fill_circle(x, y, r, rgb(0x0d1830));
++            c.draw_image_circle(item.bubble, x, y, r);
++        } else {
++            c.fill_circle(x, y, r, rgb(0x1b2a44));
++            c.text_centered(static_cast<int>(x), static_cast<int>(y + r / 4), "?", static_cast<int>(r * 0.7f), MUTED, Weight::Bold);
++        }
++        break;
++    }
++    case TileKind::Henkaku:
++        c.fill_circle(x, y, r, rgb(0x0a0f1a));
++        if (!henkaku.empty())
++            c.draw_image(henkaku, static_cast<int>(x) - henkaku.width / 2, static_cast<int>(y) - henkaku.height / 2);
++        break;
++    case TileKind::Install:
++        c.fill_circle(x, y, r, rgb(0x1f7fe6));
++        c.fill_circle(x - r * 0.25f, y - r * 0.3f, r * 0.62f, rgb(0xffffff, 26));
++        install_glyph(c, x, y, r);
++        break;
++    }
++}
++
++void draw_bubbles(Canvas &c, std::vector<Item> &items, const std::vector<Tile> &tiles, int selected, const ps4ui::Image &henkaku) {
++    const int count = static_cast<int>(tiles.size());
++    const int page = selected / PER_PAGE;
++    const int pages = std::max(1, (count + PER_PAGE - 1) / PER_PAGE);
++    // the selected one last, over its neighbours
++    for (int pass = 0; pass < 2; pass++) {
++        for (int slot = 0; slot < PER_PAGE; slot++) {
++            const int index = page * PER_PAGE + slot;
++            if (index >= count)
++                break;
++            const bool sel = index == selected;
++            if (sel != (pass == 1))
++                continue;
++            const Slot &s = SLOTS[slot];
++            const float r = sel ? BUBBLE_SEL_R : BUBBLE_R;
++            c.fill_circle(s.x + 3.f, s.y + 11.f, r + 3.f, rgb(0x000000, 70));
++            draw_bubble(c, tiles[index], items, s.x, s.y, r, henkaku);
++            c.ring(s.x, s.y, r - 1.5f, 3.f, rgb(0xffffff, sel ? 245 : 140));
++            if (sel)
++                c.ring(s.x, s.y, r + 9.f, 5.f, rgb(0x9adcff, 235));
++            centered_text(c, s.x, static_cast<int>(s.y + r + (sel ? 46.f : 40.f)), tile_title(tiles[index], items),
++                sel ? 30 : 26, sel ? TEXT : rgb(0xe6ecf6), sel ? Weight::Bold : Weight::Regular, sel ? 330 : 270);
++        }
++    }
++    // the pages, as dots down the right edge
++    const float dots_x = W - 58.f;
++    const float y0 = H / 2.f - (pages - 1) * 21.f;
++    for (int p = 0; p < pages; p++)
++        c.fill_circle(dots_x, y0 + p * 42.f, p == page ? 11.f : 6.f, rgb(0xffffff, p == page ? 245 : 110));
++}
++
++// --- a game's LiveArea ---
++
++void ensure_livearea(Item &item, const fs::path &app_dir) {
++    if (item.livearea_loaded)
++        return;
++    item.livearea_loaded = true;
++    const fs::path contents = app_dir / "sce_sys" / "livearea" / "contents";
++    boost::system::error_code ec;
++    for (const char *name : { "bg0.png", "bg.png" }) {
++        const fs::path bg = contents / name;
++        if (fs::exists(bg, ec)) {
++            item.livearea_bg = ps4ui::load_image(fs_utils::path_to_utf8(bg), W, H);
++            break;
++        }
++    }
++    const fs::path gate = contents / "startup.png";
++    if (fs::exists(gate, ec))
++        item.livearea_gate = ps4ui::load_image(fs_utils::path_to_utf8(gate), 560, 316);
++}
++
++void draw_livearea(Canvas &c, Item &item) {
++    if (!item.livearea_bg.empty()) {
++        c.clear_gradient(rgb(0x05080f), rgb(0x05080f));
++        c.draw_image(item.livearea_bg, (W - item.livearea_bg.width) / 2, (H - item.livearea_bg.height) / 2);
++        c.fill_rect(0, 0, W, H, rgb(0x000000, 70));
++    } else {
++        vita_background(c);
++    }
++    // the game: its bubble and name at the top left
++    ensure_icons(item);
++    const float bx = 200.f, by = 200.f, br = 104.f;
++    c.fill_circle(bx + 3.f, by + 10.f, br + 3.f, rgb(0x000000, 80));
++    if (!item.bubble.empty())
++        c.draw_image_circle(item.bubble, bx, by, br);
++    else
++        c.fill_circle(bx, by, br, rgb(0x1b2a44));
++    c.ring(bx, by, br - 1.5f, 3.f, rgb(0xffffff, 240));
++    c.fill_round_rect(340, 120, W - 340 - 120, 170, 26, rgb(0x000000, 90));
++    c.text(380, 196, item.entry.title, 56, TEXT, Weight::Bold, W - 380 - 160);
++    c.text(380, 252, item.entry.title_id + (item.entry.app_ver.empty() ? "" : "   v" + item.entry.app_ver), 30, rgb(0xc8d6ee));
++    // the gate: the game's start picture, with Start under it
++    const int gw = 620, gh = 350, gx = (W - gw) / 2, gy = 400;
++    c.fill_round_rect(gx - 14, gy - 14, gw + 28, gh + 120, 30, rgb(0x000000, 70));
++    c.fill_round_rect(gx - 12, gy - 12, gw + 24, gh + 112, 28, rgb(0xf4f7fb));
++    c.fill_round_rect(gx, gy, gw, gh, 18, rgb(0x0d1830));
++    const ps4ui::Image &picture = !item.livearea_gate.empty() ? item.livearea_gate : item.large;
++    if (!picture.empty())
++        c.draw_image(picture, gx + (gw - picture.width) / 2, gy + (gh - picture.height) / 2);
++    c.text_centered(W / 2, gy + gh + 72, "Start", 44, rgb(0x14284a), Weight::Bold);
++}
++
++// --- the HENkaku settings, in the launcher ---
++
++using SItem = ps4settings::Item;
++
++struct SettingsLevel {
++    const std::vector<SItem> *items = nullptr;
++    std::string name;
++    int selected = 0;
++    int top = 0;
++};
++
++struct SettingsView {
++    // whose: "All games", or a game's name
++    std::string scope;
++    std::vector<SItem> root;
++    std::vector<SettingsLevel> stack;
++};
++
++constexpr int SET_Y = 236;
++constexpr int SET_ROW = 76;
++constexpr int SET_SECTION = 62;
++constexpr int SET_H = 740;
++
++bool settings_selectable(const SItem &item) {
++    return item.type != SItem::kind::section;
++}
++
++// To the next line that can be picked, up (-1) or down
++void settings_move(SettingsLevel &level, int step) {
++    const auto &items = *level.items;
++    for (int i = level.selected + step; i >= 0 && i < static_cast<int>(items.size()); i += step) {
++        if (settings_selectable(items[i])) {
++            level.selected = i;
++            return;
++        }
++    }
++    if (level.selected < static_cast<int>(items.size()) && !settings_selectable(items[level.selected])) {
++        for (int i = 0; i < static_cast<int>(items.size()); i++) {
++            if (settings_selectable(items[i])) {
++                level.selected = i;
++                return;
++            }
++        }
++    }
++}
++
++void settings_open(SettingsView &view, std::string scope, std::vector<SItem> root) {
++    view.scope = std::move(scope);
++    view.root = std::move(root);
++    view.stack.clear();
++    view.stack.push_back({ &view.root, {}, 0, 0 });
++    settings_move(view.stack.back(), 1);
++}
++
++int choice_value(const SItem &item) {
++    const int count = static_cast<int>(item.values.size());
++    return (count > 0 && item.get) ? std::clamp(item.get(), 0, count - 1) : -1;
++}
++
++// Left / right on a choice: its previous / next value
++void settings_change(const SItem &item, int step) {
++    const int count = static_cast<int>(item.values.size());
++    if (item.type != SItem::kind::choice || count == 0 || !item.set)
++        return;
++    item.set((std::max(choice_value(item), 0) + step + count) % count);
++}
++
++void draw_settings(Canvas &c, SettingsView &view, const ps4ui::Image &henkaku) {
++    c.clear_gradient(rgb(0x10203c), rgb(0x03060d));
++    c.fill_circle(1700, -120, 620, rgb(0x2a6fd6, 22));
++    // the heading: the ensō, HENkaku, whose settings and which page
++    int tx = MARGIN;
++    if (!henkaku.empty()) {
++        c.draw_image(henkaku, MARGIN, 60);
++        tx += henkaku.width + 30;
++    }
++    c.text(tx, 122, "HENkaku", 66, TEXT, Weight::Bold);
++    std::string path = view.scope;
++    for (size_t i = 1; i < view.stack.size(); i++)
++        path += "   >   " + view.stack[i].name;
++    c.text(tx + 4, 176, path, 32, ACCENT, Weight::Regular, W - tx - MARGIN);
++    c.fill_rect(MARGIN, 206, W - 2 * MARGIN, 2, rgb(0xffffff, 30));
++
++    SettingsLevel &level = view.stack.back();
++    const auto &items = *level.items;
++    const int count = static_cast<int>(items.size());
++    const auto height_of = [&](int i) { return items[i].type == SItem::kind::section ? SET_SECTION : SET_ROW; };
++    const auto span = [&](int first, int last) {
++        int h = 0;
++        for (int i = first; i <= last; i++)
++            h += height_of(i);
++        return h;
++    };
++    // the selection in view, with its section's heading when that's right above it
++    if (level.selected < level.top)
++        level.top = level.selected;
++    if (level.top > 0 && level.top == level.selected && items[level.top - 1].type == SItem::kind::section)
++        level.top--;
++    while (level.top < level.selected && span(level.top, level.selected) > SET_H)
++        level.top++;
++
++    int y = SET_Y;
++    int last = level.top - 1;
++    for (int i = level.top; i < count; i++) {
++        const int h = height_of(i);
++        if (y + h > SET_Y + SET_H)
++            break;
++        last = i;
++        const SItem &item = items[i];
++        if (item.type == SItem::kind::section) {
++            c.text(MARGIN + 6, y + 44, item.name, 26, ACCENT, Weight::Bold);
++            y += h;
++            continue;
++        }
++        const bool sel = i == level.selected;
++        c.fill_round_rect(MARGIN, y, W - 2 * MARGIN, h - 10, 18, sel ? rgb(0x2a6fd6, 120) : rgb(0xffffff, 14));
++        if (sel)
++            c.fill_round_rect(MARGIN, y + 16, 6, h - 42, 3, ACCENT);
++        const int name_w = c.text(MARGIN + 38, y + 47, item.name, 32, TEXT, sel ? Weight::Bold : Weight::Regular, 900);
++        const int right = W - MARGIN - 38;
++        if (item.type == SItem::kind::choice) {
++            if (!item.note.empty())
++                c.text(MARGIN + 38 + name_w + 18, y + 45, item.note, 24, MUTED);
++            const int value = choice_value(item);
++            const std::string text = value >= 0 ? "<   " + item.values[value] + "   >" : std::string();
++            c.text(right - c.text_width(text, 30, Weight::Bold), y + 46, text, 30, sel ? TEXT : ACCENT, Weight::Bold);
++        } else if (item.type == SItem::kind::page) {
++            const std::string text = item.note.empty() ? std::string(">") : item.note + "     >";
++            c.text(right - c.text_width(text, 28), y + 46, text, 28, MUTED);
++        }
++        y += h;
++    }
++    // more above or below
++    if (level.top > 0)
++        c.text_centered(W / 2, SET_Y - 8, "...", 30, MUTED, Weight::Bold);
++    if (last + 1 < count)
++        c.text_centered(W / 2, SET_Y + SET_H + 26, "...", 30, MUTED, Weight::Bold);
++}
++
++// Lines the launcher adds to the HENkaku settings (the firmware download, Quit)
++SItem section_item(std::string name) {
++    SItem item;
++    item.type = SItem::kind::section;
++    item.name = std::move(name);
++    return item;
++}
++
++SItem action_item(std::string name, std::function<void()> run) {
++    SItem item;
++    item.type = SItem::kind::action;
++    item.name = std::move(name);
++    item.run = std::move(run);
++    return item;
++}
++
 +} // namespace
 +
 +void show_message(const std::string &title, const std::string &detail) {
@@ -3548,15 +4335,42 @@ index 00000000..4cb2f9cf
 +Choice run(EmuEnvState &emuenv, const std::string &notice_text) {
 +    Canvas canvas(W, H);
 +    std::vector<Item> items = load_items(emuenv);
++    std::vector<Tile> tiles = make_tiles(items);
 +    app::FirmwareState fw = app::get_firmware_state(emuenv);
-+    int selected = 0;
++    const ps4settings::Prefs &prefs = ps4settings::prefs();
++    // the HENkaku ensō, at the status bar's, the bubble's and the settings heading's sizes
++    const std::string henkaku_path = ps4settings::icon_path();
++    const ps4ui::Image henkaku_bar = ps4ui::load_image(henkaku_path, 46, 46);
++    const ps4ui::Image henkaku_bubble = ps4ui::load_image(henkaku_path, 150, 150);
++    const ps4ui::Image henkaku_heading = ps4ui::load_image(henkaku_path, 124, 124);
++
++    enum class Mode {
++        Home, // the bubbles or the list (HENkaku > System > Style)
++        Browser, // the install browser
++        LiveArea, // a game's
++        Settings, // the HENkaku settings: all games', or a game's
++    };
++    Mode mode = Mode::Home;
++    Mode settings_return = Mode::Home;
++    int selected = 0; // the list's
 +    int top = 0;
++    int tile = 0; // the bubbles'
++    int live = -1; // the game whose LiveArea is open
++    SettingsView settings;
++    bool quit_requested = false;
++    bool firmware_requested = false;
++
 +    // the last game started is selected again
 +    static std::string last_app_path;
-+    for (size_t i = 0; i < items.size(); i++) {
-+        if (!last_app_path.empty() && items[i].entry.path == last_app_path)
-+            selected = static_cast<int>(i);
-+    }
++    const auto select_app = [&](const std::string &app_path, const std::string &title_id) {
++        for (size_t i = 0; i < items.size(); i++) {
++            if ((!app_path.empty() && items[i].entry.path == app_path) || (!title_id.empty() && items[i].entry.title_id == title_id)) {
++                selected = static_cast<int>(i);
++                tile = static_cast<int>(i) + 2; // after the HENkaku and Install bubbles
++            }
++        }
++    };
++    select_app(last_app_path, {});
 +    std::string notice = notice_text;
 +    auto notice_until = Clock::now() + std::chrono::seconds(notice.empty() ? 0 : 12);
 +    InstallJob job;
@@ -3565,9 +4379,8 @@ index 00000000..4cb2f9cf
 +        job.thread = std::thread([&emuenv, &job, downloads = missing_firmware(fw)] { firmware_worker(emuenv, job, downloads); });
 +        notice.clear();
 +    };
-+    // the install browser (Triangle), where it was the last time
++    // the install browser, where it was the last time
 +    static fs::path browse_dir = INSTALL_DIR; // empty: the locations
-+    bool browsing = false;
 +    std::vector<Entry> entries;
 +    int browse_selected = 0;
 +    int browse_top = 0;
@@ -3577,10 +4390,47 @@ index 00000000..4cb2f9cf
 +        entries = browse_dir.empty() ? locations() : list_folder(browse_dir);
 +        browse_selected = browse_top = 0;
 +    };
++    const auto open_browser = [&] {
++        mode = Mode::Browser;
++        open_dir(browse_dir);
++    };
 +    const auto start_install = [&](std::vector<Entry> list, bool consume) {
 +        reset(job, false);
 +        job.thread = std::thread([&emuenv, &job, list = std::move(list), consume]() mutable { install_worker(emuenv, job, std::move(list), consume); });
 +        notice.clear();
++    };
++    // starts a game, or decrypts it first when it's still a NoNpDrm dump (it starts when done)
++    const auto start_game = [&](int index) -> std::optional<Choice> {
++        const Item &item = items[index];
++        const fs::path app_dir = emuenv.vita_fs_path / "ux0" / "app" / item.entry.path;
++        if (!still_encrypted(app_dir)) {
++            last_app_path = item.entry.path;
++            show_message("Starting", item.entry.title);
++            return Choice{ false, item.entry.path, item.entry.title };
++        }
++        reset(job, false);
++        job.start_app = item.entry.path;
++        job.start_title = item.entry.title;
++        job.thread = std::thread([&emuenv, &job, app_dir, title = item.entry.title] { decrypt_worker(emuenv, job, app_dir, title); });
++        notice.clear();
++        return std::nullopt;
++    };
++    // the HENkaku settings: a game's (game >= 0) or all games', with the launcher's own lines
++    const auto open_settings = [&](int game) {
++        settings_return = mode;
++        if (game >= 0) {
++            settings_open(settings, items[game].entry.title, ps4settings::game_pages(emuenv, items[game].entry.path));
++        } else {
++            std::vector<SItem> root = ps4settings::global_pages(emuenv);
++            if (!missing_firmware(fw).empty()) {
++                root.push_back(section_item("PS Vita firmware"));
++                root.push_back(action_item(fw.main_firmware ? "Download the font package from Sony" : "Download the firmware from Sony", [&] { firmware_requested = true; }));
++            }
++            root.push_back(section_item("Vita3K"));
++            root.push_back(action_item("Quit Vita3K", [&] { quit_requested = true; }));
++            settings_open(settings, "All games", std::move(root));
++        }
++        mode = Mode::Settings;
 +    };
 +    // What's missing of the firmware comes from Sony by itself, unless the user stopped that
 +    // before or copied update files to install
@@ -3592,7 +4442,7 @@ index 00000000..4cb2f9cf
 +            if (updates_waiting())
 +                notice = "PS Vita update files are waiting in /data/Vita3K/install: Triangle, then Square installs them";
 +            else
-+                notice = std::string(fw.main_firmware ? "The PS Vita font package isn't installed: some games need it." : "The PS Vita firmware isn't installed: most games need it.") + " Press Square to download it from Sony.";
++                notice = std::string(fw.main_firmware ? "The PS Vita font package isn't installed: some games need it." : "The PS Vita firmware isn't installed: most games need it.") + " HENkaku (OPTIONS) downloads it from Sony.";
 +            notice_until = Clock::now() + std::chrono::hours(1);
 +        }
 +    }
@@ -3600,7 +4450,7 @@ index 00000000..4cb2f9cf
 +    // buttons held from the game don't count as presses here
 +    uint32_t previous = ps4pad::read().buttons;
 +    Clock::time_point repeat_at{};
-+    int repeat_dir = 0;
++    int repeat_key = 0;
 +    bool dirty = true;
 +    auto last_progress = Clock::now();
 +
@@ -3612,6 +4462,10 @@ index 00000000..4cb2f9cf
 +            buttons |= ORBIS_PAD_BUTTON_UP;
 +        if (pad.connected && pad.ly > 208)
 +            buttons |= ORBIS_PAD_BUTTON_DOWN;
++        if (pad.connected && pad.lx < 48)
++            buttons |= ORBIS_PAD_BUTTON_LEFT;
++        if (pad.connected && pad.lx > 208)
++            buttons |= ORBIS_PAD_BUTTON_RIGHT;
 +        const uint32_t pressed = buttons & ~previous;
 +        previous = buttons;
 +        const auto now = Clock::now();
@@ -3635,24 +4489,23 @@ index 00000000..4cb2f9cf
 +                    return Choice{ false, start_app, start_title };
 +                }
 +                items = load_items(emuenv);
++                tiles = make_tiles(items);
 +                const bool had_font_package = fw.font_package;
 +                fw = app::get_firmware_state(emuenv);
 +                // the text in the PS Vita's fonts, now that they're there
 +                if (fw.font_package && !had_font_package)
 +                    ps4ui::set_vita_font_dir(fs_utils::path_to_utf8(emuenv.vita_fs_path / "sa0" / "data" / "font" / "pvf") + "/");
 +                selected = std::min(selected, std::max(0, static_cast<int>(items.size()) - 1));
++                tile = std::min(tile, static_cast<int>(tiles.size()) - 1);
 +                if (!job.firmware) {
-+                    // back to the games, on the one just installed
-+                    browsing = false;
++                    // back home, on the game just installed
++                    mode = Mode::Home;
 +                    std::string title_id;
 +                    {
 +                        const std::lock_guard<std::mutex> lock(job.mutex);
 +                        title_id = job.title_id;
 +                    }
-+                    for (size_t i = 0; i < items.size(); i++) {
-+                        if (!title_id.empty() && items[i].entry.title_id == title_id)
-+                            selected = static_cast<int>(i);
-+                    }
++                    select_app({}, title_id);
 +                }
 +                notice = summary(job);
 +                notice_until = now + std::chrono::seconds(20);
@@ -3670,29 +4523,156 @@ index 00000000..4cb2f9cf
 +                }
 +            }
 +        } else {
-+            const int count = static_cast<int>(browsing ? entries.size() : items.size());
-+            const int page = browsing ? BROWSER_ROWS : VISIBLE_ROWS;
-+            int &sel = browsing ? browse_selected : selected;
-+            int dir = (buttons & ORBIS_PAD_BUTTON_UP) ? -1 : (buttons & ORBIS_PAD_BUTTON_DOWN) ? 1 : 0;
++            // the D-pad, repeating while held
++            int dx = (buttons & ORBIS_PAD_BUTTON_LEFT) ? -1 : (buttons & ORBIS_PAD_BUTTON_RIGHT) ? 1 : 0;
++            int dy = (buttons & ORBIS_PAD_BUTTON_UP) ? -1 : (buttons & ORBIS_PAD_BUTTON_DOWN) ? 1 : 0;
++            if (dy != 0)
++                dx = 0;
++            const int key = dx * 3 + dy;
 +            bool step = false;
-+            if (dir != 0 && dir != repeat_dir) {
++            if (key != 0 && key != repeat_key) {
 +                step = true;
 +                repeat_at = now + std::chrono::milliseconds(380);
-+            } else if (dir != 0 && now >= repeat_at) {
++            } else if (key != 0 && now >= repeat_at) {
 +                step = true;
-+                repeat_at = now + std::chrono::milliseconds(70);
++                repeat_at = now + std::chrono::milliseconds(mode == Mode::Home && prefs.bubbles ? 150 : 70);
 +            }
-+            repeat_dir = dir;
-+            if (step && count > 0) {
-+                sel = std::clamp(sel + dir, 0, count - 1);
-+                dirty = true;
++            repeat_key = key;
++            if (!step)
++                dx = dy = 0;
++
++            switch (mode) {
++            case Mode::Home:
++                if (prefs.bubbles) {
++                    const int count = static_cast<int>(tiles.size());
++                    if (dx != 0 || dy != 0) {
++                        tile = bubble_step(tile, count, dx, dy);
++                        dirty = true;
++                    }
++                    // L1 / R1: a page up / down
++                    if (pressed & (ORBIS_PAD_BUTTON_L1 | ORBIS_PAD_BUTTON_R1)) {
++                        tile = std::clamp(tile + ((pressed & ORBIS_PAD_BUTTON_L1) ? -PER_PAGE : PER_PAGE), 0, count - 1);
++                        dirty = true;
++                    }
++                    const Tile &t = tiles[tile];
++                    if (pressed & ORBIS_PAD_BUTTON_CROSS) {
++                        if (t.kind == TileKind::Henkaku) {
++                            open_settings(-1);
++                        } else if (t.kind == TileKind::Install) {
++                            open_browser();
++                        } else {
++                            live = t.item;
++                            ensure_livearea(items[live], emuenv.vita_fs_path / "ux0" / "app" / items[live].entry.path);
++                            mode = Mode::LiveArea;
++                        }
++                        dirty = true;
++                    } else if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && t.kind == TileKind::Game) {
++                        open_settings(t.item);
++                        dirty = true;
++                    }
++                } else {
++                    const int count = static_cast<int>(items.size());
++                    if (dy != 0 && count > 0) {
++                        selected = std::clamp(selected + dy, 0, count - 1);
++                        dirty = true;
++                    }
++                    // L1 / R1: a page at a time
++                    if ((pressed & (ORBIS_PAD_BUTTON_L1 | ORBIS_PAD_BUTTON_R1)) && count > 0) {
++                        selected = std::clamp(selected + ((pressed & ORBIS_PAD_BUTTON_L1) ? -VISIBLE_ROWS : VISIBLE_ROWS), 0, count - 1);
++                        dirty = true;
++                    }
++                    if ((pressed & ORBIS_PAD_BUTTON_CROSS) && count > 0) {
++                        if (auto choice = start_game(selected))
++                            return *choice;
++                        dirty = true;
++                    } else if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && count > 0) {
++                        open_settings(selected);
++                        dirty = true;
++                    }
++                }
++                if (pressed & ORBIS_PAD_BUTTON_TRIANGLE) {
++                    open_browser();
++                    dirty = true;
++                } else if (pressed & ORBIS_PAD_BUTTON_OPTIONS) {
++                    open_settings(-1);
++                    dirty = true;
++                }
++                break;
++
++            case Mode::LiveArea:
++                if (pressed & ORBIS_PAD_BUTTON_CROSS) {
++                    if (auto choice = start_game(live))
++                        return *choice;
++                    dirty = true;
++                } else if (pressed & ORBIS_PAD_BUTTON_SQUARE) {
++                    open_settings(live);
++                    dirty = true;
++                } else if (pressed & ORBIS_PAD_BUTTON_CIRCLE) {
++                    mode = Mode::Home;
++                    dirty = true;
++                }
++                break;
++
++            case Mode::Settings: {
++                SettingsLevel &level = settings.stack.back();
++                const auto &list = *level.items;
++                const SItem *item = level.selected < static_cast<int>(list.size()) ? &list[level.selected] : nullptr;
++                const auto open_page = [&](const SItem &page) {
++                    settings.stack.push_back({ &page.items, page.name, 0, 0 });
++                    if (!page.items.empty() && !settings_selectable(page.items[0]))
++                        settings_move(settings.stack.back(), 1);
++                };
++                const auto back = [&] {
++                    if (settings.stack.size() > 1) {
++                        settings.stack.pop_back();
++                    } else {
++                        mode = settings_return;
++                        // the home screen's style may have changed
++                        tiles = make_tiles(items);
++                    }
++                };
++                if (dy != 0) {
++                    settings_move(level, dy);
++                } else if (dx != 0 && item) {
++                    if (item->type == SItem::kind::choice)
++                        settings_change(*item, dx);
++                    else if (item->type == SItem::kind::page && dx > 0)
++                        open_page(*item);
++                    else if (dx < 0)
++                        back();
++                } else if ((pressed & ORBIS_PAD_BUTTON_CROSS) && item) {
++                    if (item->type == SItem::kind::choice)
++                        settings_change(*item, 1);
++                    else if (item->type == SItem::kind::page)
++                        open_page(*item);
++                    else if (item->type == SItem::kind::action && item->run)
++                        item->run();
++                } else if (pressed & ORBIS_PAD_BUTTON_CIRCLE) {
++                    back();
++                }
++                if (dx != 0 || dy != 0 || (pressed & (ORBIS_PAD_BUTTON_CROSS | ORBIS_PAD_BUTTON_CIRCLE)))
++                    dirty = true;
++                if (quit_requested)
++                    return Choice{ true, {}, {} };
++                if (firmware_requested) {
++                    firmware_requested = false;
++                    mode = Mode::Home;
++                    start_firmware();
++                    dirty = true;
++                }
++                break;
 +            }
-+            // L1 / R1: a page at a time
-+            if ((pressed & (ORBIS_PAD_BUTTON_L1 | ORBIS_PAD_BUTTON_R1)) && count > 0) {
-+                sel = std::clamp(sel + ((pressed & ORBIS_PAD_BUTTON_L1) ? -page : page), 0, count - 1);
-+                dirty = true;
-+            }
-+            if (browsing) {
++
++            case Mode::Browser: {
++                const int count = static_cast<int>(entries.size());
++                if (dy != 0 && count > 0) {
++                    browse_selected = std::clamp(browse_selected + dy, 0, count - 1);
++                    dirty = true;
++                }
++                if ((pressed & (ORBIS_PAD_BUTTON_L1 | ORBIS_PAD_BUTTON_R1)) && count > 0) {
++                    browse_selected = std::clamp(browse_selected + ((pressed & ORBIS_PAD_BUTTON_L1) ? -BROWSER_ROWS : BROWSER_ROWS), 0, count - 1);
++                    dirty = true;
++                }
 +                if ((pressed & ORBIS_PAD_BUTTON_CROSS) && !entries.empty()) {
 +                    const Entry e = entries[browse_selected];
 +                    if (installable(e.kind))
@@ -3709,7 +4689,7 @@ index 00000000..4cb2f9cf
 +                    }
 +                } else if (pressed & ORBIS_PAD_BUTTON_CIRCLE) {
 +                    if (browse_dir.empty()) {
-+                        browsing = false;
++                        mode = Mode::Home;
 +                    } else {
 +                        // up a folder (from a location: to the locations), on the folder it came from
 +                        const fs::path from = browse_dir;
@@ -3721,35 +4701,11 @@ index 00000000..4cb2f9cf
 +                    }
 +                    dirty = true;
 +                } else if (pressed & ORBIS_PAD_BUTTON_TRIANGLE) {
-+                    browsing = false;
++                    mode = Mode::Home;
 +                    dirty = true;
 +                }
-+            } else {
-+                if ((pressed & ORBIS_PAD_BUTTON_CROSS) && !items.empty()) {
-+                    const Item &item = items[selected];
-+                    const fs::path app_dir = emuenv.vita_fs_path / "ux0" / "app" / item.entry.path;
-+                    if (!still_encrypted(app_dir)) {
-+                        last_app_path = item.entry.path;
-+                        show_message("Starting", item.entry.title);
-+                        return Choice{ false, item.entry.path, item.entry.title };
-+                    }
-+                    // decrypted first, then started
-+                    reset(job, false);
-+                    job.start_app = item.entry.path;
-+                    job.start_title = item.entry.title;
-+                    job.thread = std::thread([&emuenv, &job, app_dir, title = item.entry.title] { decrypt_worker(emuenv, job, app_dir, title); });
-+                    notice.clear();
-+                    dirty = true;
-+                } else if (pressed & ORBIS_PAD_BUTTON_TRIANGLE) {
-+                    browsing = true;
-+                    open_dir(browse_dir);
-+                    dirty = true;
-+                } else if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && !missing_firmware(fw).empty()) {
-+                    start_firmware();
-+                    dirty = true;
-+                } else if (pressed & ORBIS_PAD_BUTTON_OPTIONS) {
-+                    return Choice{ true, {}, {} };
-+                }
++                break;
++            }
 +            }
 +        }
 +        if (!notice.empty() && now >= notice_until) {
@@ -3758,32 +4714,71 @@ index 00000000..4cb2f9cf
 +        }
 +
 +        if (dirty) {
-+            // keep the selection in view
-+            int &sel = browsing ? browse_selected : selected;
-+            int &first = browsing ? browse_top : top;
-+            const int rows = browsing ? BROWSER_ROWS : VISIBLE_ROWS;
-+            if (sel < first)
-+                first = sel;
-+            if (sel >= first + rows)
-+                first = sel - rows + 1;
-+            background(canvas);
-+            header(canvas, fw);
 +            std::vector<Hint> hints;
-+            if (browsing) {
++            switch (mode) {
++            case Mode::Home:
++                if (prefs.bubbles) {
++                    vita_background(canvas);
++                    status_bar(canvas, fw, henkaku_bar);
++                    draw_bubbles(canvas, items, tiles, tile, henkaku_bubble);
++                    const Tile &t = tiles[tile];
++                    hints.push_back({ Pad::Cross, t.kind == TileKind::Henkaku ? "Settings" : t.kind == TileKind::Install ? "Install games" : "Open" });
++                    if (t.kind == TileKind::Game)
++                        hints.push_back({ Pad::Square, "Game settings" });
++                    hints.push_back({ Pad::Triangle, "Install" });
++                    hints.push_back({ Pad::Options, "HENkaku" });
++                } else {
++                    // Vita3K's list, as it was
++                    if (selected < top)
++                        top = selected;
++                    if (selected >= top + VISIBLE_ROWS)
++                        top = selected - VISIBLE_ROWS + 1;
++                    background(canvas);
++                    header(canvas, fw);
++                    draw_list(canvas, items, selected, top);
++                    if (!items.empty()) {
++                        hints.push_back({ Pad::Cross, "Start" });
++                        hints.push_back({ Pad::Square, "Game settings" });
++                    }
++                    hints.push_back({ Pad::Triangle, "Install games" });
++                    hints.push_back({ Pad::Options, "HENkaku" });
++                }
++                break;
++            case Mode::LiveArea:
++                draw_livearea(canvas, items[live]);
++                hints.push_back({ Pad::Cross, "Start" });
++                hints.push_back({ Pad::Square, "Game settings" });
++                hints.push_back({ Pad::Circle, "Back" });
++                break;
++            case Mode::Settings: {
++                draw_settings(canvas, settings, henkaku_heading);
++                const SettingsLevel &level = settings.stack.back();
++                const SItem *item = level.selected < static_cast<int>(level.items->size()) ? &(*level.items)[level.selected] : nullptr;
++                if (item && item->type == SItem::kind::choice) {
++                    hints.push_back({ Pad::DPad, "Change" });
++                    hints.push_back({ Pad::Cross, "Next value" });
++                } else if (item && item->type == SItem::kind::page) {
++                    hints.push_back({ Pad::Cross, "Open" });
++                } else if (item && item->type == SItem::kind::action) {
++                    hints.push_back({ Pad::Cross, "Do it" });
++                }
++                hints.push_back({ Pad::Circle, "Back" });
++                break;
++            }
++            case Mode::Browser:
++                if (browse_selected < browse_top)
++                    browse_top = browse_selected;
++                if (browse_selected >= browse_top + BROWSER_ROWS)
++                    browse_top = browse_selected - BROWSER_ROWS + 1;
++                background(canvas);
++                header(canvas, fw);
 +                draw_browser(canvas, browse_dir, entries, browse_selected, browse_top);
 +                if (!entries.empty())
 +                    hints.push_back({ Pad::Cross, installable(entries[browse_selected].kind) ? "Install" : "Open" });
 +                if (std::any_of(entries.begin(), entries.end(), [](const Entry &e) { return installable(e.kind); }))
 +                    hints.push_back({ Pad::Square, "Install all here" });
 +                hints.push_back({ Pad::Circle, "Back" });
-+            } else {
-+                draw_list(canvas, items, selected, top);
-+                if (!items.empty())
-+                    hints.push_back({ Pad::Cross, "Start" });
-+                hints.push_back({ Pad::Triangle, "Install games" });
-+                if (!missing_firmware(fw).empty())
-+                    hints.push_back({ Pad::Square, "Download firmware" });
-+                hints.push_back({ Pad::Options, "Quit" });
++                break;
 +            }
 +            draw_notice(canvas, notice);
 +            footer(canvas, hints);
@@ -3849,10 +4844,10 @@ index 00000000..0210098f
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..36b1d5d9
+index 00000000..a406fd9b
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
-@@ -0,0 +1,549 @@
+@@ -0,0 +1,491 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -3888,6 +4883,7 @@ index 00000000..36b1d5d9
 +#include "ps4_launcher.h"
 +#include "ps4_pad.h"
 +#include "ps4_perf.h"
++#include "ps4_settings.h"
 +#include "ps4_wsi.h"
 +
 +#include <app/functions.h>
@@ -3901,6 +4897,7 @@ index 00000000..36b1d5d9
 +#include <overlay/pause_overlay.h>
 +#include <packages/sfo.h>
 +#include <renderer/frame_host.h>
++#include <renderer/state.h>
 +#include <util/fs.h>
 +#include <util/log.h>
 +
@@ -3908,6 +4905,7 @@ index 00000000..36b1d5d9
 +#include <SDL3/SDL_init.h>
 +
 +#include <orbis/SystemService.h>
++#include <orbis/libkernel.h>
 +
 +#include <algorithm>
 +#include <chrono>
@@ -3975,98 +4973,21 @@ index 00000000..36b1d5d9
 +    long long waits[4] = {};
 +};
 +
-+// The quick menu (L3 + R3): Vita3K's pause menu, with the settings worth changing on the PS4
-+// between Resume and Exit. A change goes through Vita3K's settings like the PC's settings dialog:
-+// saved in config.yml, and applied at once where Vita3K can (the resolution and the texture checks
-+// at the next start). The menu reads the settings on the render thread while a change replaces
-+// emuenv.cfg (strings and all) on the overlay's input thread: both take quick_menu_mutex.
-+std::mutex quick_menu_mutex;
-+
-+void install_quick_menu(EmuEnvState &emuenv) {
-+    using overlay::pause_menu_setting;
-+    const auto change = [&emuenv](const std::function<void(Config &)> &edit) {
-+        const std::lock_guard<std::mutex> lock(quick_menu_mutex);
-+        Config desired;
-+        desired = emuenv.cfg;
-+        edit(desired);
-+        app::commit_settings(emuenv, desired);
-+    };
-+    std::vector<pause_menu_setting> settings;
-+
-+    // Vita3K's performance overlay (its detail levels)
-+    settings.push_back({ "Show FPS", { "Off", "FPS", "FPS + frame time", "FPS + min/avg/max", "FPS + graph" },
-+        [&emuenv] {
-+            const std::lock_guard<std::mutex> lock(quick_menu_mutex);
-+            return emuenv.cfg.performance_overlay ? emuenv.cfg.performance_overlay_detail + 1 : 0;
-+        },
-+        [change](int value) {
-+            change([value](Config &cfg) {
-+                cfg.performance_overlay = value > 0;
-+                if (value > 0)
-+                    cfg.performance_overlay_detail = value - 1;
-+            });
-+        } });
-+    settings.push_back({ "FPS position", { "Top left", "Top centre", "Top right", "Bottom left", "Bottom centre", "Bottom right" },
-+        [&emuenv] {
-+            const std::lock_guard<std::mutex> lock(quick_menu_mutex);
-+            return emuenv.cfg.performance_overlay_position;
-+        },
-+        [change](int value) { change([value](Config &cfg) { cfg.performance_overlay_position = value; }); } });
-+
-+    std::vector<std::string> volumes;
-+    for (int volume = 0; volume <= 100; volume += 10)
-+        volumes.push_back(std::to_string(volume) + "%");
-+    settings.push_back({ "Volume", volumes,
-+        [&emuenv] {
-+            const std::lock_guard<std::mutex> lock(quick_menu_mutex);
-+            return (emuenv.cfg.audio_volume + 5) / 10;
-+        },
-+        [change](int value) { change([value](Config &cfg) { cfg.audio_volume = value * 10; }); } });
-+
-+    // How the 960x544 picture is scaled to the TV (FSR: AMD's upscaler, on the GPU)
-+    static const std::vector<std::string> filters = { "Bilinear", "Nearest", "Bicubic", "FXAA", "FSR" };
-+    settings.push_back({ "Screen filter", filters,
-+        [&emuenv] {
-+            const std::lock_guard<std::mutex> lock(quick_menu_mutex);
-+            const auto it = std::find(filters.begin(), filters.end(), emuenv.cfg.screen_filter);
-+            return it == filters.end() ? 0 : static_cast<int>(it - filters.begin());
-+        },
-+        [change](int value) { change([value](Config &cfg) { cfg.screen_filter = filters[value]; }); } });
-+
-+    // Rendering above the Vita's resolution: sharper on the TV, more work for the GPU
-+    static const float multipliers[] = { 1.0f, 1.5f, 2.0f };
-+    settings.push_back({ "Resolution (next start)", { "960x544", "1440x816", "1920x1088" },
-+        [&emuenv] {
-+            const std::lock_guard<std::mutex> lock(quick_menu_mutex);
-+            int best = 0;
-+            for (int i = 0; i < 3; i++) {
-+                if (std::abs(emuenv.cfg.resolution_multiplier - multipliers[i]) < std::abs(emuenv.cfg.resolution_multiplier - multipliers[best]))
-+                    best = i;
-+            }
-+            return best;
-+        },
-+        [change](int value) { change([value](Config &cfg) { cfg.resolution_multiplier = multipliers[value]; }); } });
-+
-+    // In the background: no stutter while a new shader compiles, the thing it draws shows up a
-+    // little later; before drawing: everything right away, with a stutter
-+    settings.push_back({ "Shader compiling", { "In the background", "Before drawing" },
-+        [&emuenv] {
-+            const std::lock_guard<std::mutex> lock(quick_menu_mutex);
-+            return emuenv.cfg.async_pipeline_compilation ? 0 : 1;
-+        },
-+        [change](int value) { change([value](Config &cfg) { cfg.async_pipeline_compilation = value == 0; }); } });
-+
-+    // How the texture cache sees a texture change: hashing its data at every use (Vita3K's
-+    // default, the render thread's time), or write-protecting the big ones (faster; a game that
-+    // changes textures in ways that aren't caught shows old ones)
-+    settings.push_back({ "Texture checks (next start)", { "Hash each use", "Watch writes" },
-+        [&emuenv] {
-+            const std::lock_guard<std::mutex> lock(quick_menu_mutex);
-+            return emuenv.cfg.hashless_texture_cache ? 1 : 0;
-+        },
-+        [change](int value) { change([value](Config &cfg) { cfg.hashless_texture_cache = value == 1; }); } });
-+
-+    overlay::set_pause_menu_settings(std::move(settings));
++// vita3k.prev.log to vita3k.game.log when it's a game's run (it has "Game started:")
++void keep_game_log(const fs::path &log_dir) {
++    const fs::path prev = log_dir / "vita3k.prev.log";
++    std::ifstream in(prev.c_str(), std::ios::binary);
++    if (!in)
++        return;
++    std::string line;
++    bool game = false;
++    while (!game && std::getline(in, line))
++        game = line.find("Game started:") != std::string::npos;
++    in.close();
++    if (!game)
++        return;
++    boost::system::error_code ec;
++    fs::copy_file(prev, log_dir / "vita3k.game.log", fs::copy_options::overwrite_existing, ec);
 +}
 +
 +EmuEnvState *crash_emuenv = nullptr;
@@ -4088,6 +5009,16 @@ index 00000000..36b1d5d9
 +}
 +
 +} // namespace
++
++// The game's threads on the first Jaguar cluster (cores 0-3, which share their L2 cache) when
++// HENkaku > CPU > Game threads says so, else on all the app's cores like every other thread.
++// kernel/src/kernel.cpp calls it as each guest thread starts.
++extern "C" void ps4_place_guest_thread() {
++    if (!ps4settings::prefs().cluster_threads)
++        return;
++    using SetAffinityFn = int32_t (*)(OrbisPthread, uint64_t);
++    reinterpret_cast<SetAffinityFn>(&scePthreadSetaffinity)(scePthreadSelf(), 0x0F);
++}
 +
 +// The crash log's guest part (port/ps4_crashlog.cpp calls it after the host's): which app ran
 +extern "C" void ps4_crash_guest_info() {
@@ -4212,7 +5143,6 @@ index 00000000..36b1d5d9
 +
 +    trace("session: launching " + request.app_path);
 +    ps4perf::benchmark_large_pages();
-+    install_quick_menu(emuenv);
 +    if (!session.begin_launch(request, request.reason != AppLaunchReason::LoadExec))
 +        return "Couldn't find " + request.app_path + " among the installed apps";
 +    trace("session: renderer");
@@ -4222,6 +5152,7 @@ index 00000000..36b1d5d9
 +        trace("session: the renderer failed");
 +        return "The renderer couldn't start (Vulkan): see /data/Vita3K/vita3k.prev.log";
 +    }
++    emuenv.renderer->fsr_sharpening = ps4settings::fsr_sharpening(ps4settings::prefs().fsr_sharpness);
 +    trace("session: runtime");
 +    if (!session.initialize_runtime()) {
 +        session.stop(app::AppSessionStopReason::LaunchFailure);
@@ -4235,6 +5166,8 @@ index 00000000..36b1d5d9
 +        return "The game couldn't be loaded: see /data/Vita3K/vita3k.prev.log";
 +    }
 +    trace("session: running " + emuenv.current_app_title);
++    // L3 + R3: the HENkaku menu, with what can change now and this game's own settings
++    overlay::set_pause_menu({ "HENkaku", ps4settings::icon_path(), ps4settings::quick_menu(emuenv) });
 +    LOG_INFO("Game started: {} ({})", emuenv.current_app_title, request.app_path);
 +
 +    std::optional<AppLaunchRequest> pending = emuenv.take_app_launch_request();
@@ -4308,6 +5241,10 @@ index 00000000..36b1d5d9
 +    // The last run's log stays as vita3k.prev.log: after every game the app starts over, and the
 +    // game's log went with it (v00.07: why PCSE00003 didn't load)
 +    fs::rename(root_paths.get_log_path() / "vita3k.log", root_paths.get_log_path() / "vita3k.prev.log", ec);
++    // A game's run is kept apart as well, as vita3k.game.log until the next game: started again from
++    // the launcher, the app had rotated v00.14's game log away before it was read
++    keep_game_log(root_paths.get_log_path());
++    ps4settings::load_prefs();
 +    if (logging::init(root_paths, false) != Success)
 +        trace("logging could not start");
 +    LOG_INFO("Vita3K for PS4 {}", app_version);
@@ -5052,6 +5989,556 @@ index 00000000..16d557c9
 +void benchmark_large_pages();
 +
 +} // namespace ps4perf
+diff --git a/vita3k/ps4/ps4_settings.cpp b/vita3k/ps4/ps4_settings.cpp
+new file mode 100644
+index 00000000..bfa5f816
+--- /dev/null
++++ b/vita3k/ps4/ps4_settings.cpp
+@@ -0,0 +1,475 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// PS4: the HENkaku settings (ps4_settings.h).
++//
++// Vita3K keeps two sets: the global settings (config.yml: the Config members) and the running
++// game's (Config::current_config: the global ones with the game's custom config,
++// config/config_<app>.xml, over them). Config's assignment copies the global members only, so
++// a change is made on a CurrentConfig and saved the way Vita3K's own settings dialog does
++// (v00.14's quick menu changed the global members and saved a default current_config over them:
++// its changes vanished and config.yml lost two settings). Three scopes:
++// - all games, in the launcher: the global settings (there current_config is them);
++// - a game, in its LiveArea or in it: its custom config, made at its first change;
++// - in a game, what applies at once: app::commit_settings, saved where the game's settings come
++//   from (its custom config, else the global ones).
++
++#include "ps4_settings.h"
++
++#include <app/functions.h>
++#include <config/functions.h>
++#include <config/settings.h>
++#include <config/state.h>
++#include <emuenv/state.h>
++#include <io/state.h>
++#include <renderer/state.h>
++#include <util/fs.h>
++#include <util/log.h>
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <string>
++
++namespace ps4settings {
++
++namespace {
++
++const char *const PREFS_FILE = "/data/Vita3K/ps4.cfg";
++const float SHARPENING_STOPS[] = { 0.0f, 0.2f, 0.5f, 1.0f, 2.0f };
++
++// Every read and change of the settings: the in-game menu reads them on the render thread while
++// a change replaces them on the overlay's input thread
++std::mutex settings_mutex;
++
++Prefs g_prefs;
++
++std::string trim(std::string s) {
++    while (!s.empty() && (s.back() == ' ' || s.back() == '\r' || s.back() == '\n' || s.back() == '\t'))
++        s.pop_back();
++    size_t start = 0;
++    while (start < s.size() && (s[start] == ' ' || s[start] == '\t'))
++        start++;
++    return s.substr(start);
++}
++
++// --- scopes: which settings a page shows and changes ---
++
++class Scope {
++public:
++    virtual ~Scope() = default;
++    virtual const Config::CurrentConfig &get() = 0;
++    virtual void change(const std::function<void(Config::CurrentConfig &)> &edit) = 0;
++};
++
++// All games, from the launcher: there emuenv.cfg.current_config is the global settings
++class GlobalScope : public Scope {
++public:
++    explicit GlobalScope(EmuEnvState &emuenv)
++        : emuenv(emuenv) {
++        config::set_current_config(emuenv.cfg, emuenv.config_path, {});
++    }
++    const Config::CurrentConfig &get() override { return emuenv.cfg.current_config; }
++    void change(const std::function<void(Config::CurrentConfig &)> &edit) override {
++        edit(emuenv.cfg.current_config);
++        // copies them to the global members, then writes config.yml
++        config::save_current_config(emuenv.cfg, emuenv.config_path, {}, false);
++    }
++
++private:
++    EmuEnvState &emuenv;
++};
++
++// One game's own settings: the global ones with its custom config over them, saved in its custom
++// config (made at the first change)
++class GameScope : public Scope {
++public:
++    GameScope(EmuEnvState &emuenv, std::string app_path)
++        : emuenv(emuenv)
++        , app_path(std::move(app_path)) {
++        reload();
++    }
++    const Config::CurrentConfig &get() override { return current; }
++    void change(const std::function<void(Config::CurrentConfig &)> &edit) override {
++        edit(current);
++        config::save_custom_config(current, emuenv.config_path, app_path);
++    }
++    bool custom() const { return config::has_custom_config(emuenv.config_path, app_path); }
++    void use_global() {
++        config::delete_custom_config(emuenv.config_path, app_path);
++        reload();
++    }
++
++private:
++    void reload() {
++        Config cfg;
++        cfg = emuenv.cfg; // the global members
++        config::set_current_config(cfg, emuenv.config_path, app_path);
++        current = cfg.current_config;
++    }
++
++    EmuEnvState &emuenv;
++    std::string app_path;
++    Config::CurrentConfig current;
++};
++
++// The running game, what applies at once: Vita3K's settings commit (applied, then saved where
++// the game's settings come from)
++class LiveScope : public Scope {
++public:
++    explicit LiveScope(EmuEnvState &emuenv)
++        : emuenv(emuenv) {}
++    const Config::CurrentConfig &get() override { return emuenv.cfg.current_config; }
++    void change(const std::function<void(Config::CurrentConfig &)> &edit) override {
++        Config desired;
++        desired = emuenv.cfg; // the global members; current_config isn't copied
++        desired.current_config = emuenv.cfg.current_config;
++        edit(desired.current_config);
++        const std::string &app_path = emuenv.io.app_path;
++        const bool custom = config::has_custom_config(emuenv.config_path, app_path);
++        app::commit_settings(emuenv, desired, custom ? app_path : std::string());
++    }
++
++private:
++    EmuEnvState &emuenv;
++};
++
++// --- lines ---
++
++Item section(std::string name) {
++    Item item;
++    item.type = Item::kind::section;
++    item.name = std::move(name);
++    return item;
++}
++
++Item page(std::string name, std::vector<Item> items, std::string note = {}) {
++    Item item;
++    item.type = Item::kind::page;
++    item.name = std::move(name);
++    item.note = std::move(note);
++    item.items = std::move(items);
++    return item;
++}
++
++Item action(std::string name, std::function<void()> run) {
++    Item item;
++    item.type = Item::kind::action;
++    item.name = std::move(name);
++    item.run = std::move(run);
++    return item;
++}
++
++template <typename T>
++int index_of(const std::vector<T> &values, const T &value) {
++    const auto it = std::find(values.begin(), values.end(), value);
++    return it == values.end() ? 0 : static_cast<int>(it - values.begin());
++}
++
++int index_of(const std::vector<float> &values, float value) {
++    int best = 0;
++    for (int i = 0; i < static_cast<int>(values.size()); i++) {
++        if (std::abs(values[i] - value) < std::abs(values[best] - value))
++            best = i;
++    }
++    return best;
++}
++
++// A choice over a per-game setting (a CurrentConfig member), in a scope
++template <typename T>
++Item choice(const std::shared_ptr<Scope> &scope, std::string name, std::vector<std::string> labels, std::vector<T> values,
++    T Config::CurrentConfig::*member, std::string note = {}) {
++    Item item;
++    item.type = Item::kind::choice;
++    item.name = std::move(name);
++    item.note = std::move(note);
++    item.values = std::move(labels);
++    item.get = [scope, values, member] {
++        const std::lock_guard<std::mutex> lock(settings_mutex);
++        return index_of(values, scope->get().*member);
++    };
++    item.set = [scope, values, member](int index) {
++        const std::lock_guard<std::mutex> lock(settings_mutex);
++        scope->change([&](Config::CurrentConfig &cc) { cc.*member = values[index]; });
++    };
++    return item;
++}
++
++// A choice over a setting only the global settings have (a Config member), written to config.yml
++template <typename T>
++Item global_choice(EmuEnvState &emuenv, std::string name, std::vector<std::string> labels, std::vector<T> values,
++    T Config::*member, std::string note = {}) {
++    Item item;
++    item.type = Item::kind::choice;
++    item.name = std::move(name);
++    item.note = std::move(note);
++    item.values = std::move(labels);
++    item.get = [&emuenv, values, member] {
++        const std::lock_guard<std::mutex> lock(settings_mutex);
++        return index_of(values, emuenv.cfg.*member);
++    };
++    item.set = [&emuenv, values, member](int index) {
++        const std::lock_guard<std::mutex> lock(settings_mutex);
++        emuenv.cfg.*member = values[index];
++        config::serialize_config(emuenv.cfg, emuenv.cfg.config_path);
++    };
++    return item;
++}
++
++// A choice over one of the PS4 frontend's own settings (ps4.cfg)
++Item pref_choice(std::string name, std::vector<std::string> labels, std::function<int(const Prefs &)> get,
++    std::function<void(Prefs &, int)> set, std::string note = {}) {
++    Item item;
++    item.type = Item::kind::choice;
++    item.name = std::move(name);
++    item.note = std::move(note);
++    item.values = std::move(labels);
++    item.get = [get] {
++        const std::lock_guard<std::mutex> lock(settings_mutex);
++        return get(g_prefs);
++    };
++    item.set = [set](int index) {
++        const std::lock_guard<std::mutex> lock(settings_mutex);
++        set(g_prefs, index);
++        save_prefs();
++    };
++    return item;
++}
++
++// --- the settings, page by page ---
++
++const std::vector<std::string> FILTERS = { "Bilinear", "Nearest", "Bicubic", "FXAA", "FSR" };
++const std::vector<std::string> FILTER_NAMES = { "Bilinear", "Nearest", "Bicubic", "FXAA", "FSR 1" };
++
++// Vita3K's performance overlay: off, or its detail levels
++Item show_fps(EmuEnvState &emuenv) {
++    Item item;
++    item.type = Item::kind::choice;
++    item.name = "Show FPS";
++    item.values = { "Off", "FPS", "FPS + frame time", "FPS + min / avg / max", "FPS + graph" };
++    item.get = [&emuenv] {
++        const std::lock_guard<std::mutex> lock(settings_mutex);
++        return emuenv.cfg.performance_overlay ? std::clamp(emuenv.cfg.performance_overlay_detail + 1, 1, 4) : 0;
++    };
++    item.set = [&emuenv](int value) {
++        const std::lock_guard<std::mutex> lock(settings_mutex);
++        emuenv.cfg.performance_overlay = value > 0;
++        if (value > 0)
++            emuenv.cfg.performance_overlay_detail = value - 1;
++        config::serialize_config(emuenv.cfg, emuenv.cfg.config_path);
++        app::sync_perf_overlay_config(emuenv);
++    };
++    return item;
++}
++
++Item fsr_sharpness(EmuEnvState &emuenv) {
++    return pref_choice("FSR 1 sharpness", { "Sharpest", "Sharp (Vita3K's)", "Medium", "Soft", "Softest" },
++        [](const Prefs &p) { return p.fsr_sharpness; },
++        [&emuenv](Prefs &p, int value) {
++            p.fsr_sharpness = value;
++            if (emuenv.renderer)
++                emuenv.renderer->fsr_sharpening = fsr_sharpening(value);
++        });
++}
++
++std::vector<Item> display_items(EmuEnvState &emuenv, const std::shared_ptr<Scope> &scope, bool global) {
++    std::vector<Item> items;
++    if (global) {
++        items.push_back(section("Performance overlay"));
++        items.push_back(show_fps(emuenv));
++        items.push_back(global_choice<int>(emuenv, "FPS position", { "Top left", "Top centre", "Top right", "Bottom left", "Bottom centre", "Bottom right" }, { 0, 1, 2, 3, 4, 5 }, &Config::performance_overlay_position));
++    }
++    items.push_back(section("Picture"));
++    items.push_back(choice<std::string>(scope, "Screen filter", FILTER_NAMES, FILTERS, &Config::CurrentConfig::screen_filter));
++    if (global)
++        items.push_back(fsr_sharpness(emuenv));
++    items.push_back(choice<int>(scope, "Texture filtering", { "Standard", "2x anisotropic", "4x anisotropic", "8x anisotropic", "16x anisotropic" }, { 1, 2, 4, 8, 16 }, &Config::CurrentConfig::anisotropic_filtering));
++    return items;
++}
++
++std::vector<Item> graphics_items(EmuEnvState &emuenv, const std::shared_ptr<Scope> &scope, bool global, const std::string &next_start) {
++    std::vector<Item> items;
++    items.push_back(section("Rendering"));
++    items.push_back(choice<float>(scope, "Resolution", { "960x544 (1x)", "1440x816 (1.5x)", "1920x1088 (2x)" }, { 1.0f, 1.5f, 2.0f }, &Config::CurrentConfig::resolution_multiplier, next_start));
++    items.push_back(choice<bool>(scope, "GPU accuracy", { "Standard", "High" }, { false, true }, &Config::CurrentConfig::high_accuracy, next_start));
++    // Vita3K's "disable surface sync", the other way round
++    items.push_back(choice<bool>(scope, "Frame read-back", { "Off (faster)", "On (for games that read their frames)" }, { true, false }, &Config::CurrentConfig::disable_surface_sync));
++    items.push_back(section("Shaders and textures"));
++    items.push_back(choice<bool>(scope, "Shader compiling", { "In the background", "Before drawing" }, { true, false }, &Config::CurrentConfig::async_pipeline_compilation));
++    if (global)
++        items.push_back(global_choice<bool>(emuenv, "Texture checks", { "Hash each use", "Watch writes" }, { false, true }, &Config::hashless_texture_cache, next_start));
++    items.push_back(section("Frame rate"));
++    // a game that waits for two vblanks a frame (30 fps) waits for one
++    items.push_back(choice<bool>(scope, "FPS hack (30 to 60)", { "Off", "On" }, { false, true }, &Config::CurrentConfig::fps_hack));
++    return items;
++}
++
++std::vector<Item> audio_items(const std::shared_ptr<Scope> &scope, const std::string &next_start) {
++    std::vector<std::string> labels;
++    std::vector<int> volumes;
++    for (int volume = 0; volume <= 100; volume += 10) {
++        labels.push_back(std::to_string(volume) + "%");
++        volumes.push_back(volume);
++    }
++    std::vector<Item> items;
++    items.push_back(choice<int>(scope, "Volume", labels, volumes, &Config::CurrentConfig::audio_volume));
++    items.push_back(choice<bool>(scope, "NGS (the Vita's audio engine)", { "On", "Off" }, { true, false }, &Config::CurrentConfig::ngs_enable, next_start));
++    return items;
++}
++
++std::vector<Item> cpu_items(const std::shared_ptr<Scope> &scope, bool global, const std::string &next_start) {
++    std::vector<Item> items;
++    items.push_back(choice<bool>(scope, "CPU optimisations", { "On (fast)", "Off (accurate, slow)" }, { true, false }, &Config::CurrentConfig::cpu_opt, next_start));
++    if (global) {
++        items.push_back(pref_choice("Game threads", { "On all cores", "On one cluster" },
++            [](const Prefs &p) { return p.cluster_threads ? 1 : 0; },
++            [](Prefs &p, int value) { p.cluster_threads = value == 1; }, next_start));
++    }
++    return items;
++}
++
++} // namespace
++
++Prefs &prefs() {
++    return g_prefs;
++}
++
++void load_prefs() {
++    FILE *f = std::fopen(PREFS_FILE, "r");
++    if (!f)
++        return;
++    char line[256];
++    while (std::fgets(line, sizeof(line), f)) {
++        const std::string text = line;
++        const size_t eq = text.find('=');
++        if (eq == std::string::npos)
++            continue;
++        const std::string key = trim(text.substr(0, eq));
++        const std::string value = trim(text.substr(eq + 1));
++        if (key == "home")
++            g_prefs.bubbles = value != "list";
++        else if (key == "fsr-sharpness")
++            g_prefs.fsr_sharpness = std::clamp(std::atoi(value.c_str()), 0, static_cast<int>(std::size(SHARPENING_STOPS)) - 1);
++        else if (key == "game-threads")
++            g_prefs.cluster_threads = value == "cluster";
++    }
++    std::fclose(f);
++}
++
++void save_prefs() {
++    FILE *f = std::fopen(PREFS_FILE, "w");
++    if (!f) {
++        LOG_WARN("PS4: couldn't write {}", PREFS_FILE);
++        return;
++    }
++    std::fprintf(f, "# Vita3K for PS4: the frontend's own settings (HENkaku > System, Display, CPU)\n");
++    std::fprintf(f, "home = %s\n", g_prefs.bubbles ? "bubbles" : "list");
++    std::fprintf(f, "fsr-sharpness = %d\n", g_prefs.fsr_sharpness);
++    std::fprintf(f, "game-threads = %s\n", g_prefs.cluster_threads ? "cluster" : "all");
++    std::fclose(f);
++}
++
++float fsr_sharpening(int index) {
++    return SHARPENING_STOPS[std::clamp(index, 0, static_cast<int>(std::size(SHARPENING_STOPS)) - 1)];
++}
++
++std::string icon_path() {
++    return "/app0/icons/henkaku.png";
++}
++
++std::vector<Item> global_pages(EmuEnvState &emuenv) {
++    const auto scope = std::make_shared<GlobalScope>(emuenv);
++    const std::string next_start = "next start";
++    std::vector<Item> pages;
++    pages.push_back(section("All games"));
++    pages.push_back(page("Display", display_items(emuenv, scope, true), "FPS, filters, FSR 1"));
++    pages.push_back(page("Graphics", graphics_items(emuenv, scope, true, next_start), "resolution, accuracy"));
++    pages.push_back(page("Audio", audio_items(scope, next_start), "volume"));
++    pages.push_back(page("CPU", cpu_items(scope, true, next_start), "dynarmic, cores"));
++
++    std::vector<Item> system;
++    system.push_back(section("Home screen"));
++    system.push_back(pref_choice("Style", { "PS Vita (bubbles)", "Vita3K (list)" },
++        [](const Prefs &p) { return p.bubbles ? 0 : 1; },
++        [](Prefs &p, int value) { p.bubbles = value == 0; }));
++    system.push_back(section("Buttons"));
++    system.push_back(global_choice<int>(emuenv, "Enter button (games)", { "Cross", "Circle" },
++        { static_cast<int>(SCE_SYSTEM_PARAM_ENTER_BUTTON_CROSS), static_cast<int>(SCE_SYSTEM_PARAM_ENTER_BUTTON_CIRCLE) },
++        &Config::sys_button, next_start));
++    pages.push_back(section("PS4"));
++    pages.push_back(page("System", std::move(system), "home screen, buttons"));
++    return pages;
++}
++
++std::vector<Item> game_pages(EmuEnvState &emuenv, const std::string &app_path) {
++    const auto scope = std::make_shared<GameScope>(emuenv, app_path);
++    const std::string next_start = "next start";
++    std::vector<Item> pages;
++    pages.push_back(section("This game"));
++    pages.push_back(page("Display", display_items(emuenv, scope, false), "filters"));
++    pages.push_back(page("Graphics", graphics_items(emuenv, scope, false, next_start), "resolution, accuracy"));
++    pages.push_back(page("Audio", audio_items(scope, next_start), "volume"));
++    pages.push_back(page("CPU", cpu_items(scope, false, next_start), "dynarmic"));
++    pages.push_back(section("Saved in config/config_" + app_path + ".xml"));
++    pages.push_back(action("Use the settings of all games", [scope] {
++        const std::lock_guard<std::mutex> lock(settings_mutex);
++        scope->use_global();
++    }));
++    return pages;
++}
++
++std::vector<Item> quick_menu(EmuEnvState &emuenv) {
++    const auto live = std::make_shared<LiveScope>(emuenv);
++    const std::string next_start = "next start";
++    std::vector<Item> items;
++
++    std::vector<Item> display;
++    display.push_back(section("Performance overlay"));
++    display.push_back(show_fps(emuenv));
++    display.push_back(global_choice<int>(emuenv, "FPS position", { "Top left", "Top centre", "Top right", "Bottom left", "Bottom centre", "Bottom right" }, { 0, 1, 2, 3, 4, 5 }, &Config::performance_overlay_position));
++    display.push_back(section("Picture"));
++    display.push_back(choice<std::string>(live, "Screen filter", FILTER_NAMES, FILTERS, &Config::CurrentConfig::screen_filter));
++    display.push_back(fsr_sharpness(emuenv));
++    display.push_back(choice<int>(live, "Texture filtering", { "Standard", "2x anisotropic", "4x anisotropic", "8x anisotropic", "16x anisotropic" }, { 1, 2, 4, 8, 16 }, &Config::CurrentConfig::anisotropic_filtering));
++
++    std::vector<Item> sound;
++    std::vector<std::string> labels;
++    std::vector<int> volumes;
++    for (int volume = 0; volume <= 100; volume += 10) {
++        labels.push_back(std::to_string(volume) + "%");
++        volumes.push_back(volume);
++    }
++    sound.push_back(choice<int>(live, "Volume", labels, volumes, &Config::CurrentConfig::audio_volume));
++
++    std::vector<Item> speed;
++    speed.push_back(choice<bool>(live, "Shader compiling", { "In the background", "Before drawing" }, { true, false }, &Config::CurrentConfig::async_pipeline_compilation));
++    speed.push_back(choice<bool>(live, "FPS hack (30 to 60)", { "Off", "On" }, { false, true }, &Config::CurrentConfig::fps_hack));
++
++    items.push_back(section("Now"));
++    items.push_back(page("Display", std::move(display), "FPS, filters, FSR 1"));
++    items.push_back(page("Audio", std::move(sound), "volume"));
++    items.push_back(page("Speed", std::move(speed), "shaders, FPS hack"));
++    items.push_back(section("From the next start"));
++    if (!emuenv.io.app_path.empty())
++        items.push_back(page("This game", game_pages(emuenv, emuenv.io.app_path), "its own settings"));
++    return items;
++}
++
++} // namespace ps4settings
+diff --git a/vita3k/ps4/ps4_settings.h b/vita3k/ps4/ps4_settings.h
+new file mode 100644
+index 00000000..c8f9da44
+--- /dev/null
++++ b/vita3k/ps4/ps4_settings.h
+@@ -0,0 +1,63 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// PS4: the HENkaku settings, the same pages in the launcher (the HENkaku bubble: all games; a
++// game's LiveArea: that game) and in a game's quick menu (L3 + R3): sections, choices, pages
++// within pages, as overlay::pause_menu_item (the in-game menu draws them itself, the launcher
++// with its canvas).
++
++#pragma once
++
++#include <overlay/pause_overlay.h>
++
++#include <string>
++#include <vector>
++
++struct EmuEnvState;
++
++namespace ps4settings {
++
++using Item = overlay::pause_menu_item;
++
++// The PS4 frontend's own settings, which Vita3K's config.yml has no place for
++// (/data/Vita3K/ps4.cfg, "key = value" lines)
++struct Prefs {
++    // the home screen: the PS Vita's bubbles, or Vita3K's list
++    bool bubbles = true;
++    // FSR 1's sharpening, an index into the choices (1: 0.2 stops, Vita3K's)
++    int fsr_sharpness = 1;
++    // the game's threads on the first four cores (one Jaguar cluster, sharing their L2 cache), or
++    // on all six like everything else
++    bool cluster_threads = false;
++};
++Prefs &prefs();
++void load_prefs();
++void save_prefs();
++// RCAS stops for an fsr_sharpness index
++float fsr_sharpening(int index);
++
++// All games' settings (config.yml, and ps4.cfg), as the launcher's HENkaku pages
++std::vector<Item> global_pages(EmuEnvState &emuenv);
++// One game's own settings (config/config_<app>.xml over the global ones), as its pages
++std::vector<Item> game_pages(EmuEnvState &emuenv, const std::string &app_path);
++// In a game: what applies at once, then the game's own settings for its next start
++std::vector<Item> quick_menu(EmuEnvState &emuenv);
++
++// The HENkaku icon (in the package)
++std::string icon_path();
++
++} // namespace ps4settings
 diff --git a/vita3k/ps4/ps4_stubs.c b/vita3k/ps4/ps4_stubs.c
 new file mode 100644
 index 00000000..c06ce988
@@ -5085,10 +6572,10 @@ index 00000000..c06ce988
 +}
 diff --git a/vita3k/ps4/ps4_wsi.cpp b/vita3k/ps4/ps4_wsi.cpp
 new file mode 100644
-index 00000000..efb158dc
+index 00000000..54fd7c7e
 --- /dev/null
 +++ b/vita3k/ps4/ps4_wsi.cpp
-@@ -0,0 +1,606 @@
+@@ -0,0 +1,619 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -5292,7 +6779,12 @@ index 00000000..efb158dc
 +    return VK_SUCCESS;
 +}
 +
-+VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice, VkSurfaceKHR, VkSurfaceCapabilitiesKHR *caps) {
++VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice physical, VkSurfaceKHR, VkSurfaceCapabilitiesKHR *caps) {
++    // the images are linear R8G8B8A8: storage too where the GPU writes such images from compute
++    // shaders (FSR's sharpening pass writes the swapchain image that way)
++    VkFormatProperties format_props{};
++    instance_fn<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties")(physical, VK_FORMAT_R8G8B8A8_UNORM, &format_props);
++    const bool storage = format_props.linearTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
 +    *caps = {};
 +    caps->minImageCount = 2;
 +    caps->maxImageCount = 3; // render into one while one is shown and one is queued
@@ -5304,6 +6796,8 @@ index 00000000..efb158dc
 +    caps->currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
 +    caps->supportedCompositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
 +    caps->supportedUsageFlags = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++    if (storage)
++        caps->supportedUsageFlags |= VK_IMAGE_USAGE_STORAGE_BIT;
 +    return VK_SUCCESS;
 +}
 +
@@ -5416,9 +6910,15 @@ index 00000000..efb158dc
 +        ici.arrayLayers = 1;
 +        ici.samples = VK_SAMPLE_COUNT_1_BIT;
 +        ici.tiling = VK_IMAGE_TILING_LINEAR;
-+        ici.usage = (info->imageUsage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) & ~VK_IMAGE_USAGE_STORAGE_BIT;
++        // storage as asked (FSR writes the image from a compute shader), else without it
++        ici.usage = info->imageUsage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 +        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 +        VkResult r = create_image(device, &ici, nullptr, &sc->images[i]);
++        if (r != VK_SUCCESS && (ici.usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
++            LOG_WARN("PS4 WSI: no storage swapchain images ({}), FSR can't work", static_cast<int>(r));
++            ici.usage &= ~VK_IMAGE_USAGE_STORAGE_BIT;
++            r = create_image(device, &ici, nullptr, &sc->images[i]);
++        }
 +        if (r != VK_SUCCESS) {
 +            LOG_ERROR("PS4 WSI: vkCreateImage failed: {}", static_cast<int>(r));
 +            free_swapchain(sc);
@@ -5743,6 +7243,32 @@ index 00000000..ced3b207
 +int ps4wsi_video_handle();
 +// Flips submitted by swapchains so far
 +unsigned long long ps4wsi_flip_count();
+diff --git a/vita3k/renderer/include/renderer/state.h b/vita3k/renderer/include/renderer/state.h
+index 65b81052..c999b5c1 100644
+--- a/vita3k/renderer/include/renderer/state.h
++++ b/vita3k/renderer/include/renderer/state.h
+@@ -99,6 +99,8 @@ struct State {
+     Backend current_backend;
+     FeatureState features;
+     float res_multiplier;
++    // FSR's sharpening pass (RCAS), in stops: 0 is the sharpest, each stop halves it
++    std::atomic<float> fsr_sharpening{ 0.2f };
+     bool disable_surface_sync;
+     bool stretch_the_display_area;
+     bool fullscreen_hd_res_pixel_perfect;
+diff --git a/vita3k/renderer/include/renderer/vulkan/state.h b/vita3k/renderer/include/renderer/vulkan/state.h
+index 1a5bc612..b18966ea 100644
+--- a/vita3k/renderer/include/renderer/vulkan/state.h
++++ b/vita3k/renderer/include/renderer/vulkan/state.h
+@@ -112,6 +112,8 @@ struct VKState : public renderer::State {
+     vkutil::Buffer default_buffer;
+ 
+     bool support_fsr = false;
++    // FSR with its 32-bit shaders (fsr_filter_*_f32.comp.spv): GPUs without 16-bit floats (the PS4's)
++    bool fsr_fp32 = false;
+     // support for the VK_KHR_uniform_buffer_standard_layout extension, needed for memory mapping and texture viewport
+     bool support_standard_layout = false;
+     bool support_rasterized_order_access = false;
 diff --git a/vita3k/renderer/src/batch.cpp b/vita3k/renderer/src/batch.cpp
 index 87e5a8e1..df46ea78 100644
 --- a/vita3k/renderer/src/batch.cpp
@@ -5898,7 +7424,7 @@ index ff6d0c5b..fc18359a 100644
  
          if (request == nullptr)
 diff --git a/vita3k/renderer/src/vulkan/renderer.cpp b/vita3k/renderer/src/vulkan/renderer.cpp
-index ed8c71ad..cad2e91a 100644
+index ed8c71ad..093208ad 100644
 --- a/vita3k/renderer/src/vulkan/renderer.cpp
 +++ b/vita3k/renderer/src/vulkan/renderer.cpp
 @@ -45,6 +45,12 @@
@@ -5951,7 +7477,22 @@ index ed8c71ad..cad2e91a 100644
  
  #ifdef __ANDROID__
          support_android_buffer_import &= SDL_GetAndroidSDKVersion() >= 26;
-@@ -1724,6 +1746,8 @@ renderer::VulkanDeviceInfo renderer::enumerate_vulkan_devices(const std::string
+@@ -945,6 +967,14 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
+         LOG_WARN("Failed to initialize Vulkan overlay renderer, overlays will be disabled");
+     }
+ 
++#ifdef __PS4__
++    // GCN 1.1 (the PS4's GPU) has no 16-bit floats, which the FSR shaders were built for: FSR 1's
++    // 32-bit path then (fsr_filter_*_f32.comp.spv), same picture
++    if (!support_fsr) {
++        support_fsr = true;
++        fsr_fp32 = true;
++    }
++#endif
+     support_fsr &= static_cast<bool>(screen_renderer.surface_capabilities.supportedUsageFlags & vk::ImageUsageFlagBits::eStorage);
+     // The FSR storage shaders write rgba8; BGRA8 swapchain views are not format-compatible.
+     support_fsr &= screen_renderer.surface_format.format == vk::Format::eR8G8B8A8Unorm;
+@@ -1724,6 +1754,8 @@ renderer::VulkanDeviceInfo renderer::enumerate_vulkan_devices(const std::string
              return info;
  
          dispatch.init(vk_get_instance_proc_addr);
@@ -5960,6 +7501,35 @@ index ed8c71ad..cad2e91a 100644
  #else
          dispatch.init();
  #endif
+diff --git a/vita3k/renderer/src/vulkan/screen_filters.cpp b/vita3k/renderer/src/vulkan/screen_filters.cpp
+index 192dba99..4ae1b08b 100644
+--- a/vita3k/renderer/src/vulkan/screen_filters.cpp
++++ b/vita3k/renderer/src/vulkan/screen_filters.cpp
+@@ -409,8 +409,11 @@ void FSRScreenFilter::init() {
+ 
+     fs::path builtin_shaders_path = screen.state.static_assets / "shaders-builtin/vulkan";
+ 
+-    const auto easu_shader_path = builtin_shaders_path / "fsr_filter_easu.comp.spv";
+-    const auto frcas_shader_path = builtin_shaders_path / "fsr_filter_rcas.comp.spv";
++    // the 32-bit shaders where the GPU has no 16-bit floats
++    const bool fp32 = screen.state.fsr_fp32;
++    const auto easu_shader_path = builtin_shaders_path / (fp32 ? "fsr_filter_easu_f32.comp.spv" : "fsr_filter_easu.comp.spv");
++    const auto frcas_shader_path = builtin_shaders_path / (fp32 ? "fsr_filter_rcas_f32.comp.spv" : "fsr_filter_rcas.comp.spv");
++    LOG_INFO("FSR 1 with its {}-bit shaders", fp32 ? 32 : 16);
+ 
+     easu_shader = vkutil::load_shader(screen.state.device, easu_shader_path);
+     rcas_shader = vkutil::load_shader(screen.state.device, frcas_shader_path);
+@@ -648,8 +651,8 @@ void FSRScreenFilter::render(bool is_pre_renderpass, vk::ImageView src_img, vk::
+     cmd_buffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout_rcas, 0, descriptor_sets[2 * screen.swapchain_image_idx + 1], {});
+     RcasConstant rcas_constant{
+         .offset = output_offset,
+-        // some default value for sharpening
+-        .sharpening = 0.2f
++        // stops: 0.2 by default, the frontend's setting where it has one
++        .sharpening = screen.state.fsr_sharpening.load(std::memory_order_relaxed)
+     };
+     cmd_buffer.pushConstants(pipeline_layout_rcas, vk::ShaderStageFlagBits::eCompute, 0, sizeof(RcasConstant), &rcas_constant);
+     cmd_buffer.dispatch(dispatch_x, dispatch_y, 1);
 diff --git a/vita3k/shader/include/shader/spirv_recompiler.h b/vita3k/shader/include/shader/spirv_recompiler.h
 index f93de644..cbe7d451 100644
 --- a/vita3k/shader/include/shader/spirv_recompiler.h
@@ -6090,6 +7660,563 @@ index e9f0e42f..6effc570 100644
  
      // If true
      const usse::USSEBlockNode &content_block = *(loop.content_block());
+diff --git a/vita3k/shaders-builtin/vulkan/fsr_filter_easu_f32.comp b/vita3k/shaders-builtin/vulkan/fsr_filter_easu_f32.comp
+new file mode 100644
+index 00000000..34435bae
+--- /dev/null
++++ b/vita3k/shaders-builtin/vulkan/fsr_filter_easu_f32.comp
+@@ -0,0 +1,73 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#version 450
++// FSR 1's 32-bit path (FsrEasuF): GPUs without 16-bit floats, such as the PS4's GCN 1.1, where
++// the half-precision fsr_filter_easu.comp can't run
++#extension GL_ARB_separate_shader_objects : enable
++#extension GL_ARB_shading_language_420pack : enable
++#extension GL_GOOGLE_include_directive : enable
++
++layout(push_constant) uniform viewport
++{
++	uvec2 offset;
++	uvec2 dim;
++	uvec2 texture_dim;
++	uvec2 output_dim;
++};
++
++uvec4 con0;
++uvec4 con1;
++uvec4 con2;
++uvec4 con3;
++
++#define A_GPU 1
++#define A_GLSL 1
++
++#include "../../../external/GPUOpen/ffx_a.h"
++layout(set=0,binding=1) uniform texture2D InputTexture;
++layout(set=0,binding=2,rgba8) uniform image2D OutputTexture;
++layout(set=0,binding=3) uniform sampler InputSampler;
++#define FSR_EASU_F 1
++AF4 FsrEasuRF(AF2 p) { return textureGather(sampler2D(InputTexture,InputSampler), p, 0); }
++AF4 FsrEasuGF(AF2 p) { return textureGather(sampler2D(InputTexture,InputSampler), p, 1); }
++AF4 FsrEasuBF(AF2 p) { return textureGather(sampler2D(InputTexture,InputSampler), p, 2); }	
++
++#include "../../../external/GPUOpen/ffx_fsr1.h"
++
++void CurrFilter(AU2 pos)
++{
++	AF3 c;
++	FsrEasuF(c, pos, con0, con1, con2, con3);
++	imageStore(OutputTexture, ASU2(pos), AF4(c, 1));
++}
++
++layout(local_size_x=64) in;
++void main()
++{
++	FsrEasuConOffset(con0, con1, con2, con3, dim.x, dim.y, texture_dim.x, texture_dim.y, output_dim.x, output_dim.y, offset.x, offset.y);
++	// Do remapping of local xy in workgroup for a more PS-like swizzle pattern.
++	AU2 gxy = ARmp8x8(gl_LocalInvocationID.x) + AU2(gl_WorkGroupID.x << 4u, gl_WorkGroupID.y << 4u);
++	CurrFilter(gxy);
++	gxy.x += 8u;
++	CurrFilter(gxy);
++	gxy.y += 8u;
++	CurrFilter(gxy);
++	gxy.x -= 8u;
++	CurrFilter(gxy);
++}
++
+diff --git a/vita3k/shaders-builtin/vulkan/fsr_filter_easu_f32.comp.spv b/vita3k/shaders-builtin/vulkan/fsr_filter_easu_f32.comp.spv
+new file mode 100644
+index 0000000000000000000000000000000000000000..797a63bb098166b053d15fe8e9f97ea997e8368d
+GIT binary patch
+literal 41440
+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
+TUVrU=XFigCt;v41=e+noKTvQ;
+
+literal 0
+HcmV?d00001
+
+diff --git a/vita3k/shaders-builtin/vulkan/fsr_filter_rcas_f32.comp b/vita3k/shaders-builtin/vulkan/fsr_filter_rcas_f32.comp
+new file mode 100644
+index 00000000..8c5cf9a8
+--- /dev/null
++++ b/vita3k/shaders-builtin/vulkan/fsr_filter_rcas_f32.comp
+@@ -0,0 +1,67 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#version 450
++// FSR 1's 32-bit path (FsrRcasF): GPUs without 16-bit floats, such as the PS4's GCN 1.1, where
++// the half-precision fsr_filter_rcas.comp can't run
++#extension GL_ARB_separate_shader_objects : enable
++#extension GL_ARB_shading_language_420pack : enable
++#extension GL_GOOGLE_include_directive : enable
++
++layout(push_constant) uniform viewport
++{
++	uvec2 offset;
++	float sharpening;
++};
++
++uvec4 con0;
++
++#define A_GPU 1
++#define A_GLSL 1
++
++#include "../../../external/GPUOpen/ffx_a.h"
++layout(set=0,binding=1) uniform texture2D InputTexture;
++layout(set=0,binding=2,rgba8) uniform image2D OutputTexture;
++layout(set=0,binding=3) uniform sampler InputSampler;
++#define FSR_RCAS_F
++AF4 FsrRcasLoadF(ASU2 p) { return texelFetch(sampler2D(InputTexture,InputSampler), ASU2(p), 0); }
++void FsrRcasInputF(inout AF1 r,inout AF1 g,inout AF1 b){}
++
++#include "../../../external/GPUOpen/ffx_fsr1.h"
++
++void CurrFilter(AU2 pos)
++{
++	AF3 c;
++	FsrRcasF(c.r, c.g, c.b, pos, con0);
++	imageStore(OutputTexture, ASU2(pos) + ASU2(offset), AF4(c, 1));
++}
++
++layout(local_size_x=64) in;
++void main()
++{
++	FsrRcasCon(con0, sharpening);
++	// Do remapping of local xy in workgroup for a more PS-like swizzle pattern.
++	AU2 gxy = ARmp8x8(gl_LocalInvocationID.x) + AU2(gl_WorkGroupID.x << 4u, gl_WorkGroupID.y << 4u);
++	CurrFilter(gxy);
++	gxy.x += 8u;
++	CurrFilter(gxy);
++	gxy.y += 8u;
++	CurrFilter(gxy);
++	gxy.x -= 8u;
++	CurrFilter(gxy);
++}
++
+diff --git a/vita3k/shaders-builtin/vulkan/fsr_filter_rcas_f32.comp.spv b/vita3k/shaders-builtin/vulkan/fsr_filter_rcas_f32.comp.spv
+new file mode 100644
+index 0000000000000000000000000000000000000000..4abbff34c915685757be80648a5b1662da29dc2d
+GIT binary patch
+literal 20380
+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
+O&CKJmIk$RTYySs3e2P^7
+
+literal 0
+HcmV?d00001
+
 diff --git a/vita3k/util/src/logging.cpp b/vita3k/util/src/logging.cpp
 index 816c6297..9115c351 100644
 --- a/vita3k/util/src/logging.cpp

@@ -4,16 +4,18 @@
 in WSL Ubuntu with the M33 / Resonance / DolphinPS4 / Crema PS4 toolchain (clang 21 + libc++ 21 on
 OpenOrbis).
 
-Status: **v00.14**. On the console the launcher works (text, firmware download, installing a VPK),
+Status: **v00.15**. On the console the launcher works (text, firmware download, installing a VPK),
 PKGj runs (renderer on RADV, audio, dynarmic, the network), and Mortal Kombat (PCSE00023) plays:
 v00.12 fixed the GPU hang at the start of a fight by turning Vita3K's memory mapping off (see
 "Graphics" below). Its fights ran at 30 fps where the game wants 60 (slow motion); v00.13 (fast
-floating point in dynarmic, GPU trace mode off) brought them to 30-43. Its perf lines showed no
-thread at its limit: the game's main thread and render thread took about 12 ms of CPU each per
-frame, one after the other. v00.14 gives the guest memory 2 MiB pages and inlines the game's
-atomics (see "Guest memory" and "CPU"), times every import each game thread calls, and adds
-settings to the quick menu (L3 + R3: show FPS, volume, screen filter, resolution, ...). Remember
-to install each new package from `/data/pkg`.
+floating point in dynarmic, GPU trace mode off) brought them to 30-43, the game's main thread and
+render thread taking about 12 ms of CPU each per frame, one after the other. v00.14 gave the guest
+memory 2 MiB pages and inlined the game's atomics; its measurements were lost (two starts of the
+launcher rotated the game's log away), so v00.15 keeps the last game's log as `vita3k.game.log`.
+v00.15 is the PS Vita look: a home screen of bubbles with a LiveArea for each game (Vita3K's list
+stays, HENkaku > System > Style), the **HENkaku** settings for all games and for each game, the
+in-game HENkaku menu (L3 + R3) in sections and pages, and FSR 1 working on the PS4 (32-bit
+shaders) with a sharpness setting. Remember to install each new package from `/data/pkg`.
 
 ## Using it
 
@@ -27,19 +29,51 @@ to install each new package from `/data/pkg`.
    under `/data`), or on a USB drive. Vita3K installs `.vpk` and `.zip` archives, dumped game
    folders (with `sce_sys/param.sfo`), and `.pkg` files with a `.zrif` text file of the same name
    holding the zRIF (or their `.rif` license installed first).
-4. In the launcher press **Triangle**: the install screen opens on `/data/Vita3K/install`.
-   **Cross** installs the file picked (or opens a folder), **Square** installs everything in the
-   folder, **Circle** goes up, to the list of places: the install folder, the PS4's storage
-   (`/data`) and the USB drives. What installs from the install folder moves to `install/done/`;
-   anywhere else it stays.
-5. Back in the list (the game just installed is picked), press **Cross**.
+4. On the home screen open **Install** (or press **Triangle**): the install screen opens on
+   `/data/Vita3K/install`. **Cross** installs the file picked (or opens a folder), **Square**
+   installs everything in the folder, **Circle** goes up, to the list of places: the install
+   folder, the PS4's storage (`/data`) and the USB drives. What installs from the install folder
+   moves to `install/done/`; anywhere else it stays.
+5. Back home (the game just installed is picked), **Cross** opens its LiveArea, **Cross** again
+   starts it.
 
 A NoNpDrm dump (with `sce_sys/package/work.bin`) copied straight into
 `/data/Vita3K/fs/ux0/app/` is still encrypted; the first time it starts, the launcher decrypts it
 in place (as installing it would have) and installs its license. Installing it from the install
 screen instead is the same, from anywhere but Vita3K's own folders.
 
-In the launcher, L1 / R1 move a page at a time and OPTIONS quits.
+### The home screen
+
+As on a PS Vita: bubbles, ten to a page in rows of 3, 4 and 3, the pages one under another (the
+dots at the right). The D-pad or the left stick moves between them, L1 / R1 go a page up or down.
+
+| Bubble | Cross opens |
+|---|---|
+| **HENkaku** (the ensō) | the settings of all games |
+| **Install** | the install screen |
+| a game | its LiveArea: its background and start picture (`sce_sys/livearea/contents`), **Cross** starts it, **Square** opens its own settings, **Circle** goes back |
+
+**Square** on a game's bubble opens its settings, **Triangle** the install screen, **OPTIONS** the
+HENkaku settings (Quit Vita3K is there too). Vita3K's list (HENkaku > System > Style) works as it
+did, Cross starting the game picked, with Square for its settings and OPTIONS for HENkaku.
+
+### HENkaku: the settings
+
+Pages within pages, with sections: **Display** (show FPS and where, screen filter, FSR 1's
+sharpness, texture filtering), **Graphics** (resolution, GPU accuracy, frame read-back, shader
+compiling, texture checks, the 30 to 60 FPS hack), **Audio** (volume, NGS), **CPU** (dynarmic's
+optimisations, the game's threads on one Jaguar cluster or all cores), **System** (the home
+screen's style, the games' enter button). Left / right or Cross change a setting, Circle goes back.
+
+- From the HENkaku bubble: **all games** (Vita3K's `config.yml`, and `ps4.cfg` for the PS4's own).
+- From a game (Square, or its LiveArea): **that game**, over all games' settings: saved in
+  `config/config_<game>.xml` from the first change; "Use the settings of all games" removes it.
+- In a game (**L3 + R3**): the HENkaku menu. Resume and Exit, the settings that change at once
+  (Display, Audio, Speed: show FPS, filter, FSR 1 sharpness, volume, shader compiling, FPS hack),
+  and **This game**: the game's own pages, for its next start (resolution, accuracy, ...).
+
+Settings marked "next start" apply when the game starts again (the app starts over after every
+game, so: Exit, then start it).
 
 | DualShock 4 | PS Vita |
 |---|---|
@@ -49,23 +83,9 @@ In the launcher, L1 / R1 move a page at a time and OPTIONS quits.
 | Touchpad click | SELECT |
 | Touchpad | front touch screen |
 | L2 / R2 / L3 / R3 | the PS TV's |
-| **L3 + R3** | the quick menu (pauses the game) |
+| **L3 + R3** | the HENkaku menu (pauses the game) |
 
-When a game ends (or Exit in the quick menu) the app restarts into the launcher.
-
-The quick menu (L3 + R3, Vita3K's pause menu with the PS4's settings): up / down picks a line,
-left / right (or Cross) changes a setting, Circle goes back to the game. The settings are saved
-in `config.yml`:
-
-| Setting | |
-|---|---|
-| Show FPS | off, FPS, + frame time, + min / avg / max, + graph (Vita3K's performance overlay) |
-| FPS position | the corner (or edge) it sits in |
-| Volume | 0-100% |
-| Screen filter | how the 960x544 picture is scaled to the TV: Bilinear, Nearest, Bicubic, FXAA, FSR |
-| Resolution (next start) | 960x544, 1440x816 or 1920x1088: sharper, more work for the GPU |
-| Shader compiling | in the background (no stutter; something new shows up a moment later) or before drawing |
-| Texture checks (next start) | hash each use (Vita3K's default) or watch writes (less work for the render thread; a game that changes a texture in a way that isn't caught shows the old one) |
+When a game ends (or Exit in the HENkaku menu) the app restarts into the launcher.
 
 ## On the console
 
@@ -74,9 +94,11 @@ in `config.yml`:
 | `/data/Vita3K/install` | where the install screen (Triangle) opens; `done/` afterwards |
 | `/data/Vita3K/cache/download/stopped` | there after Circle stopped the firmware download (Square starts it again) |
 | `/data/Vita3K/fs` | the Vita's file system: `ux0` (apps, saves), `vs0`/`os0`/`sa0`/`pd0` (firmware) |
-| `/data/Vita3K/config.yml` | Vita3K's settings |
+| `/data/Vita3K/config.yml` | Vita3K's settings: all games' |
+| `/data/Vita3K/config/config_<game>.xml` | a game's own settings (HENkaku, from the game) |
+| `/data/Vita3K/ps4.cfg` | the PS4's own: home screen style, FSR 1 sharpness, game threads |
 | `/data/Vita3K/cache` | shader cache; `download/`: the firmware while it downloads |
-| `/data/Vita3K` | `vita3k.log`, `boot-trace.log` (startup milestones), `crash.log` (appended to); the run before's are `vita3k.prev.log` and `boot-trace.prev.log` (the app starts over after every game, so a game's log is there) |
+| `/data/Vita3K` | `vita3k.log`, `boot-trace.log` (startup milestones), `crash.log` (appended to); the run before's are `vita3k.prev.log` and `boot-trace.prev.log` (the app starts over after every game, so a game's log is there), and the last game's run stays as `vita3k.game.log` |
 | `/data/Vita3K/trace-log` | an empty file there keeps Vita3K's trace and debug lines in the log (left out otherwise: thousands while a game loads, each a write to the file) |
 | `/app0` | the package: `eboot.bin`, `data/`, `shaders-builtin/`, `icons/`, `fonts/` |
 
@@ -94,7 +116,14 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
   console (`boot-trace.log` says which it got). The game runs in an `app::AppSessionController` session like
   the SDL frontend's. A session leaves threads, guest memory and the GPU device behind, so when the
   game ends the app restarts itself (`sceSystemServiceLoadExec`) back into the launcher; a game
-  starting another executable restarts into it the same way.
+  starting another executable restarts into it the same way. The home screen of bubbles, the
+  LiveArea and the HENkaku settings pages are drawn the same way (`ps4_launcher.cpp`); the
+  settings themselves are in `ps4_settings.cpp` as `overlay::pause_menu_item` pages, which the
+  in-game HENkaku menu (Vita3K's pause overlay, `overlay/src/pause_overlay.cpp`, now pages and
+  sections with an icon) draws on its own. A change is made the way Vita3K's settings dialog
+  makes it: all games' through `config::save_current_config`, a game's into its custom config,
+  in a game through `app::commit_settings` (v00.14's quick menu changed `Config`'s global members
+  and saved a default `current_config` over them, as `Config`'s assignment leaves that out).
 - **Graphics**: Vita3K's Vulkan renderer on DolphinPS4's RADV port, linked in. `ps4_wsi.cpp` (M33's
   WSI) adds `VK_EXT_headless_surface` and `VK_KHR_swapchain` on VideoOut (linear 1920x1080 images,
   GPU-side flips); the renderer gets its entry points from `ps4_vk_get_instance_proc_addr()` and
@@ -102,7 +131,14 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
   with it, shaders read guest memory through buffer device addresses, which ACO compiles to FLAT
   instructions on GFX7, and the PS4 kernel sets the FLAT apertures up for GNM (a PS4 PCSX2 port's
   first FLAT store hung the GPU; Mortal Kombat's fights hung it at a skinned model). Guest memory
-  then goes through descriptors, as on GPUs without buffer device addresses.
+  then goes through descriptors, as on GPUs without buffer device addresses. **FSR 1** (screen
+  filter): Vita3K offers it only with 16-bit floats in shaders, which GCN 1.1 lacks, and with a
+  swapchain a compute shader can write; on the PS4 it uses FSR 1's 32-bit path
+  (`shaders-builtin/vulkan/fsr_filter_*_f32.comp`, the same EASU and RCAS passes) and the WSI
+  gives its linear images storage use where the GPU can (else it says so in the log and FSR falls
+  back to bilinear). The sharpening (RCAS stops) is a setting. FSR 3 isn't possible here: its
+  upscaler and frame generation both need the game's motion vectors and depth, which a Vita game
+  doesn't give and Vita3K can't make.
 - **CPU**: dynarmic's x86-64 JIT (`patches/dynarmic-ps4.patch`). Only flexible memory can run code
   on the PS4 and there is a JIT per guest thread, so each 128 MiB code cache is a virtual range
   reservation committed in 256 KiB steps as code is emitted (system flexible memory, else regular),
@@ -188,6 +224,8 @@ Upload from Windows (Git Bash): `scripts/upload-to-console.sh out/Vita3K-vXX.YY.
 GPL-2.0-or-later, as Vita3K ([LICENSE](LICENSE)): the patches are modifications of Vita3K and
 dynarmic (0BSD). The PS4 runtime in `port/` and the toolchain scripts come from the M33 / Resonance /
 DolphinPS4 / Crema ports; `port/mesa/ac_ps4_drm.c` is the RADV winsys of the PS4 Mesa port (MIT).
+`assets/henkaku.png` (the HENkaku bubble's and menu's ensō) is drawn by
+`scripts/make-henkaku-icon.py`, in the manner of the HENkaku logo, not copied from it.
 `fonts/` is Roboto 3.009 (from Vita3K's Tracy submodule), under the SIL Open Font License 1.1
 (`fonts/OFL-Roboto.txt`).
 No PS Vita firmware, Sony system files or games are included: supply your own.
