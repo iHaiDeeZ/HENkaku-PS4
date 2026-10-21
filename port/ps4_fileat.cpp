@@ -53,8 +53,18 @@ bool resolve(int dirfd, const char* path, std::string& out) {
         errno = EFAULT;
         return false;
     }
-    if (dirfd == AT_FDCWD || path[0] == '/') {
+    if (path[0] == '/' || (dirfd == AT_FDCWD && !*path)) {
         out = path;
+        return true;
+    }
+    if (dirfd == AT_FDCWD) {
+        // The kernel turns relative names down (EINVAL, where elsewhere they'd simply not be
+        // there): Vita3K v00.03 died on Boost's status("ux0/app"). They're the working directory's.
+        char cwd[1024];
+        out = getcwd(cwd, sizeof(cwd)) ? cwd : "/";
+        if (out.empty() || out.back() != '/')
+            out += '/';
+        out += path;
         return true;
     }
     {

@@ -4,8 +4,9 @@
 in WSL Ubuntu with the M33 / Resonance / DolphinPS4 / Crema PS4 toolchain (clang 21 + libc++ 21 on
 OpenOrbis).
 
-Status: **v00.03**: v00.02 crashed at startup on the console (see "How the port works", file
-functions); v00.03 fixes that and downloads the firmware by itself. Not yet seen running.
+Status: **v00.04**. On the console v00.02 and v00.03 stopped at startup on file functions the PS4's
+C library lacks or does differently (see "How the port works", file functions); v00.04 fixes the
+second and adds the install screen. Not yet seen running.
 
 ## Using it
 
@@ -13,13 +14,20 @@ functions); v00.03 fixes that and downloads the firmware by itself. Not yet seen
 2. The first time, the launcher downloads the PS Vita firmware (3.74, 128 MiB) and font package
    (54 MiB) from Sony's update server and installs them. Circle stops the download (it carries on
    later, and doesn't start by itself again); Square starts it. Without a connection, copy Sony's
-   update files (`PSVUPDAT.PUP`, `PSP2UPDAT.PUP`) to `/data/Vita3K/install/` instead.
-3. Over FTP, copy games to **`/data/Vita3K/install/`**: `.vpk` or `.zip` archives, dumped game
-   folders (with `sce_sys/param.sfo`), or a `.pkg` with a `.zrif` text file of the same name
-   holding its zRIF (or its `.rif` license next to it).
-4. In the launcher press **Triangle**: everything there is installed, and what installed moves to
-   `install/done/`.
-5. Pick a game and press **Cross**.
+   update files (`PSVUPDAT.PUP`, `PSP2UPDAT.PUP`) to `/data/Vita3K/install/` and install them
+   like a game.
+3. Put games where the PS4 can see them: over FTP in **`/data/Vita3K/install/`** (or anywhere
+   under `/data`), or on a USB drive. Vita3K installs `.vpk` and `.zip` archives, dumped game
+   folders (with `sce_sys/param.sfo`), and `.pkg` files with a `.zrif` text file of the same name
+   holding the zRIF (or their `.rif` license installed first).
+4. In the launcher press **Triangle**: the install screen opens on `/data/Vita3K/install`.
+   **Cross** installs the file picked (or opens a folder), **Square** installs everything in the
+   folder, **Circle** goes up, to the list of places: the install folder, the PS4's storage
+   (`/data`) and the USB drives. What installs from the install folder moves to `install/done/`;
+   anywhere else it stays.
+5. Back in the list (the game just installed is picked), press **Cross**.
+
+In the launcher, L1 / R1 move a page at a time and OPTIONS quits.
 
 | DualShock 4 | PS Vita |
 |---|---|
@@ -37,7 +45,7 @@ When a game ends (or Exit in the pause menu) the app restarts into the launcher.
 
 | Path | What |
 |---|---|
-| `/data/Vita3K/install` | what the launcher installs (Triangle); `done/` afterwards |
+| `/data/Vita3K/install` | where the install screen (Triangle) opens; `done/` afterwards |
 | `/data/Vita3K/cache/download/stopped` | there after Circle stopped the firmware download (Square starts it again) |
 | `/data/Vita3K/fs` | the Vita's file system: `ux0` (apps, saves), `vs0`/`os0`/`sa0`/`pd0` (firmware) |
 | `/data/Vita3K/config.yml` | Vita3K's settings |
@@ -50,8 +58,10 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
 ## How the port works
 
 - **Frontend** (`vita3k/ps4/` in the patch): `ps4_main.cpp` replaces the Qt UI and the SDL window.
-  The launcher (`ps4_launcher.cpp`, `ps4_canvas.cpp`) is drawn by the CPU into VideoOut buffers
-  12-13 in the console's own fonts; the game runs in an `app::AppSessionController` session like
+  The launcher (`ps4_launcher.cpp`, `ps4_canvas.cpp`: the game list and the install screen, which
+  browses the install folder, `/data` and `/mnt/usbN`) is drawn by the CPU into VideoOut buffers
+  12-13 in the console's own fonts; whether it reached the screen is in `boot-trace.log`
+  (`launcher: screen ready`, `first frame`). The game runs in an `app::AppSessionController` session like
   the SDL frontend's. A session leaves threads, guest memory and the GPU device behind, so when the
   game ends the app restarts itself (`sceSystemServiceLoadExec`) back into the launcher; a game
   starting another executable restarts into it the same way.
@@ -82,8 +92,10 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
   `fchmodat` and `utimensat` only as stubs failing with ENOSYS, and the sysroot's Boost.Filesystem
   uses them for every status check and removal (v00.02 died at its first `create_directories`).
   Linker wraps implement them with `stat`, `lstat`, `open`, `unlink`, `rmdir`, `chmod` and `utimes`;
-  `openat` remembers which path each directory descriptor stands for. `statvfs` is wrapped too:
-  the C library's never fills in its result.
+  `openat` remembers which path each directory descriptor stands for. The kernel refuses relative
+  names (EINVAL, which Boost throws on, where elsewhere they'd just not be found: v00.03 died on
+  `status("ux0/app")`), so the wraps take them from the working directory. `statvfs` is wrapped
+  too: the C library's never fills in its result.
 - **Runtime** (`port/`, from M33): heap, crash and boot logs, profiler, DNS, the RADV winsys.
 
 ## Building

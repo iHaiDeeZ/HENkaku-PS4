@@ -1789,10 +1789,10 @@ index 00000000..01fdf0f1
 +} // namespace ps4download
 diff --git a/vita3k/ps4/ps4_launcher.cpp b/vita3k/ps4/ps4_launcher.cpp
 new file mode 100644
-index 00000000..a300ebf7
+index 00000000..da09606d
 --- /dev/null
 +++ b/vita3k/ps4/ps4_launcher.cpp
-@@ -0,0 +1,837 @@
+@@ -0,0 +1,1238 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -1810,12 +1810,12 @@ index 00000000..a300ebf7
 +// with this program; if not, write to the Free Software Foundation, Inc.,
 +// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 +
-+// PS4: the launcher, in place of the desktop's Qt window: the installed apps with their icons,
-+// and installing what the user copied to /data/Vita3K/install (the PS Vita firmware and font
-+// package .PUP files, .vpk/.zip archives, .pkg files with their zRIF or .rif license, dumped game
-+// folders). When the firmware or the font package isn't installed, it downloads them from Sony's
-+// update server first. Drawn by the CPU into VideoOut buffers 12-13, so it needs no Vulkan; the
-+// renderer's swapchain takes over the screen with its first flip.
++// PS4: the launcher, in place of the desktop's Qt window: the installed apps with their icons, and
++// an install browser (Triangle) over /data/Vita3K/install, the PS4's storage and USB drives: .vpk
++// and .zip archives, .pkg files with their zRIF or .rif license, dumped game folders, the PS Vita
++// firmware and font package .PUP files. When the firmware or the font package isn't installed, it
++// downloads them from Sony's update server first. Drawn by the CPU into VideoOut buffers 12-13, so
++// it needs no Vulkan; the renderer's swapchain takes over the screen with its first flip.
 +
 +#include "ps4_launcher.h"
 +
@@ -1832,6 +1832,7 @@ index 00000000..a300ebf7
 +#include <packages/functions.h>
 +#include <packages/license.h>
 +#include <packages/pkg.h>
++#include <packages/sfo.h>
 +#include <util/fs.h>
 +#include <util/log.h>
 +#include <util/string_utils.h>
@@ -1842,12 +1843,15 @@ index 00000000..a300ebf7
 +
 +#include <algorithm>
 +#include <atomic>
++#include <cctype>
 +#include <chrono>
 +#include <cstdint>
 +#include <cstring>
 +#include <functional>
++#include <iterator>
 +#include <map>
 +#include <mutex>
++#include <optional>
 +#include <thread>
 +
 +extern "C" {
@@ -1915,17 +1919,31 @@ index 00000000..a300ebf7
 +bool splash_hidden = false;
 +int current = 0;
 +
++// (in boot-trace.log as well: whether the launcher ever reached the screen)
++void screen_trace(const std::string &line) {
++    LOG_INFO("PS4 launcher: {}", line);
++    ps4_boot_trace(("launcher: " + line).c_str());
++}
++
 +bool setup_buffers() {
 +    if (registered)
 +        return true;
-+    const int video = ps4wsi_video_handle();
-+    if (video < 0)
++    static bool failed = false; // once: it doesn't get better
++    if (failed)
 +        return false;
++    const int video = ps4wsi_video_handle();
++    if (video < 0) {
++        screen_trace(fmt::format("no VideoOut ({:08X})", static_cast<uint32_t>(video)));
++        failed = true;
++        return false;
++    }
 +    off_t phys = 0;
 +    void *base = nullptr;
-+    if (ps4l_allocate_direct(0, static_cast<off_t>(ps4l_direct_memory_size()), 2 * BUFFER_SIZE, 2 << 20, WC_GARLIC, &phys) != 0
-+        || ps4l_map_direct(&base, 2 * BUFFER_SIZE, PROT_CPU_GPU_RW, 0, phys, 2 << 20) != 0) {
-+        LOG_ERROR("PS4 launcher: no direct memory for its screen");
++    const int32_t allocated = ps4l_allocate_direct(0, static_cast<off_t>(ps4l_direct_memory_size()), 2 * BUFFER_SIZE, 2 << 20, WC_GARLIC, &phys);
++    const int32_t mapped = allocated != 0 ? -1 : ps4l_map_direct(&base, 2 * BUFFER_SIZE, PROT_CPU_GPU_RW, 0, phys, 2 << 20);
++    if (allocated != 0 || mapped != 0) {
++        screen_trace(fmt::format("no direct memory for the screen ({:08X} {:08X})", static_cast<uint32_t>(allocated), static_cast<uint32_t>(mapped)));
++        failed = true;
 +        return false;
 +    }
 +    buffers[0] = static_cast<uint8_t *>(base);
@@ -1935,10 +1953,12 @@ index 00000000..a300ebf7
 +    sceVideoOutSetBufferAttribute(&attribute, ORBIS_VIDEO_OUT_PIXEL_FORMAT_A8B8G8R8_SRGB, ORBIS_VIDEO_OUT_TILING_MODE_LINEAR, 0, W, H, W);
 +    const int set = sceVideoOutRegisterBuffers(video, ps4wsi::LAUNCHER_FIRST_BUFFER, addresses, 2, &attribute);
 +    if (set < 0) {
-+        LOG_ERROR("PS4 launcher: sceVideoOutRegisterBuffers failed: {:08X}", static_cast<uint32_t>(set));
++        screen_trace(fmt::format("sceVideoOutRegisterBuffers failed: {:08X}", static_cast<uint32_t>(set)));
++        failed = true;
 +        return false;
 +    }
 +    registered = true;
++    screen_trace(fmt::format("screen ready (VideoOut {}, buffers {}-{})", video, ps4wsi::LAUNCHER_FIRST_BUFFER, ps4wsi::LAUNCHER_FIRST_BUFFER + 1));
 +    return true;
 +}
 +
@@ -1947,8 +1967,9 @@ index 00000000..a300ebf7
 +        return;
 +    std::memcpy(buffers[current], canvas.data(), static_cast<size_t>(W) * H * 4);
 +    __atomic_thread_fence(__ATOMIC_SEQ_CST); // write-combined stores out before the flip
-+    sceVideoOutSubmitFlip(ps4wsi_video_handle(), ps4wsi::LAUNCHER_FIRST_BUFFER + current, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0);
++    const int flip = sceVideoOutSubmitFlip(ps4wsi_video_handle(), ps4wsi::LAUNCHER_FIRST_BUFFER + current, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0);
 +    if (!splash_hidden) {
++        screen_trace(fmt::format("first frame (flip {:08X})", static_cast<uint32_t>(flip)));
 +        // the system shows the app's splash picture until the app has one of its own
 +        sceSystemServiceHideSplashScreen();
 +        splash_hidden = true;
@@ -1985,25 +2006,48 @@ index 00000000..a300ebf7
 +    c.fill_rect(MARGIN, 172, W - 2 * MARGIN, 2, rgb(0xffffff, 28));
 +}
 +
-+void footer(Canvas &c, bool have_apps, bool firmware_missing) {
++enum class Pad {
++    Cross,
++    Circle,
++    Square,
++    Triangle,
++    Options,
++};
++
++struct Hint {
++    Pad button;
++    std::string label;
++};
++
++// What the buttons do on this screen, left to right
++void footer(Canvas &c, const std::vector<Hint> &hints) {
 +    int x = MARGIN;
 +    const int y = 1024;
-+    if (have_apps) {
-+        c.cross_button(x + 20.f, y - 10.f, 20.f);
-+        x += 50;
-+        x += c.text(x, y, "Start", 30, TEXT) + 48;
++    for (const Hint &hint : hints) {
++        switch (hint.button) {
++        case Pad::Cross:
++            c.cross_button(x + 20.f, y - 10.f, 20.f);
++            x += 50;
++            break;
++        case Pad::Circle:
++            c.circle_button(x + 20.f, y - 10.f, 20.f);
++            x += 50;
++            break;
++        case Pad::Square:
++            c.square_button(x + 20.f, y - 10.f, 20.f);
++            x += 50;
++            break;
++        case Pad::Triangle:
++            c.triangle_button(x + 20.f, y - 10.f, 20.f);
++            x += 50;
++            break;
++        case Pad::Options:
++            c.pill_button(x, y - 10, "OPTIONS", 22);
++            x += c.text_width("OPTIONS", 22, Weight::Bold) + 40;
++            break;
++        }
++        x += c.text(x, y, hint.label, 30, TEXT) + 48;
 +    }
-+    c.triangle_button(x + 20.f, y - 10.f, 20.f);
-+    x += 50;
-+    x += c.text(x, y, "Install from /data/Vita3K/install", 30, TEXT) + 48;
-+    if (firmware_missing) {
-+        c.square_button(x + 20.f, y - 10.f, 20.f);
-+        x += 50;
-+        x += c.text(x, y, "Download firmware", 30, TEXT) + 48;
-+    }
-+    c.pill_button(x, y - 10, "OPTIONS", 22);
-+    x += c.text_width("OPTIONS", 22, Weight::Bold) + 40;
-+    c.text(x, y, "Quit", 30, TEXT);
 +}
 +
 +// --- the apps ---
@@ -2043,6 +2087,98 @@ index 00000000..a300ebf7
 +    c.text_centered(x + size / 2, y + size / 2 + size / 8, "?", size / 3, MUTED, Weight::Bold);
 +}
 +
++// --- what can be installed (the install browser's entries) ---
++
++enum class Kind {
++    Location, // where to look: the install folder, the PS4's storage, a USB drive
++    Folder,
++    GameFolder, // a dumped app: a folder with sce_sys/param.sfo
++    Archive, // .vpk, .zip
++    Package, // .pkg, with its zRIF
++    Update, // .pup: the firmware or the font package
++    License, // .rif, work.bin
++};
++
++struct Entry {
++    Kind kind;
++    std::string name;
++    fs::path path;
++    uint64_t size = 0;
++    int zrif = -1; // a package's: whether there's a .zrif file next to it (-1: not looked yet)
++};
++
++bool installable(Kind kind) {
++    return kind != Kind::Location && kind != Kind::Folder;
++}
++
++std::optional<Kind> file_kind(const fs::path &p) {
++    const std::string ext = string_utils::tolower(p.extension().string());
++    if (ext == ".vpk" || ext == ".zip")
++        return Kind::Archive;
++    if (ext == ".pkg")
++        return Kind::Package;
++    if (ext == ".pup")
++        return Kind::Update;
++    if (ext == ".rif" || p.filename() == "work.bin")
++        return Kind::License;
++    return std::nullopt;
++}
++
++// Where the browser looks first: the install folder, the PS4's storage, the USB drives plugged in
++std::vector<Entry> locations() {
++    std::vector<Entry> list{
++        { Kind::Location, "Install folder", INSTALL_DIR },
++        { Kind::Location, "PS4 storage", "/data" },
++    };
++    for (int i = 0; i < 8; i++) {
++        const fs::path usb = fmt::format("/mnt/usb{}", i);
++        boost::system::error_code ec;
++        if (fs::is_directory(usb, ec))
++            list.push_back({ Kind::Location, fmt::format("USB drive {}", i + 1), usb });
++    }
++    return list;
++}
++
++bool is_location(const fs::path &dir) {
++    const std::vector<Entry> list = locations();
++    return std::any_of(list.begin(), list.end(), [&](const Entry &e) { return e.path == dir; });
++}
++
++// A folder's subfolders, then what in it can be installed
++std::vector<Entry> list_folder(const fs::path &dir) {
++    std::vector<Entry> folders, files;
++    boost::system::error_code ec;
++    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
++        const fs::path p = it->path();
++        const std::string name = p.filename().string();
++        if (name.empty() || name[0] == '.')
++            continue;
++        boost::system::error_code entry_ec;
++        if (fs::is_directory(p, entry_ec)) {
++            const bool app = fs::exists(p / "sce_sys" / "param.sfo", entry_ec);
++            folders.push_back({ app ? Kind::GameFolder : Kind::Folder, name, p });
++        } else if (const auto kind = file_kind(p)) {
++            const auto size = fs::file_size(p, entry_ec);
++            files.push_back({ *kind, name, p, entry_ec ? 0 : static_cast<uint64_t>(size) });
++        }
++    }
++    const auto by_name = [](const Entry &a, const Entry &b) {
++        return string_utils::tolower(a.name) < string_utils::tolower(b.name);
++    };
++    std::sort(folders.begin(), folders.end(), by_name);
++    std::sort(files.begin(), files.end(), by_name);
++    folders.insert(folders.end(), files.begin(), files.end());
++    return folders;
++}
++
++std::string size_text(uint64_t bytes) {
++    if (bytes >= (1ull << 30))
++        return fmt::format("{:.1f} GB", bytes / static_cast<double>(1ull << 30));
++    if (bytes >= (1ull << 20))
++        return fmt::format("{} MB", bytes >> 20);
++    return fmt::format("{} KB", (bytes + 1023) >> 10);
++}
++
 +// --- installing ---
 +
 +struct InstallJob {
@@ -2060,8 +2196,9 @@ index 00000000..a300ebf7
 +    bool stoppable = false; // a download, which Circle stops
 +    bool stop_requested = false;
 +    bool stopped = false;
-+    std::vector<std::string> done; // what the firmware download installed
++    std::vector<std::string> done; // what was installed
 +    std::vector<std::string> failures;
++    std::string title_id; // the app installed last, which the list selects
 +};
 +
 +void reset(InstallJob &job, bool firmware) {
@@ -2076,6 +2213,7 @@ index 00000000..a300ebf7
 +    job.stoppable = job.stop_requested = job.stopped = false;
 +    job.done.clear();
 +    job.failures.clear();
++    job.title_id.clear();
 +}
 +
 +// install_pup, which throws when a file isn't what it expects: the firmware's version, or nothing
@@ -2105,34 +2243,29 @@ index 00000000..a300ebf7
 +    return {};
 +}
 +
-+void install_worker(EmuEnvState &emuenv, InstallJob &job) {
-+    const fs::path dir = INSTALL_DIR;
-+    const fs::path done_dir = dir / "done";
-+    std::vector<fs::path> licenses, pups, pkgs, archives, folders;
-+    boost::system::error_code ec;
-+    fs::create_directories(done_dir, ec);
-+    for (const auto &e : fs::directory_iterator(dir, ec)) {
-+        const fs::path &p = e.path();
-+        if (p.filename() == "done")
-+            continue;
-+        if (fs::is_directory(p)) {
-+            if (fs::exists(p / "sce_sys" / "param.sfo"))
-+                folders.push_back(p);
-+            continue;
-+        }
-+        const std::string ext = string_utils::tolower(p.extension().string());
-+        if (ext == ".rif" || p.filename() == "work.bin")
-+            licenses.push_back(p);
-+        else if (ext == ".pup")
-+            pups.push_back(p);
-+        else if (ext == ".pkg")
-+            pkgs.push_back(p);
-+        else if (ext == ".vpk" || ext == ".zip")
-+            archives.push_back(p);
++// Licenses first (the packages after them may need them), then updates, packages, archives, folders
++int install_order(Kind kind) {
++    switch (kind) {
++    case Kind::License: return 0;
++    case Kind::Update: return 1;
++    case Kind::Package: return 2;
++    case Kind::Archive: return 3;
++    default: return 4;
++    }
++}
++
++// Installs what the browser picked. consume: they're in the install folder, and what installs moves
++// into its done/ (with a package's .zrif file).
++void install_worker(EmuEnvState &emuenv, InstallJob &job, std::vector<Entry> list, bool consume) {
++    std::stable_sort(list.begin(), list.end(), [](const Entry &a, const Entry &b) { return install_order(a.kind) < install_order(b.kind); });
++    const fs::path done_dir = fs::path(INSTALL_DIR) / "done";
++    if (consume) {
++        boost::system::error_code ec;
++        fs::create_directories(done_dir, ec);
 +    }
 +    {
 +        const std::lock_guard<std::mutex> lock(job.mutex);
-+        job.total = static_cast<int>(licenses.size() + pups.size() + pkgs.size() + archives.size() + folders.size());
++        job.total = static_cast<int>(list.size());
 +    }
 +
 +    const auto begin = [&](const fs::path &p) {
@@ -2146,7 +2279,7 @@ index 00000000..a300ebf7
 +        const std::lock_guard<std::mutex> lock(job.mutex);
 +        job.progress = std::clamp(v > 1.f ? v / 100.f : v, 0.f, 1.f);
 +    };
-+    // successful ones move into done/, with their license file
++    // what installed, and in the install folder into its done/ (with a package's .zrif file)
 +    const auto finish = [&](const fs::path &p, bool ok, const std::string &why) {
 +        const std::lock_guard<std::mutex> lock(job.mutex);
 +        if (!ok) {
@@ -2155,53 +2288,73 @@ index 00000000..a300ebf7
 +            return;
 +        }
 +        job.installed++;
++        job.done.push_back(p.filename().string());
++        if (!consume)
++            return;
 +        boost::system::error_code move_ec;
 +        fs::rename(p, done_dir / p.filename(), move_ec);
 +        for (const char *ext : { ".zrif", ".txt" }) {
 +            fs::path companion = p;
 +            companion.replace_extension(ext);
-+            if (fs::exists(companion))
++            if (fs::exists(companion, move_ec))
 +                fs::rename(companion, done_dir / companion.filename(), move_ec);
 +        }
++    };
++    const auto installed_app = [&](const std::string &title_id) {
++        const std::lock_guard<std::mutex> lock(job.mutex);
++        job.title_id = title_id;
 +    };
 +
 +    // (an exception here would end the app: it stops the installing instead, as a failure)
 +    try {
-+        // licenses first: the packages after them may need them
-+        for (const auto &p : licenses) {
++        for (Entry &e : list) {
++            const fs::path &p = e.path;
 +            begin(p);
-+            finish(p, copy_license(emuenv, p), "not a valid license");
-+        }
-+        for (const auto &p : pups) {
-+            begin(p);
-+            const std::string version = install_update(emuenv, p, set_progress);
-+            finish(p, !version.empty(), "not a PS Vita firmware or font package");
-+        }
-+        for (const auto &p : pkgs) {
-+            begin(p);
-+            std::string zrif = read_zrif(p);
-+            if (zrif.empty())
-+                zrif = find_pkg_zrif(p, emuenv.vita_fs_path);
-+            if (zrif.empty()) {
-+                finish(p, false, "no license: put its zRIF in a .zrif file of the same name, or its .rif next to it");
-+                continue;
++            switch (e.kind) {
++            case Kind::License:
++                finish(p, copy_license(emuenv, p), "not a valid license");
++                break;
++            case Kind::Update:
++                finish(p, !install_update(emuenv, p, set_progress).empty(), "not a PS Vita firmware or font package");
++                break;
++            case Kind::Package: {
++                std::string zrif = read_zrif(p);
++                if (zrif.empty())
++                    zrif = find_pkg_zrif(p, emuenv.vita_fs_path);
++                if (zrif.empty()) {
++                    finish(p, false, "no license: put its zRIF in a .zrif file of the same name, or install its .rif first");
++                    break;
++                }
++                const bool ok = install_pkg(p, emuenv, zrif, set_progress);
++                if (ok)
++                    installed_app(emuenv.app_info.app_title_id);
++                finish(p, ok, "the package couldn't be installed");
++                break;
 +            }
-+            finish(p, install_pkg(p, emuenv, zrif, set_progress), "the package couldn't be installed");
-+        }
-+        for (const auto &p : archives) {
-+            begin(p);
-+            const auto contents = install_archive(emuenv, p, [&](ArchiveContents progress) {
-+                if (progress.progress)
-+                    set_progress(*progress.progress);
-+                else if (progress.count && progress.current && *progress.count > 0)
-+                    set_progress(*progress.current / *progress.count);
-+            });
-+            const bool ok = !contents.empty() && std::all_of(contents.begin(), contents.end(), [](const ContentInfo &c) { return c.state; });
-+            finish(p, ok, "nothing in it could be installed");
-+        }
-+        for (const auto &p : folders) {
-+            begin(p);
-+            finish(p, install_contents(emuenv, p) > 0, "not an app folder");
++            case Kind::Archive: {
++                const auto contents = install_archive(emuenv, p, [&](ArchiveContents progress) {
++                    if (progress.progress)
++                        set_progress(*progress.progress);
++                    else if (progress.count && progress.current && *progress.count > 0)
++                        set_progress(*progress.current / *progress.count);
++                });
++                const bool ok = !contents.empty() && std::all_of(contents.begin(), contents.end(), [](const ContentInfo &c) { return c.state; });
++                if (ok)
++                    installed_app(contents.front().title_id);
++                finish(p, ok, "nothing in it could be installed");
++                break;
++            }
++            case Kind::GameFolder: {
++                const bool ok = install_contents(emuenv, p) > 0;
++                if (ok)
++                    installed_app(emuenv.app_info.app_title_id);
++                finish(p, ok, "not an app folder");
++                break;
++            }
++            case Kind::Location:
++            case Kind::Folder:
++                break;
++            }
 +        }
 +        app::init_apps_list(emuenv);
 +    } catch (const std::exception &e) {
@@ -2364,7 +2517,9 @@ index 00000000..a300ebf7
 +        return text;
 +    }
 +    if (job.total == 0)
-+        return std::string("Nothing to install: copy files to ") + INSTALL_DIR + " first";
++        return "Nothing there can be installed";
++    if (job.failures.empty() && job.done.size() == 1)
++        return "Installed " + job.done.front();
 +    std::string text = fmt::format("Installed {} of {}", job.installed, job.total);
 +    for (const auto &failure : job.failures)
 +        text += "\n" + failure;
@@ -2416,11 +2571,12 @@ index 00000000..a300ebf7
 +        c.fill_round_rect(MARGIN, LIST_Y + 20, cw, 600, 32, rgb(0x14213a, 220));
 +        c.text(MARGIN + 64, LIST_Y + 120, "No games yet", 52, TEXT, Weight::Bold);
 +        const int y = c.text_wrapped(MARGIN + 64, LIST_Y + 200,
-+            "Copy games to /data/Vita3K/install over FTP, then press Triangle:", 32, MUTED, cw - 128, 46);
++            "Press Triangle to install games. Vita3K installs:", 32, MUTED, cw - 128, 46);
 +        const char *lines[] = {
-+            ".vpk or .zip files, or dumped game folders",
-+            "a .pkg, with a .zrif file of the same name holding its zRIF",
-+            "The PS Vita firmware and font package download from Sony when they're missing (Square), or install from their .PUP files there",
++            ".vpk and .zip archives, and dumped game folders",
++            ".pkg packages, with a .zrif file of the same name holding the zRIF",
++            "from /data/Vita3K/install (copy them there over FTP), anywhere on the PS4's storage, or a USB drive",
++            "The PS Vita firmware and font package download from Sony by themselves when they're missing (Square)",
 +        };
 +        int ly = y + 24;
 +        for (const char *line : lines) {
@@ -2469,6 +2625,157 @@ index 00000000..a300ebf7
 +        c.text(PANEL_X, y + 46, "Version " + item.entry.app_ver, 28, MUTED);
 +}
 +
++// --- the install browser ---
++
++constexpr int BROWSER_Y = 286; // its list (its heading above)
++constexpr int BROWSER_ROWS = 6;
++
++bool has_zrif(Entry &e) {
++    if (e.zrif < 0)
++        e.zrif = read_zrif(e.path).empty() ? 0 : 1;
++    return e.zrif == 1;
++}
++
++// An entry's picture: a folder, or a tile saying what the file is
++void draw_entry_icon(Canvas &c, const Entry &e, int x, int y, int size) {
++    const float s = static_cast<float>(size);
++    if (e.kind == Kind::Folder || e.kind == Kind::GameFolder) {
++        const Color color = e.kind == Kind::GameFolder ? OK : rgb(0xe8b84a);
++        c.fill_round_rect(x + size / 10, y + size / 5, size * 2 / 5, size / 4, size / 14, color);
++        c.fill_round_rect(x + size / 10, y + size * 3 / 10, size * 4 / 5, size * 11 / 20, size / 12, color);
++        if (e.kind == Kind::GameFolder)
++            c.text_centered(x + size / 2, y + size * 13 / 20, "GAME", size / 5, rgb(0x0d2347), Weight::Bold);
++        return;
++    }
++    c.fill_round_rect(x, y, size, size, size / 6, rgb(0x1b2a44));
++    if (e.kind == Kind::Location && e.path == INSTALL_DIR) {
++        // an arrow into a tray
++        const float cx = x + s / 2;
++        c.line(cx, y + s * 0.2f, cx, y + s * 0.6f, s / 14, ACCENT);
++        c.line(cx - s * 0.16f, y + s * 0.45f, cx, y + s * 0.62f, s / 14, ACCENT);
++        c.line(cx + s * 0.16f, y + s * 0.45f, cx, y + s * 0.62f, s / 14, ACCENT);
++        c.line(x + s * 0.24f, y + s * 0.78f, x + s * 0.76f, y + s * 0.78f, s / 14, ACCENT);
++        return;
++    }
++    std::string label;
++    Color color = ACCENT;
++    switch (e.kind) {
++    case Kind::Location:
++        label = e.path.string().rfind("/mnt/usb", 0) == 0 ? "USB" : "PS4";
++        break;
++    case Kind::Archive:
++        label = e.path.extension().string().substr(1);
++        std::transform(label.begin(), label.end(), label.begin(), [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
++        break;
++    case Kind::Package:
++        label = "PKG";
++        color = rgb(0xb48cff);
++        break;
++    case Kind::Update:
++        label = "PUP";
++        color = WARN;
++        break;
++    case Kind::License:
++        label = "RIF";
++        color = MUTED;
++        break;
++    default:
++        break;
++    }
++    c.text_centered(x + size / 2, y + size / 2 + size / 9, label, size / 4, color, Weight::Bold);
++    c.fill_round_rect(x + size / 4, y + size * 3 / 4, size / 2, std::max(3, size / 22), std::max(1, size / 44), color);
++}
++
++// The line under an entry's name
++std::string entry_summary(Entry &e) {
++    switch (e.kind) {
++    case Kind::Location: return e.path.string();
++    case Kind::Folder: return "Folder";
++    case Kind::GameFolder: return "Dumped game folder";
++    case Kind::Archive: return "PS Vita app archive   " + size_text(e.size);
++    case Kind::Package: return "PS Vita package   " + size_text(e.size) + (has_zrif(e) ? "" : "   no .zrif file");
++    case Kind::Update: return "PS Vita update file   " + size_text(e.size);
++    case Kind::License: return "PS Vita license";
++    }
++    return {};
++}
++
++// What the panel says about the selected entry
++std::vector<std::string> entry_details(Entry &e) {
++    std::vector<std::string> lines;
++    switch (e.kind) {
++    case Kind::Location:
++        lines = { e.path.string(), "Cross opens it" };
++        break;
++    case Kind::Folder:
++        lines = { "Cross opens it" };
++        break;
++    case Kind::GameFolder:
++        lines = { "A dumped game: its files are copied into Vita3K", "Cross installs it" };
++        break;
++    case Kind::Archive:
++        lines = { "PS Vita app archive, " + size_text(e.size), "Cross installs it" };
++        break;
++    case Kind::Package:
++        lines = { "PS Vita package, " + size_text(e.size),
++            has_zrif(e) ? std::string("Its zRIF is in the .zrif file next to it")
++                        : std::string("Its zRIF goes in a text file of the same name ending in .zrif (unless its .rif license is installed)"),
++            "Cross installs it" };
++        break;
++    case Kind::Update:
++        lines = { "PS Vita update file (the firmware or the font package), " + size_text(e.size), "Cross installs it" };
++        break;
++    case Kind::License:
++        lines = { "PS Vita license, for the packages that need one", "Cross installs it" };
++        break;
++    }
++    if (installable(e.kind) && e.path.parent_path() == INSTALL_DIR)
++        lines.push_back("Once it's installed it moves to install/done");
++    return lines;
++}
++
++void draw_browser(Canvas &c, const fs::path &dir, std::vector<Entry> &entries, int selected, int top) {
++    const int hx = c.text(MARGIN, 250, "Install", 44, TEXT, Weight::Bold);
++    c.text(MARGIN + hx + 28, 250, dir.empty() ? std::string("Where are the files?") : dir.string(), 30, MUTED, Weight::Regular, W - 2 * MARGIN - hx - 28);
++    if (entries.empty()) {
++        const int cw = W - 2 * MARGIN;
++        c.fill_round_rect(MARGIN, BROWSER_Y + 10, cw, 400, 32, rgb(0x14213a, 220));
++        c.text(MARGIN + 64, BROWSER_Y + 110, "Nothing to install here", 44, TEXT, Weight::Bold);
++        c.text_wrapped(MARGIN + 64, BROWSER_Y + 180,
++            "Vita3K installs .vpk and .zip archives, .pkg packages (with a .zrif file of the same name holding the zRIF), dumped game folders, PS Vita update files (.PUP) and licenses (.rif). Copy them here over FTP, or go back (Circle) and open a USB drive.",
++            30, MUTED, cw - 128, 44);
++        return;
++    }
++    const int count = static_cast<int>(entries.size());
++    for (int row = 0; row < BROWSER_ROWS && top + row < count; row++) {
++        Entry &e = entries[top + row];
++        const int y = BROWSER_Y + row * ROW_H;
++        const bool sel = top + row == selected;
++        if (sel) {
++            c.fill_round_rect(LIST_X - 16, y, LIST_W + 32, ROW_H - 8, 22, rgb(0x2a6fd6, 90));
++            c.fill_round_rect(LIST_X - 16, y + 18, 6, ROW_H - 44, 3, ACCENT);
++        }
++        draw_entry_icon(c, e, LIST_X + 8, y + (ROW_H - 8 - ICON) / 2, ICON);
++        const int tx = LIST_X + ICON + 36;
++        c.text(tx, y + 50, e.name, 36, sel ? TEXT : rgb(0xd5dbe7), sel ? Weight::Bold : Weight::Regular, LIST_W - ICON - 60);
++        c.text(tx, y + 86, entry_summary(e), 24, MUTED, Weight::Regular, LIST_W - ICON - 60);
++    }
++    if (count > BROWSER_ROWS) {
++        const int track_h = BROWSER_ROWS * ROW_H - 8;
++        const int thumb_h = std::max(40, track_h * BROWSER_ROWS / count);
++        const int thumb_y = BROWSER_Y + (track_h - thumb_h) * top / (count - BROWSER_ROWS);
++        c.fill_round_rect(LIST_X + LIST_W + 30, BROWSER_Y, 6, track_h, 3, rgb(0xffffff, 24));
++        c.fill_round_rect(LIST_X + LIST_W + 30, thumb_y, 6, thumb_h, 3, rgb(0xffffff, 90));
++    }
++    // the selected one, larger, and what Cross does with it
++    Entry &e = entries[selected];
++    constexpr int big = 200;
++    draw_entry_icon(c, e, PANEL_X + (PANEL_W - big) / 2, BROWSER_Y + 10, big);
++    int y = c.text_wrapped(PANEL_X, BROWSER_Y + big + 80, e.name, 36, TEXT, PANEL_W, 46, Weight::Bold);
++    for (const std::string &line : entry_details(e))
++        y = c.text_wrapped(PANEL_X, y + 12, line, 28, MUTED, PANEL_W, 38);
++}
++
 +void draw_notice(Canvas &c, const std::string &notice) {
 +    if (notice.empty())
 +        return;
@@ -2491,7 +2798,11 @@ index 00000000..a300ebf7
 +    const int x = c.text(MARGIN, 128, "Vita3K", 76, TEXT, Weight::Bold);
 +    c.text(MARGIN + x + 18, 128, "for PS4", 38, ACCENT);
 +    c.text_centered(W / 2, H / 2 - 10, title, 56, TEXT, Weight::Bold);
-+    c.text_centered(W / 2, H / 2 + 60, detail, 32, MUTED);
++    // one line centered, a longer one (an error) wrapped
++    if (c.text_width(detail, 32) <= W - 2 * MARGIN)
++        c.text_centered(W / 2, H / 2 + 60, detail, 32, MUTED);
++    else
++        c.text_wrapped(MARGIN, H / 2 + 60, detail, 32, MUTED, W - 2 * MARGIN, 44);
 +    present(c);
 +}
 +
@@ -2515,6 +2826,23 @@ index 00000000..a300ebf7
 +        job.thread = std::thread([&emuenv, &job, downloads = missing_firmware(fw)] { firmware_worker(emuenv, job, downloads); });
 +        notice.clear();
 +    };
++    // the install browser (Triangle), where it was the last time
++    static fs::path browse_dir = INSTALL_DIR; // empty: the locations
++    bool browsing = false;
++    std::vector<Entry> entries;
++    int browse_selected = 0;
++    int browse_top = 0;
++    const auto open_dir = [&](const fs::path &dir) {
++        boost::system::error_code ec;
++        browse_dir = !dir.empty() && fs::is_directory(dir, ec) ? dir : fs::path();
++        entries = browse_dir.empty() ? locations() : list_folder(browse_dir);
++        browse_selected = browse_top = 0;
++    };
++    const auto start_install = [&](std::vector<Entry> list, bool consume) {
++        reset(job, false);
++        job.thread = std::thread([&emuenv, &job, list = std::move(list), consume]() mutable { install_worker(emuenv, job, std::move(list), consume); });
++        notice.clear();
++    };
 +    // What's missing of the firmware comes from Sony by itself, unless the user stopped that
 +    // before or copied update files to install
 +    if (!missing_firmware(fw).empty()) {
@@ -2523,7 +2851,7 @@ index 00000000..a300ebf7
 +            start_firmware();
 +        } else if (notice.empty()) {
 +            if (updates_waiting())
-+                notice = "Press Triangle to install the update files in /data/Vita3K/install";
++                notice = "PS Vita update files are waiting in /data/Vita3K/install: Triangle, then Square installs them";
 +            else
 +                notice = std::string(fw.main_firmware ? "The PS Vita font package isn't installed: some games need it." : "The PS Vita firmware isn't installed: most games need it.") + " Press Square to download it from Sony.";
 +            notice_until = Clock::now() + std::chrono::hours(1);
@@ -2556,6 +2884,19 @@ index 00000000..a300ebf7
 +                items = load_items(emuenv);
 +                fw = app::get_firmware_state(emuenv);
 +                selected = std::min(selected, std::max(0, static_cast<int>(items.size()) - 1));
++                if (!job.firmware) {
++                    // back to the games, on the one just installed
++                    browsing = false;
++                    std::string title_id;
++                    {
++                        const std::lock_guard<std::mutex> lock(job.mutex);
++                        title_id = job.title_id;
++                    }
++                    for (size_t i = 0; i < items.size(); i++) {
++                        if (!title_id.empty() && items[i].entry.title_id == title_id)
++                            selected = static_cast<int>(i);
++                    }
++                }
 +                notice = summary(job);
 +                notice_until = now + std::chrono::seconds(20);
 +                dirty = true;
@@ -2572,6 +2913,9 @@ index 00000000..a300ebf7
 +                }
 +            }
 +        } else {
++            const int count = static_cast<int>(browsing ? entries.size() : items.size());
++            const int page = browsing ? BROWSER_ROWS : VISIBLE_ROWS;
++            int &sel = browsing ? browse_selected : selected;
 +            int dir = (buttons & ORBIS_PAD_BUTTON_UP) ? -1 : (buttons & ORBIS_PAD_BUTTON_DOWN) ? 1 : 0;
 +            bool step = false;
 +            if (dir != 0 && dir != repeat_dir) {
@@ -2582,26 +2926,64 @@ index 00000000..a300ebf7
 +                repeat_at = now + std::chrono::milliseconds(70);
 +            }
 +            repeat_dir = dir;
-+            if (step && !items.empty()) {
-+                selected = std::clamp(selected + dir, 0, static_cast<int>(items.size()) - 1);
++            if (step && count > 0) {
++                sel = std::clamp(sel + dir, 0, count - 1);
 +                dirty = true;
 +            }
-+            if ((pressed & ORBIS_PAD_BUTTON_CROSS) && !items.empty()) {
-+                const Item &item = items[selected];
-+                last_app_path = item.entry.path;
-+                show_message("Starting", item.entry.title);
-+                return Choice{ false, item.entry.path, item.entry.title };
++            // L1 / R1: a page at a time
++            if ((pressed & (ORBIS_PAD_BUTTON_L1 | ORBIS_PAD_BUTTON_R1)) && count > 0) {
++                sel = std::clamp(sel + ((pressed & ORBIS_PAD_BUTTON_L1) ? -page : page), 0, count - 1);
++                dirty = true;
 +            }
-+            if (pressed & ORBIS_PAD_BUTTON_TRIANGLE) {
-+                reset(job, false);
-+                job.thread = std::thread([&emuenv, &job] { install_worker(emuenv, job); });
-+                notice.clear();
-+                dirty = true;
-+            } else if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && !missing_firmware(fw).empty()) {
-+                start_firmware();
-+                dirty = true;
-+            } else if (pressed & ORBIS_PAD_BUTTON_OPTIONS) {
-+                return Choice{ true, {}, {} };
++            if (browsing) {
++                if ((pressed & ORBIS_PAD_BUTTON_CROSS) && !entries.empty()) {
++                    const Entry e = entries[browse_selected];
++                    if (installable(e.kind))
++                        start_install({ e }, e.path.parent_path() == INSTALL_DIR);
++                    else
++                        open_dir(e.path);
++                    dirty = true;
++                } else if (pressed & ORBIS_PAD_BUTTON_SQUARE) {
++                    std::vector<Entry> all;
++                    std::copy_if(entries.begin(), entries.end(), std::back_inserter(all), [](const Entry &e) { return installable(e.kind); });
++                    if (!all.empty()) {
++                        start_install(std::move(all), browse_dir == INSTALL_DIR);
++                        dirty = true;
++                    }
++                } else if (pressed & ORBIS_PAD_BUTTON_CIRCLE) {
++                    if (browse_dir.empty()) {
++                        browsing = false;
++                    } else {
++                        // up a folder (from a location: to the locations), on the folder it came from
++                        const fs::path from = browse_dir;
++                        open_dir(is_location(from) ? fs::path() : from.parent_path());
++                        for (size_t i = 0; i < entries.size(); i++) {
++                            if (entries[i].path == from)
++                                browse_selected = static_cast<int>(i);
++                        }
++                    }
++                    dirty = true;
++                } else if (pressed & ORBIS_PAD_BUTTON_TRIANGLE) {
++                    browsing = false;
++                    dirty = true;
++                }
++            } else {
++                if ((pressed & ORBIS_PAD_BUTTON_CROSS) && !items.empty()) {
++                    const Item &item = items[selected];
++                    last_app_path = item.entry.path;
++                    show_message("Starting", item.entry.title);
++                    return Choice{ false, item.entry.path, item.entry.title };
++                }
++                if (pressed & ORBIS_PAD_BUTTON_TRIANGLE) {
++                    browsing = true;
++                    open_dir(browse_dir);
++                    dirty = true;
++                } else if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && !missing_firmware(fw).empty()) {
++                    start_firmware();
++                    dirty = true;
++                } else if (pressed & ORBIS_PAD_BUTTON_OPTIONS) {
++                    return Choice{ true, {}, {} };
++                }
 +            }
 +        }
 +        if (!notice.empty() && now >= notice_until) {
@@ -2611,15 +2993,34 @@ index 00000000..a300ebf7
 +
 +        if (dirty) {
 +            // keep the selection in view
-+            if (selected < top)
-+                top = selected;
-+            if (selected >= top + VISIBLE_ROWS)
-+                top = selected - VISIBLE_ROWS + 1;
++            int &sel = browsing ? browse_selected : selected;
++            int &first = browsing ? browse_top : top;
++            const int rows = browsing ? BROWSER_ROWS : VISIBLE_ROWS;
++            if (sel < first)
++                first = sel;
++            if (sel >= first + rows)
++                first = sel - rows + 1;
 +            background(canvas);
 +            header(canvas, fw);
-+            draw_list(canvas, items, selected, top);
++            std::vector<Hint> hints;
++            if (browsing) {
++                draw_browser(canvas, browse_dir, entries, browse_selected, browse_top);
++                if (!entries.empty())
++                    hints.push_back({ Pad::Cross, installable(entries[browse_selected].kind) ? "Install" : "Open" });
++                if (std::any_of(entries.begin(), entries.end(), [](const Entry &e) { return installable(e.kind); }))
++                    hints.push_back({ Pad::Square, "Install all here" });
++                hints.push_back({ Pad::Circle, "Back" });
++            } else {
++                draw_list(canvas, items, selected, top);
++                if (!items.empty())
++                    hints.push_back({ Pad::Cross, "Start" });
++                hints.push_back({ Pad::Triangle, "Install games" });
++                if (!missing_firmware(fw).empty())
++                    hints.push_back({ Pad::Square, "Download firmware" });
++                hints.push_back({ Pad::Options, "Quit" });
++            }
 +            draw_notice(canvas, notice);
-+            footer(canvas, !items.empty(), !missing_firmware(fw).empty());
++            footer(canvas, hints);
 +            if (job.running)
 +                draw_install(canvas, job);
 +            present(canvas);
@@ -2682,10 +3083,10 @@ index 00000000..0210098f
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..927fe680
+index 00000000..c6375941
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
-@@ -0,0 +1,348 @@
+@@ -0,0 +1,351 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -2967,6 +3368,9 @@ index 00000000..927fe680
 +    char program[] = "vita3k";
 +    char *args[] = { program, nullptr };
 +    Config cfg{};
++    // Set before the command line options are made: they list <vita fs>/ux0/app, which is
++    // "ux0/app" with no path yet, and the PS4 refuses relative paths (Boost threw on it)
++    cfg.set_vita_fs_path(root_paths.get_vita_fs_path());
 +    EmuEnvState emuenv;
 +    crash_emuenv = &emuenv;
 +    if (config::init_config(cfg, 1, args, root_paths, false) != Success) {
