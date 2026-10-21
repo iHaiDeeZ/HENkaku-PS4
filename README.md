@@ -4,7 +4,7 @@
 in WSL Ubuntu with the M33 / Resonance / DolphinPS4 / Crema PS4 toolchain (clang 21 + libc++ 21 on
 OpenOrbis).
 
-Status: **v00.01**: builds and packages; not yet run on a console.
+Status: **v00.02**: builds and packages; not yet run on a console.
 
 ## Using it
 
