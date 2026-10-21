@@ -4,11 +4,12 @@
 in WSL Ubuntu with the M33 / Resonance / DolphinPS4 / Crema PS4 toolchain (clang 21 + libc++ 21 on
 OpenOrbis).
 
-Status: **v00.10**. On the console the launcher works (text, firmware download, installing a VPK),
-PKGj runs (renderer on RADV, audio, dynarmic, the network), and v00.09 decrypted Mortal Kombat
-(PCSE00023) and ran it at 25-30 fps through its menus for 90 s, until the GPU hung loading a fight
-and the system killed the app. v00.10 fixes the shader translation that most likely made a loop
-endless (see "Shaders" below). Remember to install each new package from `/data/pkg`.
+Status: **v00.11**. On the console the launcher works (text, firmware download, installing a VPK),
+PKGj runs (renderer on RADV, audio, dynarmic, the network), and Mortal Kombat (PCSE00023) runs
+its menus at 20-30 fps. Starting a fight the GPU hangs (v00.09: the app was killed; v00.10, with
+the shader fixes below: the whole PS4 froze), both times in the draws right after RADV set up the
+HTILE of a new depth-stencil buffer; v00.11 runs RADV without HTILE (`RADV_DEBUG=nohiz`).
+Remember to install each new package from `/data/pkg`.
 
 ## Using it
 
@@ -91,8 +92,10 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
   stops after 4096 turns on the PS4 (a GPU that never finishes gets the app killed, with no
   trace). PS4 shader cache version 1401, so older translations are made again. A GPU hang is
   logged by the RADV winsys in `/data/DolphinPS4/radv-ps4.log` and `gpu-hang.txt` (its paths are
-  DolphinPS4's); an empty `/data/Vita3K/radv-trace` file turns on its flight recorder and RADV's
-  per-draw trace ids (slower) to find the draw.
+  DolphinPS4's); an empty `/data/Vita3K/radv-trace` file turns on its flight recorder
+  (`/data/DolphinPS4/flight`) and RADV's per-draw trace ids (slower) to find the draw. RADV runs
+  with `RADV_DEBUG=nohiz` (no depth compression): Mortal Kombat's fights hung the GPU right after
+  HTILE fast clears of a depth-stencil buffer.
 - **Guest memory** (`mem/src/mem.cpp`): the Vita's 4 GiB address space is a virtual range
   reservation; the host pages the allocator commits are backed by direct memory mapped in place
   (16 KiB pages), and given back to a free list when freed. Write tracking uses `mprotect` and the

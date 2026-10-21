@@ -3227,10 +3227,10 @@ index 00000000..0210098f
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..74745987
+index 00000000..02df6814
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
-@@ -0,0 +1,388 @@
+@@ -0,0 +1,393 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -3536,14 +3536,19 @@ index 00000000..74745987
 +    if (logging::init(root_paths, false) != Success)
 +        trace("logging could not start");
 +    LOG_INFO("Vita3K for PS4 {}", app_version);
-+    // Which draw a GPU hang is on: RADV's per-draw trace ids and the PS4 winsys' flight recorder
-+    // (port/mesa/ac_ps4_drm.c, into /data/DolphinPS4/flight), when /data/Vita3K/radv-trace is there.
-+    // It slows the rendering down.
++    // RADV without HTILE (depth compression): Mortal Kombat hung the GPU twice starting a fight, both
++    // times in the draws right after RADV initialized and fast-cleared the HTILE of a new
++    // depth-stencil buffer (Dolphin, which works, has no stencil), and once the whole PS4 froze.
++    // Then which draw a GPU hang is on: RADV's per-draw trace ids and the PS4 winsys' flight
++    // recorder (port/mesa/ac_ps4_drm.c, into /data/DolphinPS4/flight), when /data/Vita3K/radv-trace
++    // is there; it slows the rendering down.
++    std::string radv_debug = "nohiz";
 +    if (fs::exists(root_paths.get_log_path() / "radv-trace", ec)) {
 +        setenv("RADV_PS4_TRACE", "1", 1);
-+        setenv("RADV_DEBUG", "hang", 1);
-+        trace("radv: flight recorder on");
++        radv_debug += ",hang";
 +    }
++    setenv("RADV_DEBUG", radv_debug.c_str(), 1);
++    trace("radv: RADV_DEBUG=" + radv_debug);
 +
 +    // CLI11 needs a program name (a PS4 app gets none)
 +    char program[] = "vita3k";
