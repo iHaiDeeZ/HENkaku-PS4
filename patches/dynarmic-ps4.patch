@@ -44,14 +44,15 @@ index 2d6d6ea6..29ce6995 100644
          fmt::print(stderr, "dynarmic: POSIX SigHandler: could not set SIGBUS handler\n");
          supports_fast_mem = false;
 diff --git a/src/dynarmic/backend/x64/block_of_code.cpp b/src/dynarmic/backend/x64/block_of_code.cpp
-index 22d9868f..30642e3f 100644
+index 22d9868f..5e0889ea 100644
 --- a/src/dynarmic/backend/x64/block_of_code.cpp
 +++ b/src/dynarmic/backend/x64/block_of_code.cpp
-@@ -20,6 +20,12 @@
+@@ -20,6 +20,13 @@
  
  #include <array>
  #include <cstring>
 +#ifdef __PS4__
++#    include <atomic>
 +#    include <map>
 +#    include <mutex>
 +
@@ -60,7 +61,7 @@ index 22d9868f..30642e3f 100644
  
  #include <mcl/assert.hpp>
  #include <mcl/bit/bit_field.hpp>
-@@ -54,12 +60,72 @@ const std::array<Xbyak::Reg64, ABI_PARAM_COUNT> BlockOfCode::ABI_PARAMS = {Block
+@@ -54,12 +61,88 @@ const std::array<Xbyak::Reg64, ABI_PARAM_COUNT> BlockOfCode::ABI_PARAMS = {Block
  
  namespace {
  
@@ -79,21 +80,37 @@ index 22d9868f..30642e3f 100644
 +int32_t sceKernelMapNamedSystemFlexibleMemory(void** address, size_t length, int32_t protection, int32_t flags, const char* name);
 +int32_t sceKernelMapNamedFlexibleMemory(void** address, size_t length, int32_t protection, int32_t flags, const char* name);
 +int32_t sceKernelMunmap(void* address, size_t length);
++// the PS4 port's runtime (its port/ps4_crashlog.cpp): a line in the app's boot trace
++void ps4_boot_trace(const char* line);
 +}
 +constexpr int32_t PS4_MAP_FIXED = 0x10;  // SCE_KERNEL_MAP_FIXED
 +constexpr int32_t PS4_PROT_CPU_RWX = 0x7;
 +
 +// Executable memory at a place in a reservation: from the system pool (where the heap also is), or
-+// failing that the app's regular flexible memory.
++// failing that the app's regular flexible memory; over the reservation, or failing that in its place.
 +bool PS4CommitCode(uint8_t* at, size_t size) {
-+    void* addr = at;
-+    if (sceKernelMapNamedSystemFlexibleMemory(&addr, size, PS4_PROT_CPU_RWX, PS4_MAP_FIXED, "dynarmic") == 0 && addr == at)
++    static std::atomic<int> logged{0};
++    const auto try_pools = [&](const char* how) {
++        void* addr = at;
++        int32_t r = sceKernelMapNamedSystemFlexibleMemory(&addr, size, PS4_PROT_CPU_RWX, PS4_MAP_FIXED, "dynarmic");
++        const char* pool = "system flexible";
++        if (r != 0 || addr != at) {
++            addr = at;
++            r = sceKernelMapNamedFlexibleMemory(&addr, size, PS4_PROT_CPU_RWX, PS4_MAP_FIXED, "dynarmic");
++            pool = "flexible";
++        }
++        if (r == 0 && addr == at) {
++            if (logged.fetch_add(1) == 0)
++                ps4_boot_trace(fmt::format("dynarmic: code memory from {} memory, mapped {}", pool, how).c_str());
++            return true;
++        }
++        ps4_boot_trace(fmt::format("dynarmic: {} KiB of code memory at {} {} failed: {:08X}", size >> 10, static_cast<void*>(at), how, static_cast<uint32_t>(r)).c_str());
++        return false;
++    };
++    if (try_pools("over the reservation"))
 +        return true;
-+    addr = at;
-+    if (sceKernelMapNamedFlexibleMemory(&addr, size, PS4_PROT_CPU_RWX, PS4_MAP_FIXED, "dynarmic") == 0 && addr == at)
-+        return true;
-+    fmt::print(stderr, "dynarmic: no executable memory for {} KiB of code at {}\n", size >> 10, static_cast<void*>(at));
-+    return false;
++    sceKernelMunmap(at, size);
++    return try_pools("after unmapping");
 +}
 +#else
  constexpr size_t CONSTANT_POOL_SIZE = 2 * 1024 * 1024;
@@ -134,7 +151,7 @@ index 22d9868f..30642e3f 100644
      uint8_t* alloc(size_t size) override {
          void* p = VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_READWRITE);
          if (p == nullptr) {
-@@ -271,7 +337,18 @@ size_t BlockOfCode::SpaceRemaining() const {
+@@ -271,7 +354,18 @@ size_t BlockOfCode::SpaceRemaining() const {
  }
  
  void BlockOfCode::EnsureMemoryCommitted([[maybe_unused]] size_t codesize) {
