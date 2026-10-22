@@ -5076,10 +5076,10 @@ index 4eb1f4f0..bd26315a 100644
      // 8) Choose the ux0 destination (a cart image is always a full app)
 diff --git a/vita3k/ps4/ps4.cmake b/vita3k/ps4/ps4.cmake
 new file mode 100644
-index 00000000..c172de60
+index 00000000..d894f6a5
 --- /dev/null
 +++ b/vita3k/ps4/ps4.cmake
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,43 @@
 +# PS4: Vita3K's frontend for the console, included from vita3k/CMakeLists.txt once the vita3k target
 +# exists. Built with the port's toolchain (toolchain/ps4-vita3k.cmake, and ps4-love-style.cmake as
 +# the project include: PS4_RUNTIME_SOURCES, ps4_link_mesa, ps4_add_eboot).
@@ -5100,6 +5100,8 @@ index 00000000..c172de60
 +	ps4/ps4_perf.h
 +	ps4/ps4_settings.cpp
 +	ps4/ps4_settings.h
++	ps4/ps4_vita_shell.cpp
++	ps4/ps4_vita_shell.h
 +	ps4/ps4_wsi.cpp
 +	ps4/ps4_wsi.h
 +	ps4/ps4_stubs.c
@@ -6610,10 +6612,10 @@ index 00000000..01fdf0f1
 +} // namespace ps4download
 diff --git a/vita3k/ps4/ps4_launcher.cpp b/vita3k/ps4/ps4_launcher.cpp
 new file mode 100644
-index 00000000..27a666cd
+index 00000000..853327d7
 --- /dev/null
 +++ b/vita3k/ps4/ps4_launcher.cpp
-@@ -0,0 +1,3302 @@
+@@ -0,0 +1,3415 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -6644,6 +6646,7 @@ index 00000000..27a666cd
 +#include "ps4_download.h"
 +#include "ps4_pad.h"
 +#include "ps4_settings.h"
++#include "ps4_vita_shell.h"
 +#include "ps4_wsi.h"
 +
 +#include "archive.h"
@@ -7845,11 +7848,11 @@ index 00000000..27a666cd
 +// made once, and only what an animation needs is drawn again for each frame.
 +
 +constexpr int PER_PAGE = 10;
-+constexpr float BUBBLE_R = 118.f;
-+constexpr int SPRITE_PAD = 20; // room for the shadow and the focus glow
++constexpr float BUBBLE_R = 134.f;
++constexpr int SPRITE_PAD = 24; // room for the rim's glow and the focus glow
 +constexpr int SPRITE = 2 * static_cast<int>(BUBBLE_R) + 2 * SPRITE_PAD;
 +constexpr int ICON_SIZE = 2 * static_cast<int>(BUBBLE_R);
-+constexpr float COLUMN = 462.f;
++constexpr float COLUMN = 460.f;
 +constexpr int STATUS_H = 60;
 +constexpr int MAX_CARDS = 5;
 +
@@ -7857,7 +7860,8 @@ index 00000000..27a666cd
 +    float x, y;
 +    int row;
 +};
-+const float ROW_Y[3] = { 232.f, 524.f, 816.f };
++// the Vita's rows (its firmware's picture of the home screen, vs0:data/internal/theme, at 1080p)
++const float ROW_Y[3] = { 224.f, 538.f, 858.f };
 +const Slot SLOTS[PER_PAGE] = {
 +    { W / 2 - COLUMN, ROW_Y[0], 0 },
 +    { W / 2.f, ROW_Y[0], 0 },
@@ -7969,6 +7973,8 @@ index 00000000..27a666cd
 +    Canvas base{ W, H }; // the theme's colours, without the light
 +    Canvas out{ W, H };
 +    bool wave = true;
++    // the PS Vita's own default theme (its wave from the firmware)
++    bool vita = false;
 +    float phase = -1.f;
 +    std::vector<uint8_t> wide, thin; // the two bands' light by distance from their middle
 +    std::vector<int> wide_y, thin_y; // their middles, by column
@@ -8015,6 +8021,71 @@ index 00000000..27a666cd
 +    w.phase = phase;
 +}
 +
++// The PS Vita's default theme as its home screen shows it, fitted to the firmware's picture of it
++// (vs0:data/internal/theme): a blue lighter at the top and toward the bottom, and the theme's own wave
++// (vs0:vsh/shell/theme_plugin.rco: white, its alpha a curtain under a curve) three times over it,
++// mirrored, drifting when the wallpaper moves
++const float VITA_STOPS[9] = { 0.06f, 0.18f, 0.32f, 0.46f, 0.58f, 0.70f, 0.80f, 0.90f, 1.0f };
++const float VITA_COLORS[9][3] = { { 0.000f, 0.452f, 0.882f }, { 0.000f, 0.464f, 0.882f }, { 0.000f, 0.378f, 0.877f },
++    { 0.017f, 0.135f, 0.925f }, { 0.265f, 0.448f, 1.000f }, { 0.568f, 0.735f, 1.000f }, { 0.785f, 0.918f, 1.000f },
++    { 0.774f, 0.926f, 1.000f }, { 0.102f, 0.525f, 0.991f } };
++struct VitaWave {
++    float x0, y0, w, h, opacity; // where on the screen (fractions of it), how strong
++};
++const VitaWave VITA_WAVES[3] = {
++    { -0.184f, 0.939f, 1.244f, 0.460f, 0.557f },
++    { -0.060f, 0.753f, 1.252f, 0.603f, 0.374f },
++    { -0.381f, 0.298f, 1.441f, 0.312f, 0.069f },
++};
++
++void vita_gradient(Canvas &base) {
++    uint32_t *p = base.data();
++    for (int y = 0; y < H; y++) {
++        const float fy = (y + 0.5f) / H;
++        int k = 0;
++        while (k < 8 && fy > VITA_STOPS[k + 1])
++            k++;
++        const float t = std::clamp((fy - VITA_STOPS[k]) / (VITA_STOPS[k + 1] - VITA_STOPS[k]), 0.f, 1.f);
++        uint32_t px = 0xFF000000u;
++        for (int ch = 0; ch < 3; ch++) {
++            const float v = VITA_COLORS[k][ch] + (VITA_COLORS[k + 1][ch] - VITA_COLORS[k][ch]) * t;
++            px |= static_cast<uint32_t>(std::clamp(v, 0.f, 1.f) * 255.f + 0.5f) << (8 * ch);
++        }
++        std::fill_n(p + static_cast<size_t>(y) * W, W, px);
++    }
++}
++
++void vita_waves(Wallpaper &w, const ps4ui::Image &wave, float phase) {
++    std::memcpy(w.out.data(), w.base.data(), static_cast<size_t>(W) * H * 4);
++    std::vector<int> column(W);
++    for (int i = 0; i < 3; i++) {
++        const VitaWave &v = VITA_WAVES[i];
++        // (drifting: back and forth, each at its own pace, never far enough to show its end)
++        const float x0 = v.x0 + 0.05f * std::sin(phase * (0.8f + 0.3f * i) + 1.7f * i) - 0.05f;
++        for (int x = 0; x < W; x++) {
++            const float u = 1.f - ((x + 0.5f) / W - x0) / v.w; // mirrored
++            column[x] = std::clamp(static_cast<int>(u * wave.width), 0, wave.width - 1);
++        }
++        const uint32_t opacity = static_cast<uint32_t>(v.opacity * 256.f);
++        const int top = std::max(0, static_cast<int>(v.y0 * H));
++        for (int y = top; y < H; y++) {
++            // (below the picture its last row goes on)
++            const int row = std::min(wave.height - 1, static_cast<int>(((y + 0.5f) / H - v.y0) / v.h * wave.height));
++            const uint32_t *src = wave.pixels.data() + static_cast<size_t>(row) * wave.width;
++            uint32_t *dst = w.out.data() + static_cast<size_t>(y) * W;
++            for (int x = 0; x < W; x++) {
++                const uint32_t a = ((src[column[x]] >> 24) * opacity) >> 8;
++                if (a == 0)
++                    continue;
++                const uint32_t p = dst[x];
++                const uint32_t r = p & 0xFF, g = (p >> 8) & 0xFF, b = (p >> 16) & 0xFF;
++                dst[x] = (r + (((255 - r) * a) >> 8)) | ((g + (((255 - g) * a) >> 8)) << 8) | ((b + (((255 - b) * a) >> 8)) << 16) | 0xFF000000u;
++            }
++        }
++    }
++    w.phase = phase;
++}
++
 +// Brings the wallpaper up to date; whether it changed
 +bool update_wallpaper(Clock::time_point now) {
 +    Wallpaper &w = wallpaper_state();
@@ -8036,7 +8107,12 @@ index 00000000..27a666cd
 +                w.wave = false;
 +            }
 +        }
-+        if (w.wave) {
++        const ps4ui::Image *vita_wave = ps4shell::picture(ps4shell::Picture::Wave);
++        w.vita = w.wave && prefs.theme == 0 && vita_wave;
++        if (w.vita) {
++            vita_gradient(w.base);
++            vita_waves(w, *vita_wave, 0.f);
++        } else if (w.wave) {
 +            const Theme &theme = current_theme();
 +            const Color top = rgb(theme.top), bottom = rgb(theme.bottom);
 +            uint32_t *p = w.base.data();
@@ -8070,7 +8146,11 @@ index 00000000..27a666cd
 +    // the wave moving: about a turn a minute, made again 30 times a second
 +    if (w.wave && prefs.moving_wallpaper && now - w.made >= std::chrono::milliseconds(33)) {
 +        static const Clock::time_point start = now;
-+        wave_light(w, std::chrono::duration<float>(now - start).count() * 0.11f);
++        const float phase = std::chrono::duration<float>(now - start).count() * 0.11f;
++        if (w.vita)
++            vita_waves(w, *ps4shell::picture(ps4shell::Picture::Wave), phase);
++        else
++            wave_light(w, phase);
 +        w.made = now;
 +        return true;
 +    }
@@ -8124,8 +8204,8 @@ index 00000000..27a666cd
 +    c.fill_rect(static_cast<int>(x) - 10, static_cast<int>(y) - 2, 20, 15, color);
 +}
 +
-+// A bubble: the icon in a glass sphere (a highlight over its top, its edge shaded, a white rim)
-+// with a soft shadow under it, premultiplied
++// A bubble as the Vita's: the icon in a circle (its edge a little shaded), a thin light rim and a
++// soft light around it, premultiplied
 +ps4ui::Image make_bubble(const ps4ui::Image &icon, Color fill) {
 +    ps4ui::Image out;
 +    out.width = out.height = SPRITE;
@@ -8136,8 +8216,9 @@ index 00000000..27a666cd
 +        for (int x = 0; x < SPRITE; x++) {
 +            const float px = x + 0.5f - c, py = y + 0.5f - c;
 +            const float d = std::sqrt(px * px + py * py);
-+            const float sd = std::sqrt(px * px + (py - 8) * (py - 8));
-+            const float shadow = std::clamp((R + 7 - sd) / 14.f, 0.f, 1.f) * 0.42f;
++            // the light around it (white)
++            const float out_d = std::max(0.f, d - R);
++            const float halo = d > R - 1 ? 0.42f * std::exp(-out_d * out_d / 55.f) : 0.f;
 +            const float cov = std::clamp(R - d + 0.5f, 0.f, 1.f);
 +            float r = fill.r, g = fill.g, b = fill.b;
 +            if (cov > 0) {
@@ -8149,22 +8230,26 @@ index 00000000..27a666cd
 +                    g = g * (1 - a) + ((p >> 8) & 0xFF) * a;
 +                    b = b * (1 - a) + ((p >> 16) & 0xFF) * a;
 +                }
-+                // the glass: light over the top, darker toward the edge
-+                const float ex = px / (R * 0.80f), ey = (py + R * 0.50f) / (R * 0.44f);
-+                const float e = ex * ex + ey * ey;
-+                const float gloss = e < 1.f ? 0.42f * std::sqrt(1.f - e) : 0.f;
-+                const float shade = 0.24f * smoothstep(R * 0.70f, R, d);
-+                r = (r + (255 - r) * gloss) * (1 - shade);
-+                g = (g + (255 - g) * gloss) * (1 - shade);
-+                b = (b + (255 - b) * gloss) * (1 - shade);
-+                const float rim = std::clamp(2.0f - std::fabs(d - (R - 2.2f)), 0.f, 1.f) * 0.9f;
++                // its edge a little shaded, lit again just inside the rim (the glass), then the rim:
++                // a light line along it
++                const float shade = 0.14f * smoothstep(R * 0.74f, R * 0.94f, d);
++                r *= 1 - shade;
++                g *= 1 - shade;
++                b *= 1 - shade;
++                const float inner = 0.22f * smoothstep(R - 12.f, R - 2.f, d);
++                r += (255 - r) * inner;
++                g += (255 - g) * inner;
++                b += (255 - b) * inner;
++                const float rim = std::clamp(2.2f - std::fabs(d - (R - 2.0f)), 0.f, 1.f) * 0.78f;
 +                r += (255 - r) * rim;
 +                g += (255 - g) * rim;
 +                b += (255 - b) * rim;
 +            }
-+            const float a = cov + shadow * (1 - cov);
-+            out.pixels[static_cast<size_t>(y) * SPRITE + x] = static_cast<uint32_t>(r * cov + 0.5f) | (static_cast<uint32_t>(g * cov + 0.5f) << 8)
-+                | (static_cast<uint32_t>(b * cov + 0.5f) << 16) | (static_cast<uint32_t>(a * 255 + 0.5f) << 24);
++            // (the halo is white: premultiplied, its colour is its alpha)
++            const float halo_a = halo * (1 - cov);
++            const float a = cov + halo_a;
++            out.pixels[static_cast<size_t>(y) * SPRITE + x] = static_cast<uint32_t>(r * cov + 255 * halo_a + 0.5f) | (static_cast<uint32_t>(g * cov + 255 * halo_a + 0.5f) << 8)
++                | (static_cast<uint32_t>(b * cov + 255 * halo_a + 0.5f) << 16) | (static_cast<uint32_t>(a * 255 + 0.5f) << 24);
 +        }
 +    }
 +    return out;
@@ -8333,50 +8418,52 @@ index 00000000..27a666cd
 +                if (scale < 0.02f)
 +                    continue;
 +                TileArt &t = art(index);
-+                if (focus > 0.01f)
-+                    c.blit_scaled(glow, x, y, scale, static_cast<uint8_t>(focus * alpha));
++                if (focus > 0.01f) {
++                    // (the focus breathes)
++                    const float breath = 0.78f + 0.22f * std::sin(ms_since(Clock::time_point{}, now) / 260.f);
++                    c.blit_scaled(glow, x, y, scale, static_cast<uint8_t>(focus * breath * alpha));
++                }
 +                c.blit_scaled(t.bubble, x, y, scale, alpha);
-+                const ps4ui::Image &label = t.label.image;
-+                c.blit(label, static_cast<int>(x) - label.width / 2, static_cast<int>(y + BUBBLE_R * scale + 36) - t.label.baseline, alpha);
 +            }
 +        }
 +    }
-+    // the pages, as dots down the right edge
++    // the pages, as dots down the right edge (the firmware's, else drawn)
 +    if (pages > 1) {
 +        const float dots_x = ox + W - 40.f;
 +        const float y0 = H / 2.f - (pages - 1) * 19.f;
 +        const float at = v.rows[1].pos;
++        const ps4ui::Image *dot = ps4shell::picture(ps4shell::Picture::PageDot);
 +        for (int p = 0; p < pages; p++) {
 +            const float near = std::clamp(1.f - std::fabs(at - p), 0.f, 1.f);
-+            c.fill_circle(dots_x, y0 + p * 38.f, 6.f + 4.f * near, rgb(0xffffff, static_cast<uint8_t>(110 + 140 * near)));
++            if (dot)
++                c.blit_scaled(*dot, dots_x, y0 + p * 38.f, 1.3f + 0.4f * near, static_cast<uint8_t>(120 + 135 * near));
++            else
++                c.fill_circle(dots_x, y0 + p * 38.f, 6.f + 4.f * near, rgb(0xffffff, static_cast<uint8_t>(110 + 140 * near)));
 +        }
 +    }
 +}
 +
-+// The status bar: HENkaku at the left; in the middle the home screen and the open LiveAreas (the
-+// one on screen bright); the firmware's state and the time at the right
-+void status_bar(Canvas &c, const app::FirmwareState &fw, const ps4ui::Image &henkaku, const std::vector<const ps4ui::Image *> &cards, float card_pos) {
-+    c.fill_rect(0, 0, W, STATUS_H, rgb(0x000000, 90));
-+    int x = 26;
-+    if (!henkaku.empty()) {
-+        c.draw_image(henkaku, x, STATUS_H / 2 - henkaku.height / 2);
-+        x += henkaku.width + 12;
-+    }
-+    x += c.text(x, 42, "HENkaku", 28, TEXT, Weight::Bold) + 14;
-+    c.text(x, 42, version_text(), 22, rgb(0xc8d6ee));
-+    // home, then the cards, 56 px apart
++// The status bar as the Vita's: black, the network at the left (the firmware's icon), in the middle
++// the home screen and the open LiveAreas (the one on screen bright), the time at the right (a PS TV's,
++// without a battery); what's missing of the firmware before the time
++void status_bar(Canvas &c, const app::FirmwareState &fw, const std::vector<const ps4ui::Image *> &cards, float card_pos) {
++    c.fill_rect(0, 0, W, STATUS_H, rgb(0x000000));
++    if (const ps4ui::Image *wifi = ps4shell::picture(ps4shell::Picture::Wifi))
++        c.blit_scaled(*wifi, 44.f, STATUS_H / 2.f, 1.9f);
++    // home, then the cards, 60 px apart
++    const ps4ui::Image *home = ps4shell::picture(ps4shell::Picture::Home);
 +    const int n = static_cast<int>(cards.size()) + 1;
-+    const float x0 = W / 2.f - (n - 1) * 28.f;
++    const float x0 = W / 2.f - (n - 1) * 30.f;
 +    for (int i = 0; i < n; i++) {
 +        const float near = std::clamp(1.f - std::fabs(card_pos - i), 0.f, 1.f);
-+        const uint8_t a = static_cast<uint8_t>(120 + 135 * near);
-+        const float cx = x0 + i * 56.f;
-+        if (i == 0)
++        const uint8_t a = static_cast<uint8_t>(110 + 145 * near);
++        const float cx = x0 + i * 60.f;
++        if (i == 0 && home)
++            c.blit_scaled(*home, cx, STATUS_H / 2.f, 0.5f, a);
++        else if (i == 0)
 +            home_glyph(c, cx, STATUS_H / 2.f, rgb(0xffffff, a));
 +        else if (!cards[i - 1]->empty())
 +            c.blit(*cards[i - 1], static_cast<int>(cx) - cards[i - 1]->width / 2, STATUS_H / 2 - cards[i - 1]->height / 2, a);
-+        if (near > 0.5f)
-+            c.fill_round_rect(static_cast<int>(cx) - 12, STATUS_H - 7, 24, 4, 2, rgb(0x9fe0ff, static_cast<uint8_t>(255 * near)));
 +    }
 +    int right = W - 34;
 +    const std::string time = clock_text();
@@ -8634,6 +8721,27 @@ index 00000000..27a666cd
 +    }
 +}
 +
++// A picture stretched to w x h with its corners (corner px of it) kept, scaled as the LiveArea is: a
++// button
++ps4ui::Image nine_slice(const ps4ui::Image &src, int w, int h, int corner) {
++    ps4ui::Image out;
++    out.width = w;
++    out.height = h;
++    out.pixels.resize(static_cast<size_t>(w) * h);
++    const int scaled = std::max(1, static_cast<int>(corner * LIVE_SCALE));
++    const auto map = [&](int d, int size, int src_size) {
++        if (d < scaled)
++            return d * corner / scaled;
++        if (d >= size - scaled)
++            return src_size - corner + (d - (size - scaled)) * corner / scaled;
++        return corner + (d - scaled) * (src_size - 2 * corner) / std::max(1, size - 2 * scaled);
++    };
++    for (int y = 0; y < h; y++)
++        for (int x = 0; x < w; x++)
++            out.pixels[static_cast<size_t>(y) * w + x] = src.pixels[static_cast<size_t>(std::clamp(map(y, h, src.height), 0, src.height - 1)) * src.width + std::clamp(map(x, w, src.width), 0, src.width - 1)];
++    return out;
++}
++
 +// A game's LiveArea as on the Vita: its background, its frames of pictures and text, and the gate
 +// (the start picture with Start under it), over the wallpaper
 +void draw_livearea(Canvas &c, Item &item) {
@@ -8690,8 +8798,33 @@ index 00000000..27a666cd
 +        c.draw_image(picture, gate.x + (gate.w - picture.width) / 2, gate.y + (gate.h - picture.height) / 2);
 +    const int bw = static_cast<int>(120 * LIVE_SCALE), bh = static_cast<int>(32 * LIVE_SCALE);
 +    const int bx = gate.x + (gate.w - bw) / 2, by = gate.y + gate.h - bh - static_cast<int>(8 * LIVE_SCALE);
-+    c.fill_round_rect(bx, by, bw, bh, 18, rgb(0x14a8de));
++    if (const ps4ui::Image *button = ps4shell::picture(ps4shell::Picture::StartButton))
++        c.blit(nine_slice(*button, bw, bh, 14), bx, by);
++    else
++        c.fill_round_rect(bx, by, bw, bh, 18, rgb(0x14a8de));
 +    c.text_centered(bx + bw / 2, by + bh / 2 + 15, "Start", 40, rgb(0xffffff), Weight::Bold);
++
++    // the top right corner, folded down along its diagonal: the LiveArea peels from there (Triangle).
++    // u, v: from the panel's right edge and its top; the corner (u + v < fold) shows what's behind the
++    // card, the flap (its mirror across the fold) the card's light back, darker toward the fold
++    const int fold = static_cast<int>(34 * LIVE_SCALE), right = panel.x + panel.w, top = panel.y;
++    const uint32_t *behind = vita_wallpaper().data();
++    uint32_t *px = c.data();
++    for (int v = 0; v < fold; v++) {
++        for (int u = 0; u < fold; u++) {
++            const int x = right - 1 - u, y = top + v;
++            if (x < 0 || y < 0 || x >= W || y >= H)
++                continue;
++            const size_t at = static_cast<size_t>(y) * W + x;
++            if (u + v < fold) {
++                px[at] = behind[at];
++            } else {
++                const float t = static_cast<float>(u + v - fold) / fold; // 0 at the fold
++                const uint32_t g = static_cast<uint32_t>(198 + 50 * t);
++                px[at] = g | (g << 8) | (std::min(255u, g + 6) << 16) | 0xFF000000u;
++            }
++        }
++    }
 +}
 +
 +// A card peeled away from its top right corner, `d` px along the diagonal (0 to W + H): over
@@ -9142,6 +9275,8 @@ index 00000000..27a666cd
 +}
 +
 +Choice run(EmuEnvState &emuenv, const std::string &notice_text) {
++    // the PS Vita shell's own pictures, from the firmware (the home screen's look as the Vita's)
++    ps4shell::load(fs_utils::path_to_utf8(emuenv.vita_fs_path / "vs0"));
 +    Canvas canvas(W, H);
 +    std::vector<Item> items = load_items(emuenv);
 +    std::vector<Tile> tiles = make_tiles(items);
@@ -9188,7 +9323,6 @@ index 00000000..27a666cd
 +        TileArt t;
 +        t.bubble = make_bubble(icon, rgb(0x1b2a44));
 +        t.mini = ps4ui::shrink_image(t.bubble, 46, 46);
-+        t.label = ps4ui::render_text(tile_title(tl, items), 26, rgb(0xffffff), Weight::Regular, 300, 170);
 +        return art.emplace(index, std::move(t)).first->second;
 +    };
 +    const std::function<TileArt &(int)> tile_art_fn = tile_art;
@@ -9807,28 +9941,9 @@ index 00000000..27a666cd
 +                        const int item = find_item(path);
 +                        minis.push_back(item >= 0 ? &tile_art(item + 2).mini : &henkaku_bar);
 +                    }
-+                    status_bar(canvas, fw, henkaku_bar, minis, card_pos.pos);
-+                    if (mode == Mode::Home) {
-+                        const Tile &t = tiles[tile];
-+                        hints.push_back({ Pad::Cross, t.kind == TileKind::Henkaku ? "Settings" : t.kind == TileKind::Install ? "Install games" : "Open" });
-+                        if (t.kind == TileKind::Game && items[t.item].system == SystemApp::None)
-+                            hints.push_back({ Pad::Square, "Game settings" });
-+                        hints.push_back({ Pad::Triangle, "Install" });
-+                        if (!cards.empty())
-+                            hints.push_back({ Pad::R1, "LiveArea" });
-+                        hints.push_back({ Pad::Options, "HENkaku" });
-+                    } else {
-+                        hints.push_back({ Pad::Cross, "Start" });
-+                        if (live >= 0 && items[live].system == SystemApp::None)
-+                            hints.push_back({ Pad::Square, "Game settings" });
-+                        hints.push_back({ Pad::Circle, "Home" });
-+                        hints.push_back({ Pad::Triangle, "Close" });
-+                        if (cards.size() > 1)
-+                            hints.push_back({ Pad::DPad, "Other LiveAreas" });
-+                    }
++                    status_bar(canvas, fw, minis, card_pos.pos);
++                    // (as on the Vita: no button hints on the home screen or a LiveArea)
 +                    draw_notice(canvas, notice);
-+                    if (!launching)
-+                        footer(canvas, hints, 1050, 0.8f, -1);
 +                    if (job.running)
 +                        draw_install(canvas, job);
 +                    present(canvas);
@@ -12279,12 +12394,287 @@ index 00000000..c06ce988
 +void ff_aom_uninit_film_grain_params(void *s) {
 +    (void)s;
 +}
+diff --git a/vita3k/ps4/ps4_vita_shell.cpp b/vita3k/ps4/ps4_vita_shell.cpp
+new file mode 100644
+index 00000000..aff8a0a4
+--- /dev/null
++++ b/vita3k/ps4/ps4_vita_shell.cpp
+@@ -0,0 +1,217 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#include "ps4_vita_shell.h"
++
++#include <miniz.h>
++
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++namespace ps4shell {
++
++namespace {
++
++// Where each picture is: its resource file, its place among the file's GIM images, its size (the
++// firmware HENkaku installs, 3.74; another version's are checked by size and left out if they differ)
++struct Wanted {
++    Picture which;
++    const char *file;
++    int index;
++    int width, height;
++};
++const Wanted WANTED[] = {
++    { Picture::Wave, "theme_plugin.rco", 0, 360, 192 },
++    { Picture::PageDot, "topmenu_plugin.rco", 5, 16, 16 },
++    { Picture::Home, "applauncher_plugin.rco", 6, 80, 80 },
++    { Picture::Glow, "applauncher_plugin.rco", 5, 40, 40 },
++    { Picture::Wifi, "indicator_plugin.rco", 55, 23, 24 },
++    { Picture::StartButton, "livearea_plugin.rco", 10, 40, 36 },
++};
++
++std::array<ps4ui::Image, static_cast<size_t>(Picture::Count)> pictures;
++bool tried = false;
++
++std::vector<uint8_t> read_file(const std::string &path) {
++    std::vector<uint8_t> data;
++    FILE *f = std::fopen(path.c_str(), "rb");
++    if (!f)
++        return data;
++    std::fseek(f, 0, SEEK_END);
++    const long size = std::ftell(f);
++    std::fseek(f, 0, SEEK_SET);
++    if (size > 0) {
++        data.resize(static_cast<size_t>(size));
++        if (std::fread(data.data(), 1, data.size(), f) != data.size())
++            data.clear();
++    }
++    std::fclose(f);
++    return data;
++}
++
++uint16_t u16(const std::vector<uint8_t> &d, size_t at) {
++    return at + 2 <= d.size() ? static_cast<uint16_t>(d[at] | d[at + 1] << 8) : 0;
++}
++
++uint32_t u32(const std::vector<uint8_t> &d, size_t at) {
++    return at + 4 <= d.size() ? static_cast<uint32_t>(d[at] | d[at + 1] << 8 | d[at + 2] << 16 | static_cast<uint32_t>(d[at + 3]) << 24) : 0;
++}
++
++// A zlib stream at src: its data, and how much of src it took; false if there isn't one
++bool inflate_at(const uint8_t *src, size_t len, std::vector<uint8_t> &out, size_t &used) {
++    mz_stream s{};
++    if (mz_inflateInit(&s) != MZ_OK)
++        return false;
++    s.next_in = src;
++    s.avail_in = static_cast<unsigned int>(len);
++    out.clear();
++    uint8_t buffer[16384];
++    int r;
++    do {
++        s.next_out = buffer;
++        s.avail_out = sizeof(buffer);
++        r = mz_inflate(&s, MZ_NO_FLUSH);
++        out.insert(out.end(), buffer, buffer + (sizeof(buffer) - s.avail_out));
++    } while (r == MZ_OK && out.size() < (64u << 20));
++    used = s.total_in;
++    mz_inflateEnd(&s);
++    return r == MZ_STREAM_END;
++}
++
++// The GIM images of a resource file, in order: its file table's zlib streams that hold one
++std::vector<std::vector<uint8_t>> gims_of(const std::vector<uint8_t> &rco) {
++    std::vector<std::vector<uint8_t>> gims;
++    if (rco.size() < 0x50 || std::memcmp(rco.data(), "RCOF", 4) != 0)
++        return gims;
++    // the header: magic, version, then (offset, size) of the tree, id, hash id, string, wide
++    // string, hash, int array, float array and file tables
++    const uint32_t files = u32(rco, 0x48), files_size = u32(rco, 0x4c);
++    if (files > rco.size() || files_size > rco.size() - files)
++        return gims;
++    const uint8_t *blob = rco.data() + files;
++    size_t i = 0;
++    std::vector<uint8_t> out;
++    while (i + 2 < files_size) {
++        const uint8_t b = blob[i + 1];
++        size_t used = 0;
++        if (blob[i] == 0x78 && (b == 0x01 || b == 0x5e || b == 0x9c || b == 0xda) && inflate_at(blob + i, files_size - i, out, used)) {
++            if (out.size() >= 16 && std::memcmp(out.data(), "MIG.", 4) == 0)
++                gims.push_back(out);
++            i += std::max<size_t>(used, 1);
++        } else {
++            i++;
++        }
++    }
++    return gims;
++}
++
++// A GIM image (the PSP's format): blocks of a type (2 the root, 3 a picture, 4 the image, 5 its
++// palette), the image's 8 or 4 bit indices into an RGBA palette (or RGBA itself), rows padded to 16
++// bytes. The shell's are all of those, unswizzled.
++bool decode_gim(const std::vector<uint8_t> &g, ps4ui::Image &image) {
++    size_t pixels_block = 0, palette_block = 0;
++    const auto walk = [&](auto &&self, size_t at, size_t end, int depth) -> void {
++        while (at + 16 <= end && depth < 8) {
++            const uint16_t type = u16(g, at);
++            const uint32_t size = u32(g, at + 4), data = u32(g, at + 12);
++            if (size == 0 || at + size > g.size())
++                return;
++            if (type == 2 || type == 3)
++                self(self, at + data, at + size, depth + 1);
++            else if (type == 4)
++                pixels_block = at + data;
++            else if (type == 5)
++                palette_block = at + data;
++            at += size;
++        }
++    };
++    walk(walk, 16, g.size(), 0);
++    if (!pixels_block)
++        return false;
++    const uint16_t format = u16(g, pixels_block + 4), order = u16(g, pixels_block + 6);
++    const int width = u16(g, pixels_block + 8), height = u16(g, pixels_block + 10);
++    const size_t pixels = pixels_block + u32(g, pixels_block + 0x1c);
++    const int bits = format == 3 ? 32 : format == 5 ? 8 : format == 4 ? 4 : 0;
++    if (!bits || order != 0 || width <= 0 || height <= 0)
++        return false;
++    const size_t row = (static_cast<size_t>(width) * bits / 8 + 15) / 16 * 16;
++    if (pixels + row * height > g.size())
++        return false;
++    std::vector<uint32_t> palette;
++    if (bits <= 8) {
++        if (!palette_block || u16(g, palette_block + 4) != 3)
++            return false;
++        const int count = u16(g, palette_block + 8);
++        const size_t colors = palette_block + u32(g, palette_block + 0x1c);
++        if (count <= 0 || colors + static_cast<size_t>(count) * 4 > g.size())
++            return false;
++        for (int k = 0; k < count; k++)
++            palette.push_back(u32(g, colors + static_cast<size_t>(k) * 4));
++    }
++    image.width = width;
++    image.height = height;
++    image.pixels.assign(static_cast<size_t>(width) * height, 0);
++    for (int y = 0; y < height; y++) {
++        const uint8_t *src = g.data() + pixels + row * y;
++        for (int x = 0; x < width; x++) {
++            uint32_t p;
++            if (bits == 32) {
++                p = static_cast<uint32_t>(src[x * 4] | src[x * 4 + 1] << 8 | src[x * 4 + 2] << 16) | static_cast<uint32_t>(src[x * 4 + 3]) << 24;
++            } else {
++                const int index = bits == 8 ? src[x] : (src[x / 2] >> ((x & 1) * 4)) & 0xF;
++                p = index < static_cast<int>(palette.size()) ? palette[index] : 0;
++            }
++            image.pixels[static_cast<size_t>(y) * width + x] = p;
++        }
++    }
++    ps4ui::premultiply(image);
++    return true;
++}
++
++} // namespace
++
++bool load(const std::string &vs0) {
++    if (tried)
++        return picture(Picture::Wave) != nullptr;
++    tried = true;
++    std::string current;
++    std::vector<std::vector<uint8_t>> gims;
++    int found = 0;
++    for (const Wanted &w : WANTED) {
++        if (current != w.file) {
++            current = w.file;
++            gims = gims_of(read_file(vs0 + "/vsh/shell/" + w.file));
++        }
++        ps4ui::Image image;
++        if (w.index < static_cast<int>(gims.size()) && decode_gim(gims[w.index], image) && image.width == w.width && image.height == w.height) {
++            pictures[static_cast<size_t>(w.which)] = std::move(image);
++            found++;
++        }
++    }
++    return found > 0;
++}
++
++const ps4ui::Image *picture(Picture which) {
++    const ps4ui::Image &image = pictures[static_cast<size_t>(which)];
++    return image.empty() ? nullptr : &image;
++}
++
++} // namespace ps4shell
+diff --git a/vita3k/ps4/ps4_vita_shell.h b/vita3k/ps4/ps4_vita_shell.h
+new file mode 100644
+index 00000000..1c069c86
+--- /dev/null
++++ b/vita3k/ps4/ps4_vita_shell.h
+@@ -0,0 +1,46 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// PS4: the PS Vita shell's own pictures (its home screen's wave, page dots and status bar icons, the
++// LiveArea's button), read from the firmware the user installed: vs0:vsh/shell/*.rco, CXML resource
++// files whose file table holds GIM images, each zlib-compressed. Nothing of Sony's ships with
++// HENkaku: without the firmware they're missing and the launcher draws its own.
++
++#pragma once
++
++#include "ps4_canvas.h"
++
++#include <string>
++
++namespace ps4shell {
++
++enum class Picture {
++    Wave, // the default theme's wave: white, its alpha a curtain under a curve (theme_plugin)
++    PageDot, // a home screen page's dot (topmenu_plugin)
++    Home, // the home screen's icon (applauncher_plugin)
++    Glow, // a soft light (applauncher_plugin)
++    Wifi, // the status bar's Wi-Fi at full strength (indicator_plugin)
++    StartButton, // the LiveArea gate's button (livearea_plugin)
++    Count
++};
++
++// Reads them from <vs0>/vsh/shell, once; false without the firmware (or with another version's files)
++bool load(const std::string &vs0);
++// One of them (premultiplied, what Canvas::blit takes), or nullptr
++const ps4ui::Image *picture(Picture which);
++
++} // namespace ps4shell
 diff --git a/vita3k/ps4/ps4_wsi.cpp b/vita3k/ps4/ps4_wsi.cpp
 new file mode 100644
-index 00000000..56d76b37
+index 00000000..73994442
 --- /dev/null
 +++ b/vita3k/ps4/ps4_wsi.cpp
-@@ -0,0 +1,683 @@
+@@ -0,0 +1,703 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -12326,6 +12716,7 @@ index 00000000..56d76b37
 +#include <cstdint>
 +#include <cstring>
 +#include <mutex>
++#include <thread>
 +#include <vector>
 +
 +extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance instance, const char *name);
@@ -12958,6 +13349,25 @@ index 00000000..56d76b37
 +        ready = -1;
 +    }
 +    return false;
++}
++
++// Whether the last flip submitted still waits for its vblank, grace_us after asking (frame
++// generation: that vblank's image then isn't made, rather than the render thread waiting a vblank
++// for a free swapchain image at every vblank, as v00.38's did once two flips were queued)
++extern "C" bool ps4_flip_pending(unsigned grace_us) {
++    if (video < 0 || flips_submitted == 0)
++        return false;
++    const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(grace_us);
++    for (;;) {
++        OrbisVideoOutFlipStatus status{};
++        if (sceVideoOutGetFlipStatus(video, &status) < 0)
++            return false;
++        if (status.flipArg >= static_cast<int64_t>(flips_submitted))
++            return false;
++        if (std::chrono::steady_clock::now() >= until)
++            return true;
++        std::this_thread::sleep_for(std::chrono::microseconds(200));
++    }
 +}
 +
 +int ps4wsi_video_handle() {
@@ -13631,7 +14041,7 @@ index 4adf5464..2f68352b 100644
      vkutil::Image depthstencil;
      vkutil::Image mask;
 diff --git a/vita3k/renderer/src/batch.cpp b/vita3k/renderer/src/batch.cpp
-index 87e5a8e1..bf180186 100644
+index 87e5a8e1..594dd785 100644
 --- a/vita3k/renderer/src/batch.cpp
 +++ b/vita3k/renderer/src/batch.cpp
 @@ -32,6 +32,7 @@
@@ -13699,12 +14109,10 @@ index 87e5a8e1..bf180186 100644
              handler->second(state, mem, config, helper, features, command_list.context);
          }
  
-@@ -134,7 +171,13 @@ static void process_batch(renderer::State &state, const FeatureState &features,
- void process_batches(renderer::State &state, const FeatureState &features, MemState &mem, Config &config, int64_t max_wait_ms) {
+@@ -135,6 +172,12 @@ void process_batches(renderer::State &state, const FeatureState &features, MemSt
      auto max_time = duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() + max_wait_ms;
  
--    while (!state.should_display) {
-+    while (!state.should_display && !state.tick_pending()) {
+     while (!state.should_display) {
 +#ifdef __PS4__
 +        ps4_thread_cpu_tick();
 +        ps4stats::enabled.store(ps4_host_profiler(), std::memory_order_relaxed);
@@ -13714,7 +14122,26 @@ index 87e5a8e1..bf180186 100644
          if (state.render_abort.load(std::memory_order_relaxed))
              return;
  
-@@ -175,6 +218,9 @@ void process_batches(renderer::State &state, const FeatureState &features, MemSt
+@@ -142,10 +185,17 @@ void process_batches(renderer::State &state, const FeatureState &features, MemSt
+         if (state.async_flip_requested.load(std::memory_order_relaxed))
+             return;
+ 
++        // frame generation: a vblank's image is due; the game's commands ready now get a batch first
++        // (a renderer that only presented would leave the game waiting on it: v00.38 stopped games
++        // in sceGxmCreateContext)
++        const bool tick = state.tick_pending();
++
+         // Try to wait for a batch (about 2 or 3ms, game should be fast for this)
+-        auto cmd_list = state.command_buffer_queue.top(3);
++        auto cmd_list = state.command_buffer_queue.top(tick ? 1 : 3);
+ 
+         if (!cmd_list || !is_cmd_ready(mem, *cmd_list)) {
++            if (tick)
++                return;
+             // beginning of the game or homebrew not using gxm
+             if (state.context == nullptr)
+                 return;
+@@ -175,7 +225,12 @@ void process_batches(renderer::State &state, const FeatureState &features, MemSt
          }
  
          state.command_buffer_queue.pop();
@@ -13722,9 +14149,12 @@ index 87e5a8e1..bf180186 100644
 +        idle.stop();
 +#endif
          process_batch(state, features, mem, config, *cmd_list);
++        if (tick)
++            return;
      }
  }
-@@ -185,6 +231,9 @@ void reset_command_list(CommandList &command_list) {
+ 
+@@ -185,6 +240,9 @@ void reset_command_list(CommandList &command_list) {
  }
  
  static void render_loop(renderer::State &state, DisplayState &display, GxmState &gxm, MemState &mem, Config &config) {
@@ -13734,7 +14164,7 @@ index 87e5a8e1..bf180186 100644
      if (state.precompile_requested) {
          auto progress_overlay = state.overlay_manager
              ? state.overlay_manager->create<overlay::shader_precompile_progress>()
-@@ -274,8 +323,18 @@ static void render_loop(renderer::State &state, DisplayState &display, GxmState
+@@ -274,8 +332,18 @@ static void render_loop(renderer::State &state, DisplayState &display, GxmState
              }
          }
  
@@ -14962,7 +15392,7 @@ index ff6d0c5b..ab744977 100644
  
          if (request == nullptr)
 diff --git a/vita3k/renderer/src/vulkan/renderer.cpp b/vita3k/renderer/src/vulkan/renderer.cpp
-index ed8c71ad..f3cc1cd3 100644
+index ed8c71ad..7ebc233b 100644
 --- a/vita3k/renderer/src/vulkan/renderer.cpp
 +++ b/vita3k/renderer/src/vulkan/renderer.cpp
 @@ -22,6 +22,7 @@
@@ -14986,19 +15416,20 @@ index ed8c71ad..f3cc1cd3 100644
  #ifdef __ANDROID__
  #include <SDL3/SDL_system.h>
  #include <dlfcn.h>
-@@ -150,6 +157,11 @@ const static std::vector<const char *> required_device_extensions = {
+@@ -150,6 +157,12 @@ const static std::vector<const char *> required_device_extensions = {
      vk::KHRMaintenance1ExtensionName
  };
  
 +#ifdef __PS4__
 +extern "C" bool ps4_frame_generation(); // vita3k/ps4/ps4_settings.cpp
 +extern "C" void ps4_set_frame_doubling(bool on); // the FPS overlay's "on screen" (ps4_settings.cpp)
++extern "C" bool ps4_flip_pending(unsigned grace_us); // vita3k/ps4/ps4_wsi.cpp
 +#endif
 +
  namespace renderer::vulkan {
  
  #if defined(__ANDROID__) && defined(USE_ADRENO_TOOLS)
-@@ -379,6 +391,8 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
+@@ -379,6 +392,8 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
  
          if (!detect_patch_bcn(&texture_cache.support_dxt))
              return false;
@@ -15007,7 +15438,7 @@ index ed8c71ad..f3cc1cd3 100644
  #else
          VULKAN_HPP_DEFAULT_DISPATCHER.init();
  #endif
-@@ -406,6 +420,10 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
+@@ -406,6 +421,10 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
              instance_extensions.push_back(vk::KHRWin32SurfaceExtensionName);
  #elif defined(__APPLE__)
              instance_extensions.push_back(vk::EXTMetalSurfaceExtensionName);
@@ -15018,7 +15449,7 @@ index ed8c71ad..f3cc1cd3 100644
  #elif !defined(__ANDROID__)
              if (!select_linux_surface_extension(*this, frame_host->handle(), instance_extensions))
                  return false;
-@@ -713,6 +731,16 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
+@@ -713,6 +732,16 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
          // we need to make a copy of the vertex buffer for moltenvk, so disable memory mapping
          support_memory_mapping = false;
  #endif
@@ -15035,7 +15466,7 @@ index ed8c71ad..f3cc1cd3 100644
  
  #ifdef __ANDROID__
          support_android_buffer_import &= SDL_GetAndroidSDKVersion() >= 26;
-@@ -945,6 +973,14 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
+@@ -945,6 +974,14 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
          LOG_WARN("Failed to initialize Vulkan overlay renderer, overlays will be disabled");
      }
  
@@ -15050,7 +15481,7 @@ index ed8c71ad..f3cc1cd3 100644
      support_fsr &= static_cast<bool>(screen_renderer.surface_capabilities.supportedUsageFlags & vk::ImageUsageFlagBits::eStorage);
      // The FSR storage shaders write rgba8; BGRA8 swapchain views are not format-compatible.
      support_fsr &= screen_renderer.surface_format.format == vk::Format::eR8G8B8A8Unorm;
-@@ -1125,11 +1161,16 @@ void VKState::cleanup() {
+@@ -1125,11 +1162,16 @@ void VKState::cleanup() {
  void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState &mem) {
      // we are displaying this frame, wait for a new one
      should_display = false;
@@ -15067,13 +15498,16 @@ index ed8c71ad..f3cc1cd3 100644
      }
  
      update_overlays();
-@@ -1143,39 +1184,21 @@ void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState
+@@ -1143,39 +1185,24 @@ void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState
      if (!frame.base && !has_overlays)
          return;
  
 +#ifdef __PS4__
-+    if (ps4_frame_generation() && frame.base) {
-+        if (render_generated(display, frame, now, has_overlays, tick))
++    if (ps4_frame_generation()) {
++        if (frame.base && render_generated(display, frame, now, has_overlays, tick))
++            return;
++        // (a frame it can't take, or only overlays: an image at a vblank too, never waiting for one)
++        if (!tick || ps4_flip_pending(2000))
 +            return;
 +    } else if (screen_renderer.frame_generator) {
 +        // (turned off: its frames are old when it's back)
@@ -15119,7 +15553,7 @@ index ed8c71ad..f3cc1cd3 100644
  
      if (has_overlays && screen_renderer.current_cmd_buffer) {
          overlay_renderer.prepare(screen_renderer.current_cmd_buffer,
-@@ -1248,6 +1271,83 @@ void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState
+@@ -1248,6 +1275,84 @@ void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState
      }
  }
  
@@ -15176,7 +15610,8 @@ index ed8c71ad..f3cc1cd3 100644
 +            return false;
 +        generator.add_frame(surface, vk::ImageLayout::eGeneral, viewport, frame.vblank_time, now);
 +    }
-+    if (!tick)
++    // at a vblank, once the last image is on screen (else this one waits for the next vblank)
++    if (!tick || ps4_flip_pending(2000))
 +        return true;
 +
 +    if (!screen_renderer.acquire_swapchain_image())
@@ -15203,7 +15638,7 @@ index ed8c71ad..f3cc1cd3 100644
  void VKState::swap_window() {
      screen_renderer.swap_window();
  
-@@ -1724,6 +1824,8 @@ renderer::VulkanDeviceInfo renderer::enumerate_vulkan_devices(const std::string
+@@ -1724,6 +1829,8 @@ renderer::VulkanDeviceInfo renderer::enumerate_vulkan_devices(const std::string
              return info;
  
          dispatch.init(vk_get_instance_proc_addr);
