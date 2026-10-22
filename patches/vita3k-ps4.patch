@@ -3314,10 +3314,10 @@ index 00000000..3c973064
 +} // namespace ps4ui
 diff --git a/vita3k/ps4/ps4_controls.cpp b/vita3k/ps4/ps4_controls.cpp
 new file mode 100644
-index 00000000..b2f65b37
+index 00000000..e8d5cffe
 --- /dev/null
 +++ b/vita3k/ps4/ps4_controls.cpp
-@@ -0,0 +1,286 @@
+@@ -0,0 +1,297 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -3384,7 +3384,7 @@ index 00000000..b2f65b37
 +    static const std::vector<ActionName> names = [] {
 +        std::vector<ActionName> list = { { "Nothing", "none" }, { "Cross", "cross" }, { "Circle", "circle" }, { "Square", "square" },
 +            { "Triangle", "triangle" }, { "Up", "up" }, { "Down", "down" }, { "Left", "left" }, { "Right", "right" }, { "L", "l" }, { "R", "r" },
-+            { "START", "start" }, { "SELECT", "select" }, { "PS TV L2", "l2" }, { "PS TV R2", "r2" }, { "PS TV L3", "l3" }, { "PS TV R3", "r3" } };
++            { "START", "start" }, { "SELECT", "select" }, { "PS TV L2 (PS TV games)", "l2" }, { "PS TV R2 (PS TV games)", "r2" }, { "PS TV L3 (PS TV games)", "l3" }, { "PS TV R3 (PS TV games)", "r3" } };
 +        for (int i = 0; i < 9; i++)
 +            list.push_back({ std::string("Front touch, ") + PLACE_NAMES[i], std::string("front-") + PLACE_KEYS[i] });
 +        for (int i = 0; i < 9; i++)
@@ -3424,13 +3424,22 @@ index 00000000..b2f65b37
 +    if (!f)
 +        return false;
 +    char line[256];
++    bool layout_2 = false;
++    std::vector<std::pair<std::string, std::string>> lines;
 +    while (std::fgets(line, sizeof(line), f)) {
 +        const std::string text = line;
 +        const size_t eq = text.find('=');
 +        if (eq == std::string::npos || text[0] == '#')
 +            continue;
-+        const std::string key = trim(text.substr(0, eq));
-+        const std::string value = trim(text.substr(eq + 1));
++        lines.push_back({ trim(text.substr(0, eq)), trim(text.substr(eq + 1)) });
++        layout_2 |= lines.back().first == "layout" && lines.back().second == "2";
++    }
++    std::fclose(f);
++    for (const auto &[key, value] : lines) {
++        // (a file from before layout 2 keeps the new touches on L2/R2/L3/R3 where it had the old
++        // defaults there)
++        if (!layout_2 && (key == "l2" || key == "r2" || key == "l3" || key == "r3") && value == key)
++            continue;
 +        if (key == "touchpad") {
 +            for (int i = 0; i < TouchpadUseCount; i++)
 +                if (value == TOUCHPAD_KEYS[i])
@@ -3446,7 +3455,6 @@ index 00000000..b2f65b37
 +                    controls.button[b] = static_cast<uint8_t>(a);
 +        }
 +    }
-+    std::fclose(f);
 +    return true;
 +}
 +
@@ -3458,6 +3466,7 @@ index 00000000..b2f65b37
 +        return;
 +    }
 +    std::fprintf(f, "# HENkaku: the DualShock 4 button = what the game gets (HENkaku > Controls)\n");
++    std::fprintf(f, "layout = 2\n");
 +    std::fprintf(f, "touchpad = %s\n", TOUCHPAD_KEYS[std::min<int>(controls.touchpad, TouchpadUseCount - 1)]);
 +    const auto &names = action_names();
 +    for (int b = 0; b < PadButtonCount; b++)
@@ -3522,8 +3531,10 @@ index 00000000..b2f65b37
 +
 +Controls defaults() {
 +    Controls controls{};
-+    const uint8_t layout[PadButtonCount] = { ActCross, ActCircle, ActSquare, ActTriangle, ActUp, ActDown, ActLeft, ActRight, ActL, ActR, ActL2, ActR2,
-+        ActL3, ActR3, ActStart, ActSelect };
++    // L2/R2 the rear touch pad's left and right, L3/R3 the front screen's (God of War's Vita port
++    // put the PS2's L2/R2 on the rear pad's halves): the PS TV's buttons only reach PS TV games
++    const uint8_t layout[PadButtonCount] = { ActCross, ActCircle, ActSquare, ActTriangle, ActUp, ActDown, ActLeft, ActRight, ActL, ActR,
++        ActBackTouch + 1, ActBackTouch + 2, ActFrontTouch + 1, ActFrontTouch + 2, ActStart, ActSelect };
 +    std::copy(std::begin(layout), std::end(layout), controls.button);
 +    controls.touchpad = TouchpadFront;
 +    return controls;
@@ -7300,10 +7311,10 @@ index 00000000..4590e9a1
 +}
 diff --git a/vita3k/ps4/ps4_pad.cpp b/vita3k/ps4/ps4_pad.cpp
 new file mode 100644
-index 00000000..5ef89053
+index 00000000..a8fca29b
 --- /dev/null
 +++ b/vita3k/ps4/ps4_pad.cpp
-@@ -0,0 +1,278 @@
+@@ -0,0 +1,287 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -7326,7 +7337,8 @@ index 00000000..5ef89053
 +// While a game runs the pad goes into Vita3K's virtual keyboard state (ctrl/state.h), which both
 +// the game's sceCtrl reads and Vita3K's own menus (overlay) merge in:
 +//   by default Cross/Circle/Square/Triangle, D-pad, sticks = the Vita's, L1/R1 = L/R, OPTIONS =
-+//   START, touchpad click = SELECT, touchpad = the front touch screen, L2/R2/L3/R3 = the PS TV's;
++//   START, touchpad click = SELECT, touchpad = the front touch screen, L2/R2 = the rear touch pad's
++//   left and right, L3/R3 = the front screen's;
 +//   each button and the touchpad can be set otherwise (ps4_controls.h: Vita buttons, touches on the
 +//   front screen or the rear touch pad), L3 + R3 together = the HENkaku menu.
 +
@@ -7438,6 +7450,14 @@ index 00000000..5ef89053
 +        float x, y;
 +        ps4controls::touch_place(place, x, y);
 +        points[port].push_back({ x, y, static_cast<uint8_t>(64 + b) });
++    }
++    // (once per panel: the log shows touches got through)
++    static bool logged[2] = {};
++    for (int port = 0; port < 2; port++) {
++        if (!points[port].empty() && !logged[port]) {
++            logged[port] = true;
++            LOG_INFO("PS4 controls: first touch on the {}", port ? "rear touch pad" : "front screen");
++        }
 +    }
 +    ps4_set_touches(emuenv.touch, points);
 +}
