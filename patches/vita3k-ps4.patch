@@ -6286,10 +6286,10 @@ index 00000000..0210098f
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..18dae10c
+index 00000000..8024f03b
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
-@@ -0,0 +1,539 @@
+@@ -0,0 +1,597 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -6329,6 +6329,8 @@ index 00000000..18dae10c
 +#include "ps4_wsi.h"
 +
 +#include <cpu/functions.h>
++#include <renderer/commands.h>
++#include <renderer/ps4_render_stats.h>
 +#include <kernel/state.h>
 +#include <kernel/thread/thread_state.h>
 +#include <app/functions.h>
@@ -6375,6 +6377,60 @@ index 00000000..18dae10c
 +
 +// kernel/src/kernel.cpp: every guest thread's wait, and who holds what it waits for
 +void ps4_log_waits(KernelState &kernel);
++
++// The renderer profiler's line: HENkaku's render thread's draws and what each part of them took,
++// its biggest kinds of state set and command (renderer/ps4_render_stats.h)
++void log_render_stats(double seconds, double ticks_per_ms) {
++    namespace st = renderer::ps4stats;
++    static const char *const commands[] = { "CreateContext", "CreateRenderTarget", "MemoryMap", "MemoryUnmap", "Draw", "TransferCopy", "TransferDownscale", "TransferFill", "Nop",
++        "SetState", "SetContext", "SyncSurfaceData", "MidSceneFlush", "SignalSyncObject", "WaitSyncObject", "SignalNotification", "SetScreenFilter", "NewFrame",
++        "DestroyRenderTarget", "DestroyContext" };
++    static const char *const states[] = { "RegionClip", "Program", "Viewport", "DepthBias", "DepthFunc", "DepthWriteEnable", "PolygonMode", "PointLineWidth",
++        "StencilFunc", "Texture", "StencilRef", "VertexStream", "TwoSided", "CullMode", "UniformBuffer", "FragmentProgramEnable", "VisibilityBuffer", "VisibilityIndex" };
++    static const char *const phases[] = { "pipeline", "shader info", "uniforms+textures", "indices", "vertices", "recording" };
++    static uint64_t last_command_ticks[st::MAX_KINDS], last_command_count[st::MAX_KINDS], last_state_ticks[st::MAX_KINDS], last_state_count[st::MAX_KINDS], last_phase[st::PhaseCount];
++    const auto take = [](std::atomic<uint64_t> &counter, uint64_t &last) {
++        const uint64_t now = counter.load(std::memory_order_relaxed);
++        const uint64_t delta = now - last;
++        last = now;
++        return delta;
++    };
++    const auto ms = [&](uint64_t ticks) { return ticks / ticks_per_ms / seconds; };
++
++    struct Part {
++        std::string name;
++        double ms_per_s, per_s;
++    };
++    const auto biggest = [](std::vector<Part> parts, size_t count) {
++        std::sort(parts.begin(), parts.end(), [](const Part &a, const Part &b) { return a.ms_per_s > b.ms_per_s; });
++        std::string text;
++        for (size_t i = 0; i < std::min(count, parts.size()) && parts[i].ms_per_s >= 1.0; i++)
++            text += fmt::format("{}{} {:.0f} ms/s ({:.0f}/s)", text.empty() ? "" : ", ", parts[i].name, parts[i].ms_per_s, parts[i].per_s);
++        return text.empty() ? std::string("-") : text;
++    };
++
++    std::vector<Part> command_parts, state_parts;
++    double draws = 0, draw_ms = 0;
++    for (int i = 0; i < st::MAX_KINDS; i++) {
++        const double c_ms = ms(take(st::command_ticks[i], last_command_ticks[i])), c_n = take(st::command_count[i], last_command_count[i]) / seconds;
++        if (i < static_cast<int>(std::size(commands)))
++            command_parts.push_back({ commands[i], c_ms, c_n });
++        if (i == static_cast<int>(renderer::CommandOpcode::Draw)) {
++            draws = c_n;
++            draw_ms = c_ms;
++        }
++        const double s_ms = ms(take(st::state_ticks[i], last_state_ticks[i])), s_n = take(st::state_count[i], last_state_count[i]) / seconds;
++        if (i < static_cast<int>(std::size(states)))
++            state_parts.push_back({ states[i], s_ms, s_n });
++    }
++    std::string draw_parts;
++    for (int i = 0; i < st::PhaseCount; i++) {
++        const double phase_ms = ms(take(st::phase_ticks[i], last_phase[i]));
++        draw_parts += fmt::format("{}{} {:.1f}", i ? ", " : "", phases[i], draws > 0 ? phase_ms * 1000.0 / draws : 0.0);
++    }
++    LOG_INFO("renderer: {:.0f} draws/s, {:.1f} us each ({}; us); commands: {}; state: {}", draws, draws > 0 ? draw_ms * 1000.0 / draws : 0.0, draw_parts,
++        biggest(command_parts, 6), biggest(state_parts, 5));
++}
 +
 +// The profiler's hottest places in each busy guest thread's code: the share of its samples, the
 +// module and offset (to find in the game's code), and the code from there (the run the JIT
@@ -6445,6 +6501,8 @@ index 00000000..18dae10c
 +                ps4_log_waits(emuenv.kernel);
 +            }
 +            log_profile(emuenv);
++            if (ps4settings::prefs().host_profiler)
++                log_render_stats(seconds, (tsc - last_tsc) / (seconds * 1000.0));
 +        } else {
 +            ps4perf::report(0, 0);
 +        }
@@ -7665,10 +7723,10 @@ index 00000000..4291971e
 +} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_settings.cpp b/vita3k/ps4/ps4_settings.cpp
 new file mode 100644
-index 00000000..26492d41
+index 00000000..ed9170d4
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.cpp
-@@ -0,0 +1,649 @@
+@@ -0,0 +1,642 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -8058,8 +8116,6 @@ index 00000000..26492d41
 +    return items;
 +}
 +
-+extern "C" void ps4_sampler_set_enabled(int on); // port/ps4_sampler.cpp
-+
 +// The diagnostics, each with its own switch: they cost a little time, and only help finding what
 +// is wrong
 +std::vector<Item> diagnostics_items() {
@@ -8074,14 +8130,9 @@ index 00000000..26492d41
 +    items.push_back(pref_choice("Format log", { "Off", "On" },
 +        [](const Prefs &p) { return p.format_log ? 1 : 0; },
 +        [](Prefs &p, int value) { p.format_log = value == 1; }, "the vertex and texture formats a game uses"));
-+    items.push_back(section("In /data/Vita3K/samples.log"));
 +    items.push_back(pref_choice("Renderer profiler", { "Off", "On" },
 +        [](const Prefs &p) { return p.host_profiler ? 1 : 0; },
-+        [](Prefs &p, int value) {
-+            p.host_profiler = value == 1;
-+            ps4_sampler_set_enabled(p.host_profiler ? 1 : 0);
-+        },
-+        "where HENkaku's render thread spends its time"));
++        [](Prefs &p, int value) { p.host_profiler = value == 1; }, "where HENkaku's render thread spends its time"));
 +    return items;
 +}
 +
@@ -8320,7 +8371,7 @@ index 00000000..26492d41
 +} // namespace ps4settings
 diff --git a/vita3k/ps4/ps4_settings.h b/vita3k/ps4/ps4_settings.h
 new file mode 100644
-index 00000000..0abc4a4c
+index 00000000..07a0d06f
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.h
 @@ -0,0 +1,92 @@
@@ -8378,7 +8429,7 @@ index 00000000..0abc4a4c
 +    // the diagnostics (HENkaku > Diagnostics), each one can be switched off:
 +    // samples where the game's threads run, and logs the hottest code every 10 s
 +    bool profiler = true;
-+    // samples where HENkaku's render thread runs, into /data/Vita3K/samples.log every 10 s
++    // times what HENkaku's render thread does (commands, state, the parts of a draw) every 10 s
 +    bool host_profiler = true;
 +    // a thread stuck in one call for seconds: the call, and every thread's wait and lock holders
 +    bool freeze_log = true;
@@ -9120,6 +9171,98 @@ index 00000000..ced3b207
 +int ps4wsi_video_handle();
 +// Flips submitted by swapchains so far
 +unsigned long long ps4wsi_flip_count();
+diff --git a/vita3k/renderer/include/renderer/ps4_render_stats.h b/vita3k/renderer/include/renderer/ps4_render_stats.h
+new file mode 100644
+index 00000000..ac02fed2
+--- /dev/null
++++ b/vita3k/renderer/include/renderer/ps4_render_stats.h
+@@ -0,0 +1,86 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#pragma once
++
++// PS4: where HENkaku's render thread spends its time (HENkaku > Diagnostics > Renderer profiler):
++// the time of each kind of command, each kind of state set, and the parts of a draw, counted with
++// the TSC on the render thread and logged every 10 s by vita3k/ps4/ps4_main.cpp. Timing, not
++// sampling: a signal sampler on this thread broke a wait of the GPU driver and froze HENkaku.
++
++#include <atomic>
++#include <cstdint>
++
++namespace renderer::ps4stats {
++
++enum Phase {
++    PhasePipeline, // finding (or compiling) the pipeline
++    PhaseUniforms, // the shader info uniforms
++    PhaseDescriptors, // the uniform buffers and textures bound
++    PhaseIndices, // the index data copied
++    PhaseVertices, // the vertex streams copied (and repacked)
++    PhaseRecord, // the draw recorded
++    PhaseCount
++};
++
++constexpr int MAX_KINDS = 32;
++
++// Written by the render thread only, read by the perf line
++inline std::atomic<bool> enabled{ false };
++inline std::atomic<uint64_t> command_ticks[MAX_KINDS];
++inline std::atomic<uint64_t> command_count[MAX_KINDS];
++inline std::atomic<uint64_t> state_ticks[MAX_KINDS];
++inline std::atomic<uint64_t> state_count[MAX_KINDS];
++inline std::atomic<uint64_t> phase_ticks[PhaseCount];
++
++inline void add(std::atomic<uint64_t> &counter, uint64_t value) {
++    counter.store(counter.load(std::memory_order_relaxed) + value, std::memory_order_relaxed);
++}
++
++// Adds the time from its start to its end (or to next()) to a counter, when the profiler is on
++class Timer {
++public:
++    explicit Timer(std::atomic<uint64_t> &counter, std::atomic<uint64_t> *count = nullptr)
++        : counter(&counter)
++        , count(count)
++        , on(enabled.load(std::memory_order_relaxed))
++        , start(on ? __builtin_ia32_rdtsc() : 0) {}
++    ~Timer() { stop(); }
++    // ends this part and starts the next one
++    void next(std::atomic<uint64_t> &next_counter) {
++        stop();
++        counter = &next_counter;
++        count = nullptr;
++        start = on ? __builtin_ia32_rdtsc() : 0;
++    }
++    void stop() {
++        if (!on || !counter)
++            return;
++        add(*counter, __builtin_ia32_rdtsc() - start);
++        if (count)
++            add(*count, 1);
++        counter = nullptr;
++    }
++
++private:
++    std::atomic<uint64_t> *counter;
++    std::atomic<uint64_t> *count;
++    bool on;
++    uint64_t start;
++};
++
++} // namespace renderer::ps4stats
 diff --git a/vita3k/renderer/include/renderer/state.h b/vita3k/renderer/include/renderer/state.h
 index 65b81052..c999b5c1 100644
 --- a/vita3k/renderer/include/renderer/state.h
@@ -9289,7 +9432,7 @@ index 1a5bc612..b18966ea 100644
      bool support_standard_layout = false;
      bool support_rasterized_order_access = false;
 diff --git a/vita3k/renderer/src/batch.cpp b/vita3k/renderer/src/batch.cpp
-index 87e5a8e1..2be5f2fa 100644
+index 87e5a8e1..6f2ddf72 100644
 --- a/vita3k/renderer/src/batch.cpp
 +++ b/vita3k/renderer/src/batch.cpp
 @@ -32,6 +32,7 @@
@@ -9300,15 +9443,16 @@ index 87e5a8e1..2be5f2fa 100644
  
  #ifdef TRACY_ENABLE
  #include <tracy/Tracy.hpp>
-@@ -39,6 +40,32 @@
+@@ -39,6 +40,33 @@
  
  struct FeatureState;
  
 +#ifdef __PS4__
++#include <renderer/ps4_render_stats.h>
++#endif
++#ifdef __PS4__
 +// port/ps4_sampler.cpp: the perf lines' counters
 +extern "C" void ps4_watch_thread(const char *name);
-+extern "C" void ps4_sampler_register_thread(const char *name);
-+extern "C" void ps4_sampler_set_enabled(int on);
 +extern "C" bool ps4_host_profiler(); // vita3k/ps4/ps4_settings.cpp
 +extern "C" void ps4_thread_cpu_tick();
 +extern "C" void ps4_wait_add(int slot, long long ns);
@@ -9333,19 +9477,32 @@ index 87e5a8e1..2be5f2fa 100644
  namespace renderer {
  Command *generic_command_allocate() {
      return new Command;
-@@ -135,6 +162,11 @@ void process_batches(renderer::State &state, const FeatureState &features, MemSt
+@@ -117,6 +145,11 @@ static void process_batch(renderer::State &state, const FeatureState &features,
+             LOG_ERROR("Unimplemented command opcode {}", static_cast<int>(cmd->opcode));
+         } else {
+             CommandHelper helper(cmd);
++#ifdef __PS4__
++            // (the renderer profiler: each kind of command's time)
++            const int kind = static_cast<int>(cmd->opcode) % ps4stats::MAX_KINDS;
++            ps4stats::Timer timer(ps4stats::command_ticks[kind], &ps4stats::command_count[kind]);
++#endif
+             handler->second(state, mem, config, helper, features, command_list.context);
+         }
+ 
+@@ -135,6 +168,12 @@ void process_batches(renderer::State &state, const FeatureState &features, MemSt
      auto max_time = duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() + max_wait_ms;
  
      while (!state.should_display) {
 +#ifdef __PS4__
 +        ps4_thread_cpu_tick();
++        ps4stats::enabled.store(ps4_host_profiler(), std::memory_order_relaxed);
 +        // waiting for the game's next commands, until process_batch
 +        PerfTimer idle(1);
 +#endif
          if (state.render_abort.load(std::memory_order_relaxed))
              return;
  
-@@ -175,6 +207,9 @@ void process_batches(renderer::State &state, const FeatureState &features, MemSt
+@@ -175,6 +214,9 @@ void process_batches(renderer::State &state, const FeatureState &features, MemSt
          }
  
          state.command_buffer_queue.pop();
@@ -9355,20 +9512,17 @@ index 87e5a8e1..2be5f2fa 100644
          process_batch(state, features, mem, config, *cmd_list);
      }
  }
-@@ -185,6 +220,12 @@ void reset_command_list(CommandList &command_list) {
+@@ -185,6 +227,9 @@ void reset_command_list(CommandList &command_list) {
  }
  
  static void render_loop(renderer::State &state, DisplayState &display, GxmState &gxm, MemState &mem, Config &config) {
 +#ifdef __PS4__
-+    // (the renderer profiler samples this thread)
-+    ps4_sampler_register_thread("render");
-+    if (ps4_host_profiler())
-+        ps4_sampler_set_enabled(1);
++    ps4_watch_thread("render");
 +#endif
      if (state.precompile_requested) {
          auto progress_overlay = state.overlay_manager
              ? state.overlay_manager->create<overlay::shader_precompile_progress>()
-@@ -274,8 +315,18 @@ static void render_loop(renderer::State &state, DisplayState &display, GxmState
+@@ -274,8 +319,18 @@ static void render_loop(renderer::State &state, DisplayState &display, GxmState
              }
          }
  
@@ -9387,6 +9541,32 @@ index 87e5a8e1..2be5f2fa 100644
          state.async_flip_requested.store(false, std::memory_order_relaxed);
  
  #ifdef TRACY_ENABLE
+diff --git a/vita3k/renderer/src/state_set.cpp b/vita3k/renderer/src/state_set.cpp
+index e983487e..760ab826 100644
+--- a/vita3k/renderer/src/state_set.cpp
++++ b/vita3k/renderer/src/state_set.cpp
+@@ -15,6 +15,9 @@
+ // with this program; if not, write to the Free Software Foundation, Inc.,
+ // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+ 
++#ifdef __PS4__
++#include <renderer/ps4_render_stats.h>
++#endif
+ #include <gxm/types.h>
+ #include <renderer/commands.h>
+ #include <renderer/driver_functions.h>
+@@ -562,6 +565,11 @@ COMMAND(handle_set_state) {
+ 
+     if (result != handlers.end()) {
+         // LOG_TRACE("State set: {}", (int)gxm_state_to_set);
++#ifdef __PS4__
++        // (the renderer profiler: each kind of state's time)
++        const int kind = static_cast<int>(gxm_state_to_set) % ps4stats::MAX_KINDS;
++        ps4stats::Timer timer(ps4stats::state_ticks[kind], &ps4stats::state_count[kind]);
++#endif
+         result->second(renderer, mem, config, helper, render_context);
+     } else {
+         LOG_ERROR("Unknown state set command {}", static_cast<uint16_t>(gxm_state_to_set));
 diff --git a/vita3k/renderer/src/vulkan/context.cpp b/vita3k/renderer/src/vulkan/context.cpp
 index 689060fb..11e3e88a 100644
 --- a/vita3k/renderer/src/vulkan/context.cpp
@@ -9597,20 +9777,21 @@ index ed8c71ad..093208ad 100644
          dispatch.init();
  #endif
 diff --git a/vita3k/renderer/src/vulkan/scene.cpp b/vita3k/renderer/src/vulkan/scene.cpp
-index acd85ab5..b7a7464b 100644
+index acd85ab5..8ab9d9fe 100644
 --- a/vita3k/renderer/src/vulkan/scene.cpp
 +++ b/vita3k/renderer/src/vulkan/scene.cpp
-@@ -19,6 +19,9 @@
+@@ -19,6 +19,10 @@
  
  #include <gxm/functions.h>
  #include <renderer/vulkan/gxm_to_vulkan.h>
 +#ifdef __PS4__
++#include <renderer/ps4_render_stats.h>
 +#include <renderer/vulkan/ps4_vertex_layout.h>
 +#endif
  
  #include <config/state.h>
  #include <spdlog/fmt/bin_to_hex.h>
-@@ -305,6 +308,15 @@ static void bind_vertex_streams(VKContext &context, MemState &mem, uint32_t inst
+@@ -305,6 +309,15 @@ static void bind_vertex_streams(VKContext &context, MemState &mem, uint32_t inst
                  if (restride) {
                      restride_stream(stream, stream_size, vertex_program.streams[i].stride);
                  }
@@ -9626,6 +9807,57 @@ index acd85ab5..b7a7464b 100644
  #endif
                  context.vertex_stream_ring_buffer.allocate(context.prerender_cmd, stream_size, stream);
                  context.vertex_stream_offsets[i] = context.vertex_stream_ring_buffer.data_offset;
+@@ -469,6 +482,10 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
+         context.begin_visibility_query();
+     }
+ 
++#ifdef __PS4__
++    // (the renderer profiler: the parts of a draw)
++    ps4stats::Timer phase(ps4stats::phase_ticks[ps4stats::PhasePipeline]);
++#endif
+     // do we need to check for a pipeline change?
+     if (context.refresh_pipeline || type != context.last_primitive) {
+         context.refresh_pipeline = false;
+@@ -501,6 +518,9 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
+     }
+ 
+     const bool use_memory_mapping = context.state.features.enable_memory_mapping;
++#ifdef __PS4__
++    phase.next(ps4stats::phase_ticks[ps4stats::PhaseUniforms]);
++#endif
+ 
+     // update uniforms if needed
+     // first update the buffer and texture count
+@@ -549,8 +569,14 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
+         memcpy(&context.prev_frag_ublock, &frag_ublock, sizeof(frag_ublock));
+     }
+ 
++#ifdef __PS4__
++    phase.next(ps4stats::phase_ticks[ps4stats::PhaseDescriptors]);
++#endif
+     // create, update and bind descriptors (uniforms and textures)
+     draw_bind_descriptors(context, mem);
++#ifdef __PS4__
++    phase.next(ps4stats::phase_ticks[ps4stats::PhaseIndices]);
++#endif
+ 
+     // Upload index data.
+     vk::IndexType index_type = (format == SCE_GXM_INDEX_FORMAT_U16) ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
+@@ -580,8 +606,14 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
+         context.render_cmd.bindIndexBuffer(context.index_stream_ring_buffer.handle(), context.index_stream_ring_buffer.data_offset, index_type);
+     }
+ 
++#ifdef __PS4__
++    phase.next(ps4stats::phase_ticks[ps4stats::PhaseVertices]);
++#endif
+     // bind the vertex streams
+     bind_vertex_streams(context, mem, instance_count, max_index);
++#ifdef __PS4__
++    phase.next(ps4stats::phase_ticks[ps4stats::PhaseRecord]);
++#endif
+ 
+     if (ordered_fetch) {
+         if (ordered_indices) {
 diff --git a/vita3k/renderer/src/vulkan/screen_filters.cpp b/vita3k/renderer/src/vulkan/screen_filters.cpp
 index 192dba99..4ae1b08b 100644
 --- a/vita3k/renderer/src/vulkan/screen_filters.cpp
