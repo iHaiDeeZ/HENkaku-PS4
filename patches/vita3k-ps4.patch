@@ -1902,7 +1902,7 @@ index 1222b690..6697043c 100644
  SceSize get_directory_used_size(const VitaIoDevice device, const std::string &vfs_path, const fs::path &vita_fs_path);
  } // namespace vfs
 diff --git a/vita3k/io/src/io.cpp b/vita3k/io/src/io.cpp
-index 006cf39f..9df4d0a7 100644
+index 006cf39f..f13d3fab 100644
 --- a/vita3k/io/src/io.cpp
 +++ b/vita3k/io/src/io.cpp
 @@ -64,9 +64,41 @@ constexpr bool log_file_stat = false;
@@ -1948,6 +1948,15 @@ index 006cf39f..9df4d0a7 100644
  }
  
  bool read_app_file(FileBuffer &buf, const fs::path &vita_fs_path, const std::string &app_path, const fs::path &vfs_file_path) {
+@@ -116,6 +148,8 @@ bool init(IOState &io, const fs::path &cache_path, const fs::path &log_path, con
+     fs::create_directories(ux0 / "theme");
+     fs::create_directories(ux0 / "video");
+     fs::create_directories(ux0 / "user");
++    // the shell's background downloads (PKGj saves a download's license in ux0:bgdl first)
++    fs::create_directories(ux0 / "bgdl" / "t");
+     fs::create_directories(uma0 / "data");
+     fs::create_directories(vd0 / "registry");
+     fs::create_directories(vd0 / "network");
 diff --git a/vita3k/kernel/include/kernel/kernel_object.h b/vita3k/kernel/include/kernel/kernel_object.h
 index f70b3397..1328a821 100644
 --- a/vita3k/kernel/include/kernel/kernel_object.h
@@ -2017,6 +2026,37 @@ index 4c4694be..af094577 100644
      // Whether the thread is deleted, so guest calls can't find it
      bool is_deleted();
      // The status a thread that ended exited with, or NOT_DORMANT or DORMANT if it hasn't ended
+diff --git a/vita3k/kernel/include/kernel/types.h b/vita3k/kernel/include/kernel/types.h
+index 051d616a..b205a814 100644
+--- a/vita3k/kernel/include/kernel/types.h
++++ b/vita3k/kernel/include/kernel/types.h
+@@ -698,6 +698,26 @@ struct SceKernelStartModuleOpt {
+     SceUInt32 start;
+ };
+ 
++struct SceKernelFwInfo {
++    SceSize size; //!< sizeof(SceKernelFwInfo)
++    char versionString[0x1C];
++    SceUInt version; //!< 0xMMmm0011: 3.74 is 0x03740011
++    SceUInt unk_24;
++};
++static_assert(sizeof(SceKernelFwInfo) == 0x28);
++
++// The system software version Vita3K reports: the last PS Vita firmware, which games may ask for
++// (PKGj compares it with each game's minimum)
++inline void fill_system_sw_version(SceKernelFwInfo &info) {
++    for (char &c : info.versionString)
++        c = 0;
++    const char version[] = "3.74";
++    for (size_t i = 0; i + 1 < sizeof(version); i++)
++        info.versionString[i] = version[i];
++    info.version = 0x03740011;
++    info.unk_24 = 0;
++}
++
+ struct SceKernelStopModuleOpt {
+     SceSize size;
+     SceUInt32 flags;
 diff --git a/vita3k/kernel/src/kernel.cpp b/vita3k/kernel/src/kernel.cpp
 index 97794b3d..fa68ee27 100644
 --- a/vita3k/kernel/src/kernel.cpp
@@ -3512,6 +3552,180 @@ index 426a3db7..b153c347 100644
  
      return 0;
  }
+diff --git a/vita3k/modules/SceIpmi/SceIpmi.cpp b/vita3k/modules/SceIpmi/SceIpmi.cpp
+index 045370a3..c0ea4810 100644
+--- a/vita3k/modules/SceIpmi/SceIpmi.cpp
++++ b/vita3k/modules/SceIpmi/SceIpmi.cpp
+@@ -19,10 +19,25 @@
+ 
+ #include "modules/module_parent.h"
+ 
++#include <io/functions.h>
++#include <util/fs.h>
+ #include <util/tracy.h>
+ 
++#include <cstring>
++#include <iterator>
++#include <mutex>
++#include <set>
++#include <string>
++#include <vector>
++
+ TRACY_MODULE_NAME(SceIpmi);
+ 
++#ifdef __PS4__
++// PS4: HENkaku's background downloads (vita3k/ps4/ps4_bgdl.cpp)
++int ps4_bgdl_queue(const fs::path &vita_fs, int type, const std::string &url, const std::string &title, const std::vector<uint8_t> &license);
++void ps4_bgdl_start(const fs::path &vita_fs);
++#endif
++
+ EXPORT(int, _ZN4IPMI6Client10disconnectEv) {
+     return UNIMPLEMENTED();
+ }
+@@ -37,6 +52,84 @@ struct BufferInfo {
+     SceSize bufferWrittenSize; // size written by method
+ };
+ 
++struct DataInfo {
++    Ptr<const void> pData;
++    SceSize dataSize;
++};
++
++// The shell's download service (SceDownload): the clients made for it. PKGj queues a package with
++// method 0x12340012 (its parameters below; the download's id comes back in the second output
++// buffer), then 0x12340007 sets the queue going. On PS4 HENkaku downloads it itself.
++static std::mutex download_clients_mutex;
++static std::set<Address> download_clients;
++
++struct DownloadParam {
++    int32_t type[2]; // 0x16 game, 0x17 add-on, 0x0C theme, 0x06 PSM, 0x00 PSP
++    char unk_08[0x68];
++    char url[0x800];
++    char icon_path[0x100];
++    char title[0x33A];
++    char license_path[0x100]; // the license, which the download keeps a copy of
++    char unk_daa[0x16];
++};
++static_assert(sizeof(DownloadParam) == 0xDC0);
++
++static bool is_download_client(Address client) {
++    const std::lock_guard<std::mutex> lock(download_clients_mutex);
++    return download_clients.contains(client);
++}
++
++static std::string bounded(const char *text, size_t size) {
++    return std::string(text, strnlen(text, size));
++}
++
++static int download_method(EmuEnvState &emuenv, uint32_t method, const DataInfo *in, uint32_t in_count, int32_t *result, BufferInfo *out, uint32_t out_count) {
++    int32_t ret = 0;
++    switch (method) {
++    case 0x12340012: { // queue a download
++        const DownloadParam *param = (in && in_count >= 1 && in[0].dataSize >= sizeof(DownloadParam)) ? in[0].pData.cast<const DownloadParam>().get(emuenv.mem) : nullptr;
++        if (!param) {
++            ret = SCE_KERNEL_ERROR_ILLEGAL_ADDR;
++            break;
++        }
++        const std::string url = bounded(param->url, sizeof(param->url));
++        const std::string title = bounded(param->title, sizeof(param->title));
++        const std::string license_path = bounded(param->license_path, sizeof(param->license_path));
++        std::vector<uint8_t> license;
++        if (!license_path.empty()) {
++            fs::ifstream file(expand_path(emuenv.io, license_path.c_str(), emuenv.vita_fs_path), std::ios::binary);
++            license.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
++        }
++        LOG_INFO("SceDownload: queue {} ({}), type {}, license {} ({} bytes)", title, url, log_hex(param->type[0]), license_path, license.size());
++#ifdef __PS4__
++        const int id = ps4_bgdl_queue(emuenv.vita_fs_path, param->type[0], url, title, license);
++#else
++        const int id = -1;
++#endif
++        if (id < 0) {
++            ret = SCE_KERNEL_ERROR_ERROR;
++            break;
++        }
++        if (out && out_count >= 2 && out[1].bufferSize >= sizeof(int32_t) && out[1].pBuffer) {
++            *out[1].pBuffer.cast<int32_t>().get(emuenv.mem) = id;
++            out[1].bufferWrittenSize = sizeof(int32_t);
++        }
++        break;
++    }
++    case 0x12340007: // the queue goes
++#ifdef __PS4__
++        ps4_bgdl_start(emuenv.vita_fs_path);
++#endif
++        break;
++    default:
++        LOG_WARN("SceDownload: method {} not handled", log_hex(method));
++        break;
++    }
++    if (result)
++        *result = ret;
++    return 0;
++}
++
+ EXPORT(int, _ZN4IPMI6Client12tryGetResultEjPiPvPmm, unsigned int a1, int *a2, void *a3, unsigned long *a4, unsigned long a5) {
+     return UNIMPLEMENTED();
+ }
+@@ -53,7 +146,10 @@ EXPORT(int, _ZN4IPMI6Client13waitEventFlagEjjjPjS1_) {
+     return UNIMPLEMENTED();
+ }
+ 
+-EXPORT(int, _ZN4IPMI6Client16invokeSyncMethodEjPKNS_8DataInfoEjPiPNS_10BufferInfoEj) {
++EXPORT(int, _ZN4IPMI6Client16invokeSyncMethodEjPKNS_8DataInfoEjPiPNS_10BufferInfoEj, Ptr<void> client, uint32_t method, const DataInfo *in, uint32_t in_count, int32_t *result, BufferInfo *out, uint32_t out_count) {
++    TRACY_FUNC(_ZN4IPMI6Client16invokeSyncMethodEjPKNS_8DataInfoEjPiPNS_10BufferInfoEj, client, method, in, in_count, result, out, out_count);
++    if (is_download_client(client.address()))
++        return download_method(emuenv, method, in, in_count, result, out, out_count);
+     return UNIMPLEMENTED();
+ }
+ 
+@@ -73,11 +169,12 @@ EXPORT(int, _ZN4IPMI6Client19terminateConnectionEv) {
+     return UNIMPLEMENTED();
+ }
+ 
+-// IPMI::Client::Config::estimateClientMemorySize()
++// IPMI::Client::Config::estimateClientMemorySize(): what the shell's own clients take (PKGj checks for
++// it); a client here only keeps its vtable
+ EXPORT(int, _ZN4IPMI6Client6Config24estimateClientMemorySizeEv) {
+     TRACY_FUNC(_ZN4IPMI6Client6Config24estimateClientMemorySizeEv);
+     STUBBED("stubbed");
+-    return 0x100;
++    return 0xC4;
+ }
+ 
+ // IPMI::Client::create(IPMI::Client**, IPMI::Client::Config const*, void*, void*)
+@@ -85,6 +182,11 @@ EXPORT(int, _ZN4IPMI6Client6createEPPS0_PKNS0_6ConfigEPvS6_, Ptr<void> *client,
+     TRACY_FUNC(_ZN4IPMI6Client6createEPPS0_PKNS0_6ConfigEPvS6_, client, config, user_data, client_memory);
+     *client_memory.cast<Ptr<void>>().get(emuenv.mem) = get_client_vtable(emuenv.kernel, emuenv.mem);
+     *client = client_memory;
++    // (the config starts with the service's name)
++    if (config && strncmp(static_cast<const char *>(config), "SceDownload", 16) == 0) {
++        const std::lock_guard<std::mutex> lock(download_clients_mutex);
++        download_clients.insert(client_memory.address());
++    }
+     STUBBED("Stubed");
+     return 0;
+ }
+diff --git a/vita3k/modules/SceKernelModulemgr/SceModulemgr.cpp b/vita3k/modules/SceKernelModulemgr/SceModulemgr.cpp
+index 53571dee..9e55f412 100644
+--- a/vita3k/modules/SceKernelModulemgr/SceModulemgr.cpp
++++ b/vita3k/modules/SceKernelModulemgr/SceModulemgr.cpp
+@@ -168,9 +168,12 @@ EXPORT(int, sceKernelGetModuleList, int flags, SceUID *modids, int *num) {
+     return SCE_KERNEL_OK;
+ }
+ 
+-EXPORT(int, sceKernelGetSystemSwVersion) {
+-    TRACY_FUNC(sceKernelGetSystemSwVersion);
+-    return UNIMPLEMENTED();
++EXPORT(int, sceKernelGetSystemSwVersion, SceKernelFwInfo *info) {
++    TRACY_FUNC(sceKernelGetSystemSwVersion, info);
++    if (!info)
++        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
++    fill_system_sw_version(*info);
++    return 0;
+ }
+ 
+ EXPORT(int, sceKernelInhibitLoadingModule) {
 diff --git a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
 index 6b5a9155..f1482605 100644
 --- a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
@@ -3526,10 +3740,24 @@ index 6b5a9155..f1482605 100644
          return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_MUTEX_ID);
      return mutex->acquire(emuenv.mem, emuenv.kernel.get_thread(thread_id), lock_count, ptimeout, false);
 diff --git a/vita3k/modules/SceLibKernel/SceLibKernel.cpp b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
-index a02c7b6a..a3a65a84 100644
+index a02c7b6a..dbb1703e 100644
 --- a/vita3k/modules/SceLibKernel/SceLibKernel.cpp
 +++ b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
-@@ -1583,7 +1583,7 @@ EXPORT(int, sceKernelLockLwMutexCB, Ptr<SceKernelLwMutexWork> workarea, int lock
+@@ -532,7 +532,12 @@ EXPORT(int, sceIoDevctl, const char *dev, SceInt cmd, const void *indata, SceSiz
+ 
+         fs::path dev_path = boost::describe::enum_to_string(device, "");
+         fs::path path = emuenv.vita_fs_path / dev_path;
+-        fs::space_info space = fs::space(path);
++        boost::system::error_code ec;
++        fs::space_info space = fs::space(path, ec);
++        if (ec) {
++            LOG_WARN_ONCE("sceIoDevctl: the free space of {} is unknown: {}", dev, ec.message());
++            space.capacity = space.free = space.available = 0;
++        }
+ 
+         ((SceIoDevInfo *)outdata)->max_size = space.capacity;
+         ((SceIoDevInfo *)outdata)->free_size = space.available;
+@@ -1583,7 +1588,7 @@ EXPORT(int, sceKernelLockLwMutexCB, Ptr<SceKernelLwMutexWork> workarea, int lock
          return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
  
      const auto lwmutexid = workarea.get(emuenv.mem)->uid;
@@ -3538,7 +3766,7 @@ index a02c7b6a..a3a65a84 100644
      if (!mutex)
          return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_MUTEX_ID);
      const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
-@@ -1880,7 +1880,7 @@ EXPORT(int, sceKernelStopUnloadModule, SceUID uid, SceSize args, Ptr<const void>
+@@ -1880,7 +1885,7 @@ EXPORT(int, sceKernelStopUnloadModule, SceUID uid, SceSize args, Ptr<const void>
  EXPORT(int, sceKernelTryLockLwMutex, Ptr<SceKernelLwMutexWork> workarea, int lock_count) {
      TRACY_FUNC(sceKernelTryLockLwMutex, workarea, lock_count);
      const auto lwmutexid = workarea.get(emuenv.mem)->uid;
@@ -3547,7 +3775,7 @@ index a02c7b6a..a3a65a84 100644
      if (!mutex)
          return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_MUTEX_ID);
      return mutex->try_acquire(emuenv.mem, emuenv.kernel.get_thread(thread_id), lock_count);
-@@ -1947,7 +1947,7 @@ EXPORT(int, sceKernelUnloadModule, SceUID uid, SceUInt32 flags, const void *pOpt
+@@ -1947,7 +1952,7 @@ EXPORT(int, sceKernelUnloadModule, SceUID uid, SceUInt32 flags, const void *pOpt
  EXPORT(int, sceKernelUnlockLwMutex, Ptr<SceKernelLwMutexWork> workarea, int unlock_count) {
      TRACY_FUNC(sceKernelUnlockLwMutex, workarea, unlock_count);
      const auto lwmutexid = workarea.get(emuenv.mem)->uid;
@@ -3556,7 +3784,7 @@ index a02c7b6a..a3a65a84 100644
      // A delete clears the owner in the work area, so a Vita reports the unlock as not owned
      if (!mutex)
          return RET_ERROR(SCE_KERNEL_ERROR_LW_MUTEX_NOT_OWNED);
-@@ -1962,7 +1962,7 @@ EXPORT(int, sceKernelUnlockLwMutex_0, Ptr<SceKernelLwMutexWork> workarea, int un
+@@ -1962,7 +1967,7 @@ EXPORT(int, sceKernelUnlockLwMutex_0, Ptr<SceKernelLwMutexWork> workarea, int un
  EXPORT(int, sceKernelUnlockLwMutex2, Ptr<SceKernelLwMutexWork> workarea, int unlock_count) {
      TRACY_FUNC(sceKernelUnlockLwMutex2, workarea, unlock_count);
      const auto lwmutexid = workarea.get(emuenv.mem)->uid;
@@ -3565,6 +3793,101 @@ index a02c7b6a..a3a65a84 100644
      // A delete clears the owner in the work area, so a Vita reports the unlock as not owned
      if (!mutex)
          return RET_ERROR(SCE_KERNEL_ERROR_LW_MUTEX_NOT_OWNED);
+diff --git a/vita3k/modules/SceVshBridge/SceVshBridge.cpp b/vita3k/modules/SceVshBridge/SceVshBridge.cpp
+index 38e1ab97..8d4f11bf 100644
+--- a/vita3k/modules/SceVshBridge/SceVshBridge.cpp
++++ b/vita3k/modules/SceVshBridge/SceVshBridge.cpp
+@@ -177,6 +177,10 @@ EXPORT(SceUID, _vshKernelSearchModuleByName, const char *module_name, const void
+         if (strcmp(mod->info.module_name, module_name) == 0)
+             return uid;
+     }
++    // A kernel plugin whose work Vita3K does itself, which homebrew looks for: NoNpDrm (games with a
++    // NoNpDrm license play; without it PKGj says "NoNpDrm not found. Games cannot be installed or played.")
++    if (strcmp(module_name, "NoNpDrm") == 0)
++        return 0x7FFF0001;
+     return RET_ERROR(SCE_KERNEL_ERROR_MODULEMGR_NO_MOD);
+ }
+ 
+@@ -296,8 +300,12 @@ EXPORT(int, _vshSblGcAuthMgrMlnpsnlAuth2) {
+     return UNIMPLEMENTED();
+ }
+ 
+-EXPORT(int, _vshSblGetSystemSwVersion) {
+-    return UNIMPLEMENTED();
++EXPORT(int, _vshSblGetSystemSwVersion, SceKernelFwInfo *info) {
++    TRACY_FUNC(_vshSblGetSystemSwVersion, info);
++    if (!info)
++        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
++    fill_system_sw_version(*info);
++    return 0;
+ }
+ 
+ EXPORT(int, _vshSblSsCreatePassPhrase) {
+diff --git a/vita3k/modules/taiHEN/taiHEN.cpp b/vita3k/modules/taiHEN/taiHEN.cpp
+index dfbc92b3..c2a1a4e4 100644
+--- a/vita3k/modules/taiHEN/taiHEN.cpp
++++ b/vita3k/modules/taiHEN/taiHEN.cpp
+@@ -176,6 +176,21 @@ static Address find_export_address(KernelState &kernel, uint32_t library_nid, ui
+     return (it != kernel.export_nids.end()) ? it->second : 0;
+ }
+ 
++// An HLE function has no ARM code of its own to point at: a stub that calls it (svc #0; mov pc, lr;
++// NID), kept in export_nids so the next lookup finds it. With export_nids_mutex held; 0 without memory.
++static Address make_hle_export_stub(EmuEnvState &emuenv, uint32_t func_nid) {
++    const Address stub_addr = alloc(emuenv.mem, 12, "taihen_dynamic_stub");
++    if (!stub_addr)
++        return 0;
++    uint32_t *stub = Ptr<uint32_t>(stub_addr).get(emuenv.mem);
++    stub[0] = 0xef000000; // svc #0
++    stub[1] = 0xe1a0f00e; // mov pc, lr
++    stub[2] = func_nid; // NID for dispatch
++    emuenv.kernel.export_nids.emplace(func_nid, stub_addr);
++    emuenv.kernel.invalidate_jit_cache(stub_addr, 12);
++    return stub_addr;
++}
++
+ // Imports resolve through export_nids_by_lib first, so a redirection must move every alias of the export.
+ static void redirect_export(KernelState &kernel, uint32_t func_nid, Address from, Address to) {
+     const auto it = kernel.export_nids.find(func_nid);
+@@ -893,6 +908,14 @@ EXPORT(int, taiGetModuleExportFunc, const char *modname, uint32_t libnid, uint32
+             *func.get(emuenv.mem) = addr;
+             return 0;
+         }
++        // one Vita3K implements itself (PKGj's SceShellSvc IPMI functions): a stub calls it
++        if (has_hle_implementation(funcnid)) {
++            if (const Address addr = make_hle_export_stub(emuenv, funcnid)) {
++                *func.get(emuenv.mem) = addr;
++                LOG_INFO("taiGetModuleExportFunc: NID {} of '{}' is HLE, called through a stub", log_hex(funcnid), modname ? modname : "<null>");
++                return 0;
++            }
++        }
+     }
+ 
+     LOG_WARN("taiGetModuleExportFunc: NID {} not found (module '{}')", log_hex(funcnid), modname ? modname : "<null>");
+@@ -1232,22 +1255,12 @@ EXPORT(int, module_get_export_func, SceUID pid, const char *modname, uint32_t li
+     {
+         const std::lock_guard<std::mutex> guard(emuenv.kernel.export_nids_mutex);
+ 
+-        // Allocate 12 bytes for the stub in emulated memory
+-        Address stub_addr = alloc(emuenv.mem, 12, "taihen_dynamic_stub");
++        const Address stub_addr = make_hle_export_stub(emuenv, funcnid);
+         if (!stub_addr) {
+             LOG_ERROR("module_get_export_func: failed to allocate dynamic stub for NID {}", log_hex(funcnid));
+             return SCE_KERNEL_ERROR_NO_MEMORY;
+         }
+ 
+-        uint32_t *stub = Ptr<uint32_t>(stub_addr).get(emuenv.mem);
+-        stub[0] = 0xef000000; // svc #0
+-        stub[1] = 0xe1a0f00e; // mov pc, lr
+-        stub[2] = funcnid; // NID for dispatch
+-
+-        // Register in export_nids so future lookups find it directly
+-        emuenv.kernel.export_nids.emplace(funcnid, stub_addr);
+-        emuenv.kernel.invalidate_jit_cache(stub_addr, 12);
+-
+         *func.get(emuenv.mem) = stub_addr;
+         LOG_INFO("module_get_export_func: created dynamic SVC stub for NID {} ({})", log_hex(funcnid), modname ? modname : "?");
+         return 0;
 diff --git a/vita3k/ngs/include/ngs/modules/player.h b/vita3k/ngs/include/ngs/modules/player.h
 index 0eb48f99..c187aae3 100644
 --- a/vita3k/ngs/include/ngs/modules/player.h
@@ -3717,6 +4040,79 @@ index 6403d07e..8d030b92 100644
              // Stop processing if no valid buffer is available or if the buffer is empty
              finished = true;
              break;
+diff --git a/vita3k/overlay/CMakeLists.txt b/vita3k/overlay/CMakeLists.txt
+index 7bce266f..c18ac372 100644
+--- a/vita3k/overlay/CMakeLists.txt
++++ b/vita3k/overlay/CMakeLists.txt
+@@ -13,6 +13,7 @@ add_library(
+     include/overlay/input.h
+     include/overlay/display_manager.h
+     include/overlay/shader_compile_notice.h
++    include/overlay/download_notice.h
+     include/overlay/perf_overlay.h
+     include/overlay/trophy_notification.h
+     include/overlay/common_dialog.h
+@@ -28,6 +29,7 @@ add_library(
+     src/input.cpp
+     src/display_manager.cpp
+     src/shader_compile_notice.cpp
++    src/download_notice.cpp
+     src/perf_overlay.cpp
+     src/trophy_notification.cpp
+     src/common_dialog.cpp
+diff --git a/vita3k/overlay/include/overlay/download_notice.h b/vita3k/overlay/include/overlay/download_notice.h
+new file mode 100644
+index 00000000..ba2b02cc
+--- /dev/null
++++ b/vita3k/overlay/include/overlay/download_notice.h
+@@ -0,0 +1,47 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#pragma once
++
++#include <overlay/controls.h>
++#include <overlay/overlay.h>
++
++#include <string>
++
++namespace overlay {
++
++// A line in the bottom right corner: a download going on in the background (PS4: PKGj's)
++struct download_notice : public overlay {
++    download_notice();
++
++    void set_text(const std::string &text);
++
++    compiled_resource get_compiled() override;
++
++private:
++    label m_label;
++    rounded_rect m_background;
++    std::string m_text;
++
++    static constexpr uint16_t k_pad_x = 10;
++    static constexpr uint16_t k_pad_y_top = 2;
++    static constexpr uint16_t k_pad_y_bot = 10;
++    static constexpr uint16_t k_margin = 8;
++    static constexpr uint16_t k_font_size = 13;
++};
++
++} // namespace overlay
 diff --git a/vita3k/overlay/include/overlay/pause_overlay.h b/vita3k/overlay/include/overlay/pause_overlay.h
 index 6c5147b7..404c7c97 100644
 --- a/vita3k/overlay/include/overlay/pause_overlay.h
@@ -3916,6 +4312,81 @@ index 9490418e..83cb3b59 100644
      }
  
      dialog.ime.status = SCE_IME_DIALOG_BUTTON_CLOSE;
+diff --git a/vita3k/overlay/src/download_notice.cpp b/vita3k/overlay/src/download_notice.cpp
+new file mode 100644
+index 00000000..d29e90c7
+--- /dev/null
++++ b/vita3k/overlay/src/download_notice.cpp
+@@ -0,0 +1,69 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#include <overlay/download_notice.h>
++#include <overlay/types.h>
++
++namespace overlay {
++
++download_notice::download_notice() {
++    visible = true;
++
++    m_background.back_color = { 0.f, 0.f, 0.f, 0.65f };
++    m_background.border_radius = 4;
++
++    m_label.fore_color = { 1.f, 1.f, 1.f, 1.f };
++    m_label.back_color = { 0.f, 0.f, 0.f, 0.f };
++    m_label.set_font(default_font_name, k_font_size);
++}
++
++void download_notice::set_text(const std::string &text) {
++    if (text == m_text)
++        return;
++    m_text = text;
++    m_label.set_text(text);
++    m_label.auto_resize();
++
++    m_background.set_size(
++        m_label.w + 2 * k_pad_x,
++        m_label.h + k_pad_y_top + k_pad_y_bot);
++
++    m_background.set_pos(
++        static_cast<int16_t>(virtual_width - k_margin - m_background.w),
++        static_cast<int16_t>(virtual_height - k_margin - m_background.h));
++
++    m_label.set_pos(
++        static_cast<int16_t>(m_background.x + k_pad_x),
++        static_cast<int16_t>(m_background.y + k_pad_y_top));
++}
++
++compiled_resource download_notice::get_compiled() {
++    compiled_resource result;
++
++    if (!visible || m_text.empty())
++        return result;
++
++    auto &bg = m_background.get_compiled();
++    result.add(bg);
++
++    auto &lbl = m_label.get_compiled();
++    result.add(lbl);
++
++    return result;
++}
++
++} // namespace overlay
 diff --git a/vita3k/overlay/src/font.cpp b/vita3k/overlay/src/font.cpp
 index 117569cf2..4c8552a5 100644
 --- a/vita3k/overlay/src/font.cpp
@@ -4653,6 +5124,19 @@ index f3985580..396d151a 100644
              include/packages/sce_types.h
              include/packages/sfo.h
              include/packages/vci.h
+diff --git a/vita3k/packages/include/packages/pkg.h b/vita3k/packages/include/packages/pkg.h
+index 42ec7eb7..cf3c3fb6 100644
+--- a/vita3k/packages/include/packages/pkg.h
++++ b/vita3k/packages/include/packages/pkg.h
+@@ -81,6 +81,7 @@ struct PkgEntry {
+     uint32_t padding;
+ };
+ 
+-bool install_pkg(const fs::path &pkg_path, EmuEnvState &emuenv, std::string &p_zRIF, const std::function<void(float)> &progress_callback = nullptr);
++// remove_pkg: the package goes once its files are out (a download nothing else needs)
++bool install_pkg(const fs::path &pkg_path, EmuEnvState &emuenv, std::string &p_zRIF, const std::function<void(float)> &progress_callback = nullptr, bool remove_pkg = false);
+ std::string find_pkg_zrif(const fs::path &pkg_path, const fs::path &vita_fs_path);
+ bool decrypt_install_nonpdrm(EmuEnvState &emuenv, const fs::path &drmlicpath, const fs::path &title_path, const std::function<void(float)> &progress_callback = nullptr);
 diff --git a/vita3k/packages/include/packages/savedata.h b/vita3k/packages/include/packages/savedata.h
 new file mode 100644
 index 00000000..0887b385
@@ -4718,7 +5202,7 @@ index a2e1a30f..d4543455 100644
 +bool get_param_info(sfo::SfoAppInfo &app_info, const vfs::FileBuffer &param, int sys_lang);
  } // namespace sfo
 diff --git a/vita3k/packages/src/pkg.cpp b/vita3k/packages/src/pkg.cpp
-index 1c5a5bd0..7f20a3b6 100644
+index 1c5a5bd0..4bfecbe0 100644
 --- a/vita3k/packages/src/pkg.cpp
 +++ b/vita3k/packages/src/pkg.cpp
 @@ -27,6 +27,7 @@
@@ -4729,33 +5213,33 @@ index 1c5a5bd0..7f20a3b6 100644
  
  #include <config/state.h>
  #include <emuenv/state.h>
-@@ -40,6 +41,9 @@
+@@ -40,6 +41,10 @@
  #include <util/bytes.h>
  #include <util/log.h>
  
 +#include <algorithm>
 +#include <cctype>
++#include <memory>
 +
  // Credits to mmozeiko https://github.com/mmozeiko/pkg2zip
  
  static void ctr_init(uint8_t *counter, uint8_t *iv, uint64_t n) {
-@@ -64,12 +68,33 @@ bool decrypt_install_nonpdrm(EmuEnvState &emuenv, const fs::path &drmlicpath, co
-     F00DEncryptorTypes f00d_enc_type = F00DEncryptorTypes::native;
-     std::string f00d_arg = std::string();
+@@ -56,6 +61,37 @@ static int execute(std::string &zrif, fs::path &title_src, fs::path &title_dst,
+     return execute(zrif, title_src_str, title_dst_str, type, f00d_arg, progress);
+ }
  
--    PfsProgressCallback pfs_progress = nullptr;
--    if (progress_callback) {
--        pfs_progress = [&progress_callback](std::uint64_t processed, std::uint64_t total, const std::string &) {
-+    // Each encrypted file goes as soon as its decrypted copy is written (the parser has read what it
-+    // needs of the dump before): the dump needs room for one more file, not a whole second copy of
-+    // itself (a game copied in encrypted, NPS Browser's, filled a PS4's storage). The parser names each
-+    // file by its full path (the dump's folder, then files.db's names), once before it and once after.
-+    // The license (sce_sys/package) stays: it's copied after.
-+    const std::string source_root = title_id_src.generic_string();
-+    std::uint64_t done_bytes = 0;
-+    const PfsProgressCallback pfs_progress = [&](std::uint64_t processed, std::uint64_t total, const std::string &file) {
-+        if (processed > done_bytes) {
-+            done_bytes = processed;
++// The parser's progress (from `from` to `to` of what progress takes), and each encrypted file of
++// `source` removed as soon as its decrypted copy is written (the parser has read what it needs of it
++// before): decrypting needs room for one more file, not a whole second copy of the game (a game
++// copied in encrypted, NPS Browser's, filled a PS4's storage). The parser names each file by its full
++// path (the folder, then files.db's names), once before it and once after. The license
++// (sce_sys/package) stays, and the PFS's own files.
++static PfsProgressCallback consuming_progress(const fs::path &source, const std::function<void(float)> &progress, float from, float to) {
++    const std::string source_root = source.generic_string();
++    const auto done_bytes = std::make_shared<std::uint64_t>(0);
++    return [=](std::uint64_t processed, std::uint64_t total, const std::string &file) {
++        if (processed > *done_bytes) {
++            *done_bytes = processed;
 +            std::string relative = file.size() > source_root.size() && file.compare(0, source_root.size(), source_root) == 0 ? file.substr(source_root.size()) : std::string();
 +            while (!relative.empty() && relative.front() == '/')
 +                relative.erase(0, 1);
@@ -4763,22 +5247,46 @@ index 1c5a5bd0..7f20a3b6 100644
 +            std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
 +            if (!relative.empty() && relative.find("..") == std::string::npos && !upper.starts_with("SCE_SYS/PACKAGE") && !upper.starts_with("SCE_PFS")) {
 +                boost::system::error_code ec;
-+                fs::path source = title_id_src / fs_utils::utf8_to_path(relative);
-+                if (!fs::is_regular_file(source, ec))
-+                    source = vfs::find_case_insensitive(title_id_src, fs_utils::utf8_to_path(relative));
-+                if (!source.empty() && fs::is_regular_file(source, ec))
-+                    fs::remove(source, ec);
++                fs::path encrypted = source / fs_utils::utf8_to_path(relative);
++                if (!fs::is_regular_file(encrypted, ec))
++                    encrypted = vfs::find_case_insensitive(source, fs_utils::utf8_to_path(relative));
++                if (!encrypted.empty() && fs::is_regular_file(encrypted, ec))
++                    fs::remove(encrypted, ec);
 +            }
 +        }
-+        if (progress_callback)
-             progress_callback(total ? static_cast<float>(processed) / static_cast<float>(total) : 1.f);
++        if (progress)
++            progress(from + (to - from) * (total ? static_cast<float>(processed) / static_cast<float>(total) : 1.f));
++    };
++}
++
+ bool decrypt_install_nonpdrm(EmuEnvState &emuenv, const fs::path &drmlicpath, const fs::path &title_path, const std::function<void(float)> &progress_callback) {
+     fs::path title_id_src = title_path;
+     fs::path title_id_dst = fs_utils::path_concat(title_path, "_dec");
+@@ -64,12 +100,8 @@ bool decrypt_install_nonpdrm(EmuEnvState &emuenv, const fs::path &drmlicpath, co
+     F00DEncryptorTypes f00d_enc_type = F00DEncryptorTypes::native;
+     std::string f00d_arg = std::string();
+ 
+-    PfsProgressCallback pfs_progress = nullptr;
+-    if (progress_callback) {
+-        pfs_progress = [&progress_callback](std::uint64_t processed, std::uint64_t total, const std::string &) {
+-            progress_callback(total ? static_cast<float>(processed) / static_cast<float>(total) : 1.f);
 -        };
 -    }
-+    };
++    // (the dump shrinks as the decrypted copy grows; its license is copied after)
++    const PfsProgressCallback pfs_progress = consuming_progress(title_id_src, progress_callback, 0.f, 1.f);
  
      if ((execute(zRIF, title_id_src, title_id_dst, f00d_enc_type, f00d_arg, pfs_progress) < 0) && (title_path.string().find("theme") == std::string::npos))
          return false;
-@@ -209,7 +234,21 @@ bool install_pkg(const fs::path &pkg_path, EmuEnvState &emuenv, std::string &p_z
+@@ -83,7 +115,7 @@ bool decrypt_install_nonpdrm(EmuEnvState &emuenv, const fs::path &drmlicpath, co
+     return true;
+ }
+ 
+-bool install_pkg(const fs::path &pkg_path, EmuEnvState &emuenv, std::string &p_zRIF, const std::function<void(float)> &progress_callback) {
++bool install_pkg(const fs::path &pkg_path, EmuEnvState &emuenv, std::string &p_zRIF, const std::function<void(float)> &progress_callback, bool remove_pkg) {
+     FILE *infile = FOPEN(pkg_path.c_str(), "rb");
+     if (!infile) {
+         LOG_CRITICAL("Failed to load pkg file in path: {}", fs_utils::path_to_utf8(pkg_path));
+@@ -209,7 +241,21 @@ bool install_pkg(const fs::path &pkg_path, EmuEnvState &emuenv, std::string &p_z
      fseek(infile, sfo_offset, SEEK_SET);
      fread(sfo_buffer.data(), sfo_buffer.size(), 1, infile);
      sfo::load(sfo_file, sfo_buffer);
@@ -4801,6 +5309,53 @@ index 1c5a5bd0..7f20a3b6 100644
  
      if (type == PkgType::PKG_TYPE_VITA_DLC)
          emuenv.app_info.app_content_id = emuenv.app_info.app_content_id.substr(20);
+@@ -306,6 +352,10 @@ bool install_pkg(const fs::path &pkg_path, EmuEnvState &emuenv, std::string &p_z
+         }
+     }
+     fclose(infile);
++    if (remove_pkg) {
++        boost::system::error_code ec;
++        fs::remove(pkg_path, ec);
++    }
+ 
+     evp_cleanup();
+     fs::path title_id_src = path;
+@@ -313,13 +363,15 @@ bool install_pkg(const fs::path &pkg_path, EmuEnvState &emuenv, std::string &p_z
+     std::string zRIF = p_zRIF;
+     F00DEncryptorTypes f00d_enc_type = F00DEncryptorTypes::native;
+     std::string f00d_arg = std::string();
++    // decrypting: 60-100%, the extracted files going as their decrypted copies come
++    const PfsProgressCallback pfs_progress = consuming_progress(title_id_src, progress_callback, 60.f, 100.f);
+ 
+-    progress_callback(80);
++    progress_callback(60);
+     switch (type) {
+     case PkgType::PKG_TYPE_VITA_APP:
+     case PkgType::PKG_TYPE_VITA_PATCH:
+ 
+-        if (execute(zRIF, title_id_src, title_id_dst, f00d_enc_type, f00d_arg) < 0) {
++        if (execute(zRIF, title_id_src, title_id_dst, f00d_enc_type, f00d_arg, pfs_progress) < 0) {
+             fs::remove_all(fs::path(title_id_src));
+             fs::remove_all(fs::path(title_id_dst));
+             return false;
+@@ -330,7 +382,7 @@ bool install_pkg(const fs::path &pkg_path, EmuEnvState &emuenv, std::string &p_z
+         break;
+     case PkgType::PKG_TYPE_VITA_DLC:
+ 
+-        if (execute(zRIF, title_id_src, title_id_dst, f00d_enc_type, f00d_arg) < 0) {
++        if (execute(zRIF, title_id_src, title_id_dst, f00d_enc_type, f00d_arg, pfs_progress) < 0) {
+             fs::remove_all(fs::path(title_id_src));
+             fs::remove_all(fs::path(title_id_dst));
+             return false;
+@@ -344,7 +396,7 @@ bool install_pkg(const fs::path &pkg_path, EmuEnvState &emuenv, std::string &p_z
+     case PkgType::PKG_TYPE_VITA_THEME:
+ 
+         // Theme don't have keystone file, need skip error
+-        execute(zRIF, title_id_src, title_id_dst, f00d_enc_type, f00d_arg);
++        execute(zRIF, title_id_src, title_id_dst, f00d_enc_type, f00d_arg, pfs_progress);
+         fs::remove_all(title_id_src);
+         fs::rename(title_id_dst, title_id_src);
+         return true;
 diff --git a/vita3k/packages/src/savedata.cpp b/vita3k/packages/src/savedata.cpp
 new file mode 100644
 index 00000000..d9e7ec26
@@ -5076,16 +5631,18 @@ index 4eb1f4f0..bd26315a 100644
      // 8) Choose the ux0 destination (a cart image is always a full app)
 diff --git a/vita3k/ps4/ps4.cmake b/vita3k/ps4/ps4.cmake
 new file mode 100644
-index 00000000..d894f6a5
+index 00000000..c76359f1
 --- /dev/null
 +++ b/vita3k/ps4/ps4.cmake
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,45 @@
 +# PS4: Vita3K's frontend for the console, included from vita3k/CMakeLists.txt once the vita3k target
 +# exists. Built with the port's toolchain (toolchain/ps4-vita3k.cmake, and ps4-love-style.cmake as
 +# the project include: PS4_RUNTIME_SOURCES, ps4_link_mesa, ps4_add_eboot).
 +
 +target_sources(vita3k PRIVATE
 +	ps4/ps4_main.cpp
++	ps4/ps4_bgdl.cpp
++	ps4/ps4_bgdl.h
 +	ps4/ps4_canvas.cpp
 +	ps4/ps4_canvas.h
 +	ps4/ps4_download.cpp
@@ -5110,7 +5667,7 @@ index 00000000..d894f6a5
 +# archive.h and the other headers next to main.cpp
 +target_include_directories(vita3k PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 +target_link_libraries(vita3k PRIVATE camera emuenv mem np overlay pugixml::pugixml stb vulkan SDL3::SDL3)
-+# the launcher's firmware download (ps4_download.cpp)
++# the launcher's firmware download and PKGj's (ps4_download.cpp)
 +target_link_libraries(vita3k PRIVATE libcurl)
 +
 +# The network library's shares (port/ps4_netfs.cpp: SMB and NFS under /net)
@@ -5123,6 +5680,427 @@ index 00000000..d894f6a5
 +target_link_libraries(vita3k PRIVATE
 +	SceSysmodule SceSystemService SceUserService SceVideoOut SceAudioOut ScePad SceNet SceCommonDialog SceImeDialog)
 +ps4_add_eboot(vita3k)
+diff --git a/vita3k/ps4/ps4_bgdl.cpp b/vita3k/ps4/ps4_bgdl.cpp
+new file mode 100644
+index 00000000..58ddf62b
+--- /dev/null
++++ b/vita3k/ps4/ps4_bgdl.cpp
+@@ -0,0 +1,340 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// PS4: background downloads. Each queued package has a folder in ux0/bgdl/t, as on the PS Vita:
++// download.txt (title, url, type, size once known), license.rif (PKGj's), and the package itself,
++// a ".part" file until it's whole.
++
++#include "ps4_bgdl.h"
++
++#include <util/log.h>
++
++#include <fmt/format.h>
++
++#include <algorithm>
++#include <cctype>
++#include <chrono>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <optional>
++#include <set>
++#include <thread>
++
++namespace ps4bgdl {
++
++namespace {
++
++using Clock = std::chrono::steady_clock;
++
++constexpr const char *JOB_FILE = "download.txt";
++constexpr const char *LICENSE_FILE = "license.rif";
++
++// queue's ids, and the thread's state below
++std::mutex g_mutex;
++bool g_running = false;
++bool g_more = false; // something was queued while the thread looked: it looks again
++std::string g_title; // the download going on
++uint64_t g_done = 0;
++uint64_t g_size = 0;
++int g_waiting = 0; // queued after it
++std::string g_last; // what happened last, said for a while
++Clock::time_point g_last_at{};
++
++fs::path root_of(const fs::path &vita_fs) {
++    return vita_fs / "ux0" / "bgdl" / "t";
++}
++
++fs::path stop_mark(const fs::path &vita_fs) {
++    return vita_fs / "ux0" / "bgdl" / "stopped";
++}
++
++bool is_id(const std::string &name) {
++    return name.size() == 8 && std::all_of(name.begin(), name.end(), [](unsigned char c) { return std::isxdigit(c); });
++}
++
++// the package's name: the URL's last part (PKGj's: EP0000-PCSB00000_00-....pkg on Sony's servers)
++std::string file_name(const std::string &url) {
++    std::string name = url.substr(0, url.find_first_of("?#"));
++    name = name.substr(name.find_last_of('/') + 1);
++    name.erase(std::remove_if(name.begin(), name.end(), [](unsigned char c) { return c < 0x20 || std::strchr("\\:*\"<>|", c); }), name.end());
++    if (name.empty() || name == "." || name == ".." || name == JOB_FILE || name == LICENSE_FILE)
++        return "package.pkg";
++    return name;
++}
++
++uint64_t size_of(const fs::path &path) {
++    boost::system::error_code ec;
++    const auto size = fs::file_size(path, ec);
++    return ec ? 0 : static_cast<uint64_t>(size);
++}
++
++bool save_job(const Download &d) {
++    const fs::path temp = d.dir / (std::string(JOB_FILE) + ".new");
++    {
++        std::string title = d.title;
++        std::replace_if(title.begin(), title.end(), [](char c) { return c == '\n' || c == '\r'; }, ' ');
++        fs::ofstream out(temp, std::ios::trunc);
++        out << "title=" << title << "\nurl=" << d.url << "\ntype=" << d.type << "\nsize=" << d.size << "\n";
++        out.flush();
++        if (!out.good())
++            return false;
++    }
++    boost::system::error_code ec;
++    fs::rename(temp, d.dir / JOB_FILE, ec);
++    return !ec;
++}
++
++std::optional<Download> load_job(const fs::path &dir) {
++    const std::string name = dir.filename().string();
++    if (!is_id(name))
++        return std::nullopt;
++    fs::ifstream in(dir / JOB_FILE);
++    if (!in)
++        return std::nullopt;
++    Download d;
++    d.dir = dir;
++    d.id = static_cast<int>(std::strtoul(name.c_str(), nullptr, 16) & 0x7fffffff);
++    std::string line;
++    while (std::getline(in, line)) {
++        const auto eq = line.find('=');
++        if (eq == std::string::npos)
++            continue;
++        const std::string key = line.substr(0, eq), value = line.substr(eq + 1);
++        if (key == "title")
++            d.title = value;
++        else if (key == "url")
++            d.url = value;
++        else if (key == "type")
++            d.type = std::atoi(value.c_str());
++        else if (key == "size")
++            d.size = std::strtoull(value.c_str(), nullptr, 10);
++    }
++    if (d.url.empty())
++        return std::nullopt;
++    if (d.title.empty())
++        d.title = file_name(d.url);
++    return d;
++}
++
++std::string short_title(const std::string &title) {
++    return title.size() > 40 ? title.substr(0, 37) + "..." : title;
++}
++
++// The game's downloads, one after the other, until none is left that this thread hasn't tried
++void worker(fs::path vita_fs) {
++    std::set<int> failed; // tried once here: the launcher tries them again
++    while (true) {
++        {
++            const std::lock_guard<std::mutex> lock(g_mutex);
++            g_more = false;
++        }
++        std::optional<Download> next;
++        int waiting = 0;
++        for (Download &d : list(vita_fs)) {
++            if (d.downloaded() || failed.contains(d.id))
++                continue;
++            if (next)
++                waiting++;
++            else
++                next = d;
++        }
++        if (!next) {
++            const std::lock_guard<std::mutex> lock(g_mutex);
++            if (g_more)
++                continue;
++            g_running = false;
++            g_title.clear();
++            return;
++        }
++        {
++            const std::lock_guard<std::mutex> lock(g_mutex);
++            g_title = next->title;
++            g_done = 0;
++            g_size = next->size;
++            g_waiting = waiting;
++        }
++        LOG_INFO("PS4 downloads: downloading {} from {}", next->title, next->url);
++        int logged = -1;
++        const ps4download::Result result = fetch(*next, [&](uint64_t done, uint64_t size) {
++            const std::lock_guard<std::mutex> lock(g_mutex);
++            g_done = done;
++            g_size = size;
++            // in the log every 10%
++            const int tenth = size ? static_cast<int>(done * 10 / size) : 0;
++            if (tenth != logged) {
++                logged = tenth;
++                LOG_INFO("PS4 downloads: {} at {}% ({} of {} MB)", next->title, tenth * 10, done >> 20, size >> 20);
++            }
++            return true;
++        });
++        const std::lock_guard<std::mutex> lock(g_mutex);
++        if (result.status == ps4download::Status::Done) {
++            LOG_INFO("PS4 downloads: {} downloaded", next->title);
++            g_last = short_title(next->title) + ": downloaded, it installs on the home screen";
++        } else {
++            LOG_ERROR("PS4 downloads: {} didn't download: {}", next->title, result.error);
++            failed.insert(next->id);
++            g_last = short_title(next->title) + " didn't download: " + result.error;
++        }
++        g_last_at = Clock::now();
++    }
++}
++
++} // namespace
++
++fs::path Download::package() const {
++    return dir / file_name(url);
++}
++
++fs::path Download::license() const {
++    return dir / LICENSE_FILE;
++}
++
++bool Download::downloaded() const {
++    // (the package gets its name only when it's whole)
++    const uint64_t have = size_of(package());
++    return have > 0 && (size == 0 || have == size);
++}
++
++int queue(const fs::path &vita_fs, int type, const std::string &url, const std::string &title, const std::vector<uint8_t> &license) {
++    const std::lock_guard<std::mutex> lock(g_mutex);
++    const fs::path root = root_of(vita_fs);
++    boost::system::error_code ec;
++    fs::create_directories(root, ec);
++    // one past the highest id there
++    int id = 1;
++    for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
++        const std::string name = it->path().filename().string();
++        if (is_id(name))
++            id = std::max(id, static_cast<int>(std::strtoul(name.c_str(), nullptr, 16) & 0x7ffffffe) + 1);
++    }
++    Download d;
++    d.dir = root / fmt::format("{:08x}", id);
++    d.id = id;
++    d.type = type;
++    d.title = title;
++    d.url = url;
++    ec.clear();
++    fs::create_directories(d.dir, ec);
++    bool saved = !ec;
++    if (saved && !license.empty()) {
++        fs::ofstream out(d.license(), std::ios::binary | std::ios::trunc);
++        out.write(reinterpret_cast<const char *>(license.data()), static_cast<std::streamsize>(license.size()));
++        out.flush();
++        saved = out.good();
++    }
++    saved = saved && save_job(d);
++    if (!saved) {
++        LOG_ERROR("PS4 downloads: {} couldn't be queued in {}", title, d.dir);
++        fs::remove_all(d.dir, ec);
++        return -1;
++    }
++    fs::remove(stop_mark(vita_fs), ec);
++    LOG_INFO("PS4 downloads: queued {} as {:08x} ({}, type {:#x}, license of {} bytes)", title, id, url, type, license.size());
++    return id;
++}
++
++std::vector<Download> list(const fs::path &vita_fs) {
++    std::vector<Download> downloads;
++    boost::system::error_code ec;
++    for (fs::directory_iterator it(root_of(vita_fs), ec), end; !ec && it != end; it.increment(ec)) {
++        boost::system::error_code dir_ec;
++        if (!fs::is_directory(it->path(), dir_ec))
++            continue;
++        if (auto d = load_job(it->path()))
++            downloads.push_back(std::move(*d));
++    }
++    std::sort(downloads.begin(), downloads.end(), [](const Download &a, const Download &b) { return a.id < b.id; });
++    return downloads;
++}
++
++void remove(const Download &d) {
++    boost::system::error_code ec;
++    fs::remove_all(d.dir, ec);
++    if (ec)
++        LOG_WARN("PS4 downloads: {} couldn't be removed: {}", d.dir, ec.message());
++}
++
++bool stopped(const fs::path &vita_fs) {
++    boost::system::error_code ec;
++    return fs::exists(stop_mark(vita_fs), ec);
++}
++
++void set_stopped(const fs::path &vita_fs, bool stop) {
++    boost::system::error_code ec;
++    if (!stop) {
++        fs::remove(stop_mark(vita_fs), ec);
++        return;
++    }
++    fs::create_directories(stop_mark(vita_fs).parent_path(), ec);
++    fs::ofstream(stop_mark(vita_fs), std::ios::trunc);
++}
++
++ps4download::Result fetch(Download &d, const Progress &progress) {
++    if (d.downloaded())
++        return { ps4download::Status::Done, {} };
++    if (d.size == 0) {
++        std::string error;
++        d.size = ps4download::remote_size(d.url, error);
++        if (d.size == 0)
++            return { ps4download::Status::Failed, error };
++        save_job(d);
++    }
++    return ps4download::download(d.url, d.package(), d.size, [&](uint64_t done) { return progress(done, d.size); });
++}
++
++void start(const fs::path &vita_fs) {
++    const std::lock_guard<std::mutex> lock(g_mutex);
++    if (g_running) {
++        g_more = true;
++        return;
++    }
++    g_running = true;
++    std::thread(worker, vita_fs).detach();
++}
++
++std::string notice() {
++    const std::lock_guard<std::mutex> lock(g_mutex);
++    if (g_running && !g_title.empty()) {
++        std::string text = "Downloading " + short_title(g_title);
++        if (g_size)
++            text += fmt::format(": {}%", g_done * 100 / g_size);
++        if (g_waiting)
++            text += fmt::format(" (+{} more)", g_waiting);
++        return text;
++    }
++    if (!g_last.empty() && Clock::now() - g_last_at < std::chrono::seconds(15))
++        return g_last;
++    return {};
++}
++
++} // namespace ps4bgdl
++
++// For modules/SceIpmi: the shell's download service
++int ps4_bgdl_queue(const fs::path &vita_fs, int type, const std::string &url, const std::string &title, const std::vector<uint8_t> &license) {
++    return ps4bgdl::queue(vita_fs, type, url, title, license);
++}
++
++void ps4_bgdl_start(const fs::path &vita_fs) {
++    ps4bgdl::start(vita_fs);
++}
++
++// For the renderer: the game's overlay
++std::string ps4_bgdl_notice() {
++    return ps4bgdl::notice();
++}
+diff --git a/vita3k/ps4/ps4_bgdl.h b/vita3k/ps4/ps4_bgdl.h
+new file mode 100644
+index 00000000..0574701a
+--- /dev/null
++++ b/vita3k/ps4/ps4_bgdl.h
+@@ -0,0 +1,69 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// PS4: the PS Vita shell's background downloads (ux0:bgdl), which HENkaku does itself. PKGj queues a
++// package with the shell's download service (SceDownload, modules/SceIpmi): it comes down in a thread
++// of its own while the game goes on, carries on in the launcher (HENkaku restarts after every game),
++// and the launcher installs it with the license PKGj gave.
++
++#pragma once
++
++#include "ps4_download.h"
++
++#include <util/fs.h>
++
++#include <cstdint>
++#include <functional>
++#include <string>
++#include <vector>
++
++namespace ps4bgdl {
++
++struct Download {
++    fs::path dir; // ux0/bgdl/t/<its id, 8 hex digits>
++    int id = 0;
++    int type = 0; // the shell's: 0x16 game, 0x17 add-on, 0x0C theme
++    std::string title;
++    std::string url;
++    uint64_t size = 0; // once the server said
++
++    fs::path package() const; // where the package goes (a ".part" file until it's whole)
++    fs::path license() const; // the license PKGj gave (none for free content)
++    bool downloaded() const; // the package is there, whole
++};
++
++// Queues one: its id, or -1 if it couldn't be saved. A queued download also undoes a stop.
++int queue(const fs::path &vita_fs, int type, const std::string &url, const std::string &title, const std::vector<uint8_t> &license);
++// The queued downloads, oldest first
++std::vector<Download> list(const fs::path &vita_fs);
++// Forgets one, and what of it came down
++void remove(const Download &d);
++
++// Stopped (Circle in the launcher): the launcher doesn't carry on with them by itself
++bool stopped(const fs::path &vita_fs);
++void set_stopped(const fs::path &vita_fs, bool stop);
++
++// Downloads it, carrying on from what's there; progress(done, size) returning false stops it
++using Progress = std::function<bool(uint64_t done, uint64_t size)>;
++ps4download::Result fetch(Download &d, const Progress &progress);
++
++// In a game: downloads what's queued in a thread of its own, until it's all there
++void start(const fs::path &vita_fs);
++// What that thread is doing, for the game's overlay ("" when there's nothing to say)
++std::string notice();
++
++} // namespace ps4bgdl
 diff --git a/vita3k/ps4/ps4_canvas.cpp b/vita3k/ps4/ps4_canvas.cpp
 new file mode 100644
 index 00000000..bf1078f1
@@ -6388,10 +7366,10 @@ index 00000000..0470cd19
 +} // namespace ps4controls
 diff --git a/vita3k/ps4/ps4_download.cpp b/vita3k/ps4/ps4_download.cpp
 new file mode 100644
-index 00000000..923d1127
+index 00000000..baf4d8ea
 --- /dev/null
 +++ b/vita3k/ps4/ps4_download.cpp
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,200 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -6478,15 +7456,51 @@ index 00000000..923d1127
 +    return ec ? 0 : static_cast<uint64_t>(size);
 +}
 +
-+} // namespace
-+
-+Result download(const std::string &url, const fs::path &path, uint64_t size, const Progress &progress) {
++void init_curl() {
 +    static std::once_flag init;
 +    std::call_once(init, [] {
 +        curl_global_init(CURL_GLOBAL_DEFAULT);
 +        // a server that closes the connection raises SIGPIPE on the next write, which would end the app
 +        std::signal(SIGPIPE, SIG_IGN);
 +    });
++}
++
++} // namespace
++
++uint64_t remote_size(const std::string &url, std::string &error) {
++    init_curl();
++    char details[CURL_ERROR_SIZE] = {};
++    CURL *curl = curl_easy_init();
++    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
++    curl_easy_setopt(curl, CURLOPT_USERAGENT, "HENkaku (Vita3K)");
++    curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
++    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
++    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
++    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
++    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 20L);
++    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
++    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, details);
++    const CURLcode code = curl_easy_perform(curl);
++    long status = 0;
++    curl_off_t length = -1;
++    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
++    curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &length);
++    curl_easy_cleanup(curl);
++    if (code != CURLE_OK) {
++        LOG_ERROR("Size of {}: {} ({}, HTTP {})", url, details, curl_easy_strerror(code), status);
++        error = describe(code, status, Transfer{}, details);
++        return 0;
++    }
++    if (length <= 0) {
++        LOG_ERROR("Size of {}: the server didn't say (HTTP {})", url, status);
++        error = "the server didn't say how big it is";
++        return 0;
++    }
++    return static_cast<uint64_t>(length);
++}
++
++Result download(const std::string &url, const fs::path &path, uint64_t size, const Progress &progress) {
++    init_curl();
 +    boost::system::error_code ec;
 +    if (size_of(path) == size)
 +        return { Status::Done, {} };
@@ -6558,10 +7572,10 @@ index 00000000..923d1127
 +} // namespace ps4download
 diff --git a/vita3k/ps4/ps4_download.h b/vita3k/ps4/ps4_download.h
 new file mode 100644
-index 00000000..01fdf0f1
+index 00000000..baad3a63
 --- /dev/null
 +++ b/vita3k/ps4/ps4_download.h
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,52 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -6579,7 +7593,8 @@ index 00000000..01fdf0f1
 +// with this program; if not, write to the Free Software Foundation, Inc.,
 +// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 +
-+// PS4: HTTP downloads (ps4_download.cpp), for the PS Vita firmware the launcher gets from Sony.
++// PS4: HTTP downloads (ps4_download.cpp), for the PS Vita firmware the launcher gets from Sony and
++// the packages PKGj queues (ps4_bgdl.cpp).
 +
 +#pragma once
 +
@@ -6605,6 +7620,9 @@ index 00000000..01fdf0f1
 +    std::string error; // why it failed, for the user
 +};
 +
++// How big what url holds is (a HEAD request), or 0 with error saying why not
++uint64_t remote_size(const std::string &url, std::string &error);
++
 +// Downloads url to path, which must come out `size` bytes long. Until it's complete the file is
 +// path + ".part", and the next call for it carries on from where this one stopped.
 +Result download(const std::string &url, const fs::path &path, uint64_t size, const Progress &progress);
@@ -6612,10 +7630,10 @@ index 00000000..01fdf0f1
 +} // namespace ps4download
 diff --git a/vita3k/ps4/ps4_launcher.cpp b/vita3k/ps4/ps4_launcher.cpp
 new file mode 100644
-index 00000000..853327d7
+index 00000000..7bd7d6a1
 --- /dev/null
 +++ b/vita3k/ps4/ps4_launcher.cpp
-@@ -0,0 +1,3415 @@
+@@ -0,0 +1,3564 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -6642,6 +7660,7 @@ index 00000000..853327d7
 +
 +#include "ps4_launcher.h"
 +
++#include "ps4_bgdl.h"
 +#include "ps4_canvas.h"
 +#include "ps4_download.h"
 +#include "ps4_pad.h"
@@ -7143,6 +8162,7 @@ index 00000000..853327d7
 +    std::atomic<bool> running{ false };
 +    std::atomic<bool> finished{ false };
 +    bool firmware = false; // the firmware download, rather than the install folder
++    bool downloads = false; // PKGj's downloads (ps4_bgdl.cpp)
 +    std::mutex mutex;
 +    std::string heading; // what the firmware download is doing
 +    std::string current;
@@ -7161,10 +8181,11 @@ index 00000000..853327d7
 +    std::string start_title;
 +};
 +
-+void reset(InstallJob &job, bool firmware) {
++void reset(InstallJob &job, bool firmware, bool downloads = false) {
 +    job.running = true;
 +    job.finished = false;
 +    job.firmware = firmware;
++    job.downloads = downloads;
 +    const std::lock_guard<std::mutex> lock(job.mutex);
 +    job.heading.clear();
 +    job.current.clear();
@@ -7549,8 +8570,110 @@ index 00000000..853327d7
 +    job.finished = true;
 +}
 +
++// PKGj's downloads (ps4_bgdl.cpp): each comes down, carrying on from where it stopped, and installs
++// with the license PKGj gave; the package goes once its files are out. Circle stops the download (it
++// carries on the next time); one that doesn't download is tried again the next time, one that
++// doesn't install is dropped.
++void bgdl_worker(EmuEnvState &emuenv, InstallJob &job, std::vector<ps4bgdl::Download> downloads) {
++    {
++        const std::lock_guard<std::mutex> lock(job.mutex);
++        job.total = static_cast<int>(downloads.size());
++    }
++    // (install_pkg counts in percent)
++    const auto set_progress = [&](float percent) {
++        const std::lock_guard<std::mutex> lock(job.mutex);
++        job.progress = std::clamp(percent / 100.f, 0.f, 1.f);
++    };
++    // (an exception here would end the app: it stops the downloads instead, as a failure)
++    try {
++        for (ps4bgdl::Download &d : downloads) {
++            {
++                const std::lock_guard<std::mutex> lock(job.mutex);
++                job.index++;
++                job.heading = "Downloading " + d.title;
++                job.current = "Connecting";
++                job.progress = 0;
++                job.stoppable = true;
++            }
++            LOG_INFO("PS4 launcher: downloading {} from {}", d.title, d.url);
++            // the speed, over a second or so
++            Clock::time_point mark_time{};
++            uint64_t mark_bytes = UINT64_MAX;
++            double speed = 0;
++            const ps4download::Result result = ps4bgdl::fetch(d, [&](uint64_t done, uint64_t size) {
++                const auto now = Clock::now();
++                if (mark_bytes == UINT64_MAX || done < mark_bytes) {
++                    mark_time = now;
++                    mark_bytes = done;
++                } else if (now - mark_time >= std::chrono::seconds(1)) {
++                    speed = (done - mark_bytes) / std::chrono::duration<double>(now - mark_time).count();
++                    mark_time = now;
++                    mark_bytes = done;
++                }
++                const std::lock_guard<std::mutex> lock(job.mutex);
++                job.progress = size ? static_cast<float>(static_cast<double>(done) / size) : 0.f;
++                job.current = fmt::format("{} of {} MB", done >> 20, size >> 20);
++                if (speed > 0)
++                    job.current += fmt::format("   {:.1f} MB/s", speed / (1 << 20));
++                return !job.stop_requested;
++            });
++            if (result.status == ps4download::Status::Stopped) {
++                ps4bgdl::set_stopped(emuenv.vita_fs_path, true);
++                const std::lock_guard<std::mutex> lock(job.mutex);
++                job.stopped = true;
++                break;
++            }
++            if (result.status != ps4download::Status::Done) {
++                const std::lock_guard<std::mutex> lock(job.mutex);
++                job.failures.push_back("Couldn't download " + d.title + ": " + result.error);
++                continue;
++            }
++            {
++                const std::lock_guard<std::mutex> lock(job.mutex);
++                job.heading = "Installing " + d.title;
++                job.current = "This can take a few minutes";
++                job.progress = 0;
++                job.stoppable = false;
++            }
++            // its license in ux0/license, where installing finds it
++            boost::system::error_code ec;
++            if (fs::exists(d.license(), ec))
++                copy_license(emuenv, d.license());
++            std::string zrif = find_pkg_zrif(d.package(), emuenv.vita_fs_path);
++            const bool ok = !zrif.empty() && install_pkg(d.package(), emuenv, zrif, set_progress, true);
++            ps4bgdl::remove(d);
++            const std::lock_guard<std::mutex> lock(job.mutex);
++            if (!ok) {
++                job.failures.push_back("Couldn't install " + d.title + (zrif.empty() ? ": no license came with it" : ""));
++                LOG_ERROR("PS4 launcher: {} not installed", d.title);
++                continue;
++            }
++            LOG_INFO("PS4 launcher: installed {} ({})", d.title, emuenv.app_info.app_title_id);
++            job.installed++;
++            job.done.push_back(d.title);
++            job.title_id = emuenv.app_info.app_title_id;
++        }
++        app::init_apps_list(emuenv);
++    } catch (const std::exception &e) {
++        const std::lock_guard<std::mutex> lock(job.mutex);
++        job.failures.push_back("The downloads stopped: " + std::string(e.what()));
++        LOG_ERROR("PS4 launcher: PKGj's downloads stopped: {}", e.what());
++    }
++    job.finished = true;
++}
++
 +std::string summary(InstallJob &job) {
 +    const std::lock_guard<std::mutex> lock(job.mutex);
++    if (job.downloads) {
++        std::string text;
++        for (size_t i = 0; i < job.done.size(); i++)
++            text += (i == 0 ? "Installed " : ", ") + job.done[i];
++        if (job.stopped)
++            text += std::string(text.empty() ? "" : "\n") + "Download stopped: HENkaku (OPTIONS) carries on with it";
++        for (const auto &failure : job.failures)
++            text += (text.empty() ? "" : "\n") + failure;
++        return text;
++    }
 +    if (job.firmware) {
 +        std::string text;
 +        for (size_t i = 0; i < job.done.size(); i++)
@@ -9361,6 +10484,8 @@ index 00000000..853327d7
 +    bool quit_requested = false;
 +    bool about_requested = false;
 +    bool firmware_requested = false;
++    bool downloads_requested = false;
++    bool cancel_downloads_requested = false;
 +
 +    // the last game started is selected again
 +    static std::string last_app_path;
@@ -9432,6 +10557,14 @@ index 00000000..853327d7
 +        job.thread = std::thread([&emuenv, &job, downloads = missing_firmware(fw)] { firmware_worker(emuenv, job, downloads); });
 +        notice.clear();
 +    };
++    // PKGj's downloads, a stop undone
++    const auto start_downloads = [&] {
++        reset(job, false, true);
++        ps4bgdl::set_stopped(emuenv.vita_fs_path, false);
++        job.thread = std::thread([&emuenv, &job, list = ps4bgdl::list(emuenv.vita_fs_path)]() mutable { bgdl_worker(emuenv, job, std::move(list)); });
++        notice.clear();
++    };
++    bool downloads_checked = false;
 +    // the install browser, where it was the last time
 +    static fs::path browse_dir = INSTALL_DIR; // empty: the locations
 +    std::vector<Entry> entries;
@@ -9478,6 +10611,11 @@ index 00000000..853327d7
 +            if (!missing_firmware(fw).empty()) {
 +                root.push_back(section_item("PS Vita firmware"));
 +                root.push_back(action_item(fw.main_firmware ? "Download the font package from Sony" : "Download the firmware from Sony", [&] { firmware_requested = true; }));
++            }
++            if (const size_t waiting = ps4bgdl::list(emuenv.vita_fs_path).size()) {
++                root.push_back(section_item("PKGj downloads"));
++                root.push_back(action_item(fmt::format("Download and install ({})", waiting), [&] { downloads_requested = true; }));
++                root.push_back(action_item("Cancel them", [&] { cancel_downloads_requested = true; }));
 +            }
 +            root.push_back(section_item("HENkaku"));
 +            root.push_back(action_item("About HENkaku", [&] { about_requested = true; }));
@@ -9549,6 +10687,19 @@ index 00000000..853327d7
 +        previous = buttons;
 +        const auto now = Clock::now();
 +
++        // PKGj's downloads carry on by themselves (after the firmware's), unless they were stopped
++        if (!job.running && !downloads_checked) {
++            downloads_checked = true;
++            const size_t waiting = ps4bgdl::list(emuenv.vita_fs_path).size();
++            if (waiting && !ps4bgdl::stopped(emuenv.vita_fs_path)) {
++                start_downloads();
++            } else if (waiting && notice.empty()) {
++                notice = waiting == 1 ? std::string("A PKGj download is waiting: HENkaku (OPTIONS) carries on with it") : fmt::format("{} PKGj downloads are waiting: HENkaku (OPTIONS) carries on with them", waiting);
++                notice_until = now + std::chrono::seconds(20);
++                dirty = true;
++            }
++        }
++
 +        if (job.running) {
 +            if (job.finished) {
 +                job.thread.join();
@@ -9598,7 +10749,7 @@ index 00000000..853327d7
 +                dirty = true;
 +            } else {
 +                // Circle stops a download
-+                if ((pressed & ORBIS_PAD_BUTTON_CIRCLE) && job.firmware) {
++                if ((pressed & ORBIS_PAD_BUTTON_CIRCLE) && (job.firmware || job.downloads)) {
 +                    const std::lock_guard<std::mutex> lock(job.mutex);
 +                    if (job.stoppable)
 +                        job.stop_requested = true;
@@ -9764,6 +10915,22 @@ index 00000000..853327d7
 +                    firmware_requested = false;
 +                    mode = Mode::Home;
 +                    start_firmware();
++                    dirty = true;
++                }
++                if (downloads_requested) {
++                    downloads_requested = false;
++                    mode = Mode::Home;
++                    start_downloads();
++                    dirty = true;
++                }
++                if (cancel_downloads_requested) {
++                    cancel_downloads_requested = false;
++                    for (const ps4bgdl::Download &d : ps4bgdl::list(emuenv.vita_fs_path))
++                        ps4bgdl::remove(d);
++                    ps4bgdl::set_stopped(emuenv.vita_fs_path, false);
++                    mode = Mode::Home;
++                    notice = "PKGj's downloads cancelled";
++                    notice_until = now + std::chrono::seconds(8);
 +                    dirty = true;
 +                }
 +                break;
@@ -14299,6 +15466,51 @@ index c92e2983..42bd7c26 100644
      } else {
          glBindTexture(GL_TEXTURE_2D, info.gl_ping_pong_texture[0]);
      }
+diff --git a/vita3k/renderer/src/renderer.cpp b/vita3k/renderer/src/renderer.cpp
+index 24a868b9..17b7f4ad 100644
+--- a/vita3k/renderer/src/renderer.cpp
++++ b/vita3k/renderer/src/renderer.cpp
+@@ -26,6 +26,7 @@
+ #include <overlay/font.h>
+ #include <overlay/pause_overlay.h>
+ #include <overlay/perf_overlay.h>
++#include <overlay/download_notice.h>
+ #include <overlay/shader_compile_notice.h>
+ #include <renderer/gl/state.h>
+ #include <renderer/gl/types.h>
+@@ -34,6 +35,10 @@
+ #include <gxm/functions.h>
+ #include <util/log.h>
+ 
++#ifdef __PS4__
++std::string ps4_bgdl_notice(); // vita3k/ps4/ps4_bgdl.cpp
++#endif
++
+ namespace renderer {
+ 
+ // The higher on this list the higher the priority of input
+@@ -76,6 +81,21 @@ void State::update_overlays() {
+         }
+     }
+ 
++#ifdef __PS4__
++    // PS4: a download going on in the background (PKGj's), in the corner
++    {
++        const std::string text = ps4_bgdl_notice();
++        auto notice = overlay_manager->get<overlay::download_notice>();
++        if (!text.empty()) {
++            if (!notice)
++                notice = overlay_manager->create<overlay::download_notice>();
++            notice->set_text(text);
++        } else if (notice) {
++            overlay_manager->remove<overlay::download_notice>();
++        }
++    }
++#endif
++
+     // Performance overlay
+     {
+         if (perf_overlay.enabled && perf_overlay.has_data) {
 diff --git a/vita3k/renderer/src/scene.cpp b/vita3k/renderer/src/scene.cpp
 index f466887d..b9de221a 100644
 --- a/vita3k/renderer/src/scene.cpp

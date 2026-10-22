@@ -4,7 +4,7 @@
 in WSL Ubuntu with the M33 / Resonance / DolphinPS4 / Crema PS4 toolchain (clang 21 + libc++ 21 on
 OpenOrbis).
 
-Status: **v00.40**. On the console the launcher works (text, firmware download, installing a VPK),
+Status: **v00.41**. On the console the launcher works (text, firmware download, installing a VPK),
 PKGj runs (renderer on RADV, audio, dynarmic, the network), and Mortal Kombat (PCSE00023) plays:
 v00.12 fixed the GPU hang at the start of a fight by turning Vita3K's memory mapping off (see
 "Graphics" below). Its fights ran at 30 fps where the game wants 60 (slow motion); v00.13 (fast
@@ -63,6 +63,16 @@ A NoNpDrm dump (with `sce_sys/package/work.bin`) copied straight into
 `/data/Vita3K/fs/ux0/app/` is still encrypted; the first time it starts, the launcher decrypts it
 in place (as installing it would have) and installs its license. Installing it from the install
 screen instead is the same, from anywhere but Vita3K's own folders.
+
+### PKGj
+
+PKGj works as on a Vita with NoNpDrm. Its **Install game** queues the package with the PS Vita
+shell's background downloads, which HENkaku does itself: the package comes down while PKGj runs
+(the bottom right corner says how far it is), carries on in the launcher when you go back to it,
+and installs there with the license PKGj gave; the new game's bubble is picked. Installing takes
+about twice the package's size (the package goes once its files are out, and each file is decrypted
+in place). **Circle** stops a download; HENkaku (OPTIONS) > PKGj downloads carries on with it or
+cancels it.
 
 ### The home screen
 
