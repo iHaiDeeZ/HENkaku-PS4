@@ -704,10 +704,10 @@ index 97794b3d..2ee78719 100644
      if (!thread->name.empty()) {
          tracy::SetThreadName(thread->name.c_str());
 diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
-index c01e4699..b2befbb1 100644
+index c01e4699..8b22a962 100644
 --- a/vita3k/kernel/src/thread.cpp
 +++ b/vita3k/kernel/src/thread.cpp
-@@ -32,6 +32,13 @@
+@@ -32,6 +32,16 @@
  #include <sstream>
  #include <utility>
  
@@ -716,21 +716,31 @@ index c01e4699..b2befbb1 100644
 +// vita3k/ps4/ps4_perf.cpp: time in guest code and in each import, for the perf lines
 +extern "C" void ps4_perf_code(uint64_t ticks);
 +extern "C" void ps4_perf_import(uint32_t nid, uint64_t ticks);
++extern "C" void ps4_perf_import_begin(uint32_t nid, uint32_t arg0);
++extern "C" void ps4_perf_code_begin(void *cpu, void (*halt)(void *));
++extern "C" bool ps4_perf_code_end();
 +#endif
 +
  // Set in the wait type of a wait that runs callbacks
  constexpr SceUInt32 WAITTYPE_CB_BIT = 0x80000000U;
  // What a thread waiting for a thread signal reports as its wait UID on a Vita, which isn't a UID
-@@ -301,13 +308,25 @@ void ThreadState::run_loop(bool top_level) {
+@@ -301,13 +311,35 @@ void ThreadState::run_loop(bool top_level) {
              lock.unlock();
  
              // Single step or run
 +#ifdef __PS4__
 +            const uint64_t run_start = __builtin_ia32_rdtsc();
++            ps4_perf_code_begin(cpu.get(), [](void *state) { stop(*static_cast<CPUState *>(state)); });
 +#endif
              const int res = do_step ? step(*cpu) : run(*cpu);
 +#ifdef __PS4__
 +            const uint64_t run_end = __builtin_ia32_rdtsc();
++            // the perf report stopped a thread that ran guest code for seconds without a call: where
++            if (ps4_perf_code_end()) {
++                const uint32_t pc = read_pc(*cpu);
++                LOG_INFO("perf: {} spins in guest code at {} ({}), lr {}, r0-r3 {} {} {} {}", name, log_hex(pc), disassemble(*cpu, pc), log_hex(read_lr(*cpu)),
++                    log_hex(read_reg(*cpu, 0)), log_hex(read_reg(*cpu, 1)), log_hex(read_reg(*cpu, 2)), log_hex(read_reg(*cpu, 3)));
++            }
 +            ps4_perf_code(run_end - run_start);
 +            // the thread's CPU time for the perf lines (a clock read every ~10 ms at most)
 +            ps4_thread_cpu_tick();
@@ -740,6 +750,9 @@ index c01e4699..b2befbb1 100644
              const bool syscall = cpu->svc_called;
              if (syscall) {
                  const uint32_t nid = *Ptr<uint32_t>(read_pc(*cpu) + 4).get(mem);
++#ifdef __PS4__
++                ps4_perf_import_begin(nid, read_reg(*cpu, 0));
++#endif
                  kernel.call_import(*cpu, nid, id);
 +#ifdef __PS4__
 +                ps4_perf_import(nid, __builtin_ia32_rdtsc() - run_end);
@@ -6742,10 +6755,10 @@ index 00000000..ff30f0d3
 +} // namespace ps4pad
 diff --git a/vita3k/ps4/ps4_perf.cpp b/vita3k/ps4/ps4_perf.cpp
 new file mode 100644
-index 00000000..5346e640
+index 00000000..c2cd8754
 --- /dev/null
 +++ b/vita3k/ps4/ps4_perf.cpp
-@@ -0,0 +1,264 @@
+@@ -0,0 +1,338 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -6805,6 +6818,17 @@ index 00000000..5346e640
 +    std::atomic<uint64_t> code_ticks{ 0 };
 +    std::atomic<uint64_t> code_runs{ 0 };
 +    ImportSlot slots[kSlots];
++    // the imports it is in now, innermost last (a callback can call imports from inside one)
++    static constexpr int kDepth = 4;
++    std::atomic<int> depth{ 0 };
++    std::atomic<uint32_t> current_nid[kDepth] = {};
++    std::atomic<uint32_t> current_arg[kDepth] = {};
++    std::atomic<uint64_t> current_start[kDepth] = {};
++    // the run of guest code it is in now (0: none), and its CPU
++    std::atomic<uint64_t> code_start{ 0 };
++    std::atomic<void *> cpu{ nullptr };
++    void (*halt)(void *) = nullptr;
++    std::atomic<bool> halted_for_pc{ false };
 +};
 +
 +GuestThread g_threads[kMaxThreads];
@@ -6838,9 +6862,44 @@ index 00000000..5346e640
 +    add(thread->code_runs, 1);
 +}
 +
++extern "C" void ps4_perf_code_begin(void *cpu, void (*halt)(void *)) {
++    GuestThread *const thread = t_thread;
++    if (!thread)
++        return;
++    thread->halt = halt;
++    thread->cpu.store(cpu, std::memory_order_relaxed);
++    thread->code_start.store(__builtin_ia32_rdtsc(), std::memory_order_release);
++}
++
++extern "C" bool ps4_perf_code_end() {
++    GuestThread *const thread = t_thread;
++    if (!thread)
++        return false;
++    thread->code_start.store(0, std::memory_order_release);
++    return thread->halted_for_pc.exchange(false);
++}
++
++extern "C" void ps4_perf_import_begin(uint32_t nid, uint32_t arg0) {
++    GuestThread *const thread = t_thread;
++    if (!thread)
++        return;
++    const int depth = thread->depth.load(std::memory_order_relaxed);
++    if (depth < GuestThread::kDepth) {
++        thread->current_nid[depth].store(nid, std::memory_order_relaxed);
++        thread->current_arg[depth].store(arg0, std::memory_order_relaxed);
++        thread->current_start[depth].store(__builtin_ia32_rdtsc(), std::memory_order_relaxed);
++    }
++    thread->depth.store(depth + 1, std::memory_order_release);
++}
++
 +extern "C" void ps4_perf_import(uint32_t nid, uint64_t ticks) {
 +    GuestThread *const thread = t_thread;
-+    if (!thread || nid == 0)
++    if (!thread)
++        return;
++    const int depth = thread->depth.load(std::memory_order_relaxed);
++    if (depth > 0)
++        thread->depth.store(depth - 1, std::memory_order_release);
++    if (nid == 0)
 +        return;
 +    const uint32_t start = (nid * 0x9E3779B1u) >> 24;
 +    for (int probe = 0; probe < kSlots; probe++) {
@@ -6914,6 +6973,34 @@ index 00000000..5346e640
 +        const double code_ms = (code_ticks - previous.code_ticks) / ticks_per_ms / seconds;
 +        previous.code_ticks = code_ticks;
 +        previous.code_runs = code_runs;
++
++        // a thread in guest code for 2 s or more without a call: a spin. Stopped once, it logs where
++        // (and goes on).
++        const uint64_t code_start = thread.code_start.load(std::memory_order_acquire);
++        if (log && code_start != 0 && (__builtin_ia32_rdtsc() - code_start) / ticks_per_ms >= 2000.0 && thread.halt && !thread.halted_for_pc.load()) {
++            thread.halted_for_pc.store(true);
++            thread.halt(thread.cpu.load(std::memory_order_relaxed));
++        }
++
++        // a thread in the same import for 2 s or more: what it waits for (a freeze shows here)
++        const int depth = std::min(thread.depth.load(std::memory_order_acquire), static_cast<int>(GuestThread::kDepth));
++        if (log && depth > 0) {
++            const uint64_t now = __builtin_ia32_rdtsc();
++            std::string stuck;
++            for (int d = 0; d < depth; d++) {
++                const double in_s = (now - thread.current_start[d].load(std::memory_order_relaxed)) / ticks_per_ms / 1000.0;
++                const char *name = import_name(thread.current_nid[d].load(std::memory_order_relaxed));
++                // (a thread that ended inside its exit call stays there)
++                if (in_s < 2.0 || std::strstr(name, "Exit"))
++                    continue;
++                char part[128];
++                snprintf(part, sizeof(part), "%s%s(0x%x) for %.0f s", stuck.empty() ? "" : ", then ", name,
++                    thread.current_arg[d].load(std::memory_order_relaxed), in_s);
++                stuck += part;
++            }
++            if (!stuck.empty())
++                LOG_INFO("perf: {} is in {}", thread.name, stuck);
++        }
 +
 +        // the threads that did something: more than 5% of the time in code and imports together
 +        if (!log || code_ms + imports_ms < 50)
@@ -7012,10 +7099,10 @@ index 00000000..5346e640
 +} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_perf.h b/vita3k/ps4/ps4_perf.h
 new file mode 100644
-index 00000000..16d557c9
+index 00000000..8835bb87
 --- /dev/null
 +++ b/vita3k/ps4/ps4_perf.h
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,44 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -7042,6 +7129,12 @@ index 00000000..16d557c9
 +extern "C" void ps4_perf_guest_thread(const char *name);
 +extern "C" void ps4_perf_code(uint64_t ticks);
 +extern "C" void ps4_perf_import(uint32_t nid, uint64_t ticks);
++// An import starts (its NID and first argument): a thread that stays in one shows in the report
++extern "C" void ps4_perf_import_begin(uint32_t nid, uint32_t arg0);
++// A run of guest code starts (the CPU, and how to stop it from another thread), and ends: whether
++// the report stopped it to see where it spins
++extern "C" void ps4_perf_code_begin(void *cpu, void (*halt)(void *));
++extern "C" bool ps4_perf_code_end();
 +
 +namespace ps4perf {
 +
