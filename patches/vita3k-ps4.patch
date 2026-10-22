@@ -4778,7 +4778,7 @@ index 4eb1f4f0..bd26315a 100644
      // 8) Choose the ux0 destination (a cart image is always a full app)
 diff --git a/vita3k/ps4/ps4.cmake b/vita3k/ps4/ps4.cmake
 new file mode 100644
-index 00000000..244018b4
+index 00000000..fb8d5aaa
 --- /dev/null
 +++ b/vita3k/ps4/ps4.cmake
 @@ -0,0 +1,41 @@
@@ -4809,7 +4809,7 @@ index 00000000..244018b4
 +
 +# archive.h and the other headers next to main.cpp
 +target_include_directories(vita3k PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-+target_link_libraries(vita3k PRIVATE camera emuenv mem overlay stb vulkan SDL3::SDL3)
++target_link_libraries(vita3k PRIVATE camera emuenv mem overlay pugixml::pugixml stb vulkan SDL3::SDL3)
 +# the launcher's firmware download (ps4_download.cpp)
 +target_link_libraries(vita3k PRIVATE libcurl)
 +
@@ -4825,10 +4825,10 @@ index 00000000..244018b4
 +ps4_add_eboot(vita3k)
 diff --git a/vita3k/ps4/ps4_canvas.cpp b/vita3k/ps4/ps4_canvas.cpp
 new file mode 100644
-index 00000000..c41357fc
+index 00000000..bf1078f1
 --- /dev/null
 +++ b/vita3k/ps4/ps4_canvas.cpp
-@@ -0,0 +1,705 @@
+@@ -0,0 +1,710 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -5042,6 +5042,11 @@ index 00000000..c41357fc
 +    fonts_tried = false;
 +    regular_set = FontSet{};
 +    bold_set = FontSet{};
++}
++
++bool image_size(const std::string &path, int &width, int &height) {
++    int n = 0;
++    return stbi_info(path.c_str(), &width, &height, &n) != 0;
 +}
 +
 +Image load_image(const std::string &path, int width, int height) {
@@ -5536,10 +5541,10 @@ index 00000000..c41357fc
 +} // namespace ps4ui
 diff --git a/vita3k/ps4/ps4_canvas.h b/vita3k/ps4/ps4_canvas.h
 new file mode 100644
-index 00000000..3c973064
+index 00000000..6f5ad8c6
 --- /dev/null
 +++ b/vita3k/ps4/ps4_canvas.h
-@@ -0,0 +1,124 @@
+@@ -0,0 +1,126 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -5587,6 +5592,8 @@ index 00000000..3c973064
 +
 +// Loads a PNG/JPEG, scaled to fit width x height (0 = as it is)
 +Image load_image(const std::string &path, int width = 0, int height = 0);
++// A picture's size in pixels, without loading it; false if it can't be read
++bool image_size(const std::string &path, int &width, int &height);
 +// Its colours multiplied by its alpha: what Canvas::blit and blit_scaled take (a sprite)
 +void premultiply(Image &image);
 +// Scaled to width x height, each pixel the average of the pixels it covers (for shrinking)
@@ -6308,10 +6315,10 @@ index 00000000..01fdf0f1
 +} // namespace ps4download
 diff --git a/vita3k/ps4/ps4_launcher.cpp b/vita3k/ps4/ps4_launcher.cpp
 new file mode 100644
-index 00000000..4bb3acea
+index 00000000..17f20193
 --- /dev/null
 +++ b/vita3k/ps4/ps4_launcher.cpp
-@@ -0,0 +1,2694 @@
+@@ -0,0 +1,2944 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -6345,6 +6352,9 @@ index 00000000..4bb3acea
 +#include "ps4_wsi.h"
 +
 +#include "archive.h"
++
++#include <io/vfs.h>
++#include <pugixml.hpp>
 +
 +#include <miniz.h>
 +
@@ -6633,10 +6643,31 @@ index 00000000..4bb3acea
 +    ps4ui::Image large;
 +    // the home screen's bubble's icon
 +    ps4ui::Image bubble;
-+    // its LiveArea: the background and the start gate's picture (sce_sys/livearea/contents)
++    // its LiveArea (sce_sys/livearea/contents/template.xml): the style, the background, the start
++    // gate's picture, and the frames of pictures and text the style places
 +    bool livearea_loaded = false;
++    std::string livearea_style = "a1";
 +    ps4ui::Image livearea_bg;
 +    ps4ui::Image livearea_gate;
++    struct LiveText {
++        std::string text;
++        uint32_t color = 0xFFFFFF;
++        float size = 0; // in the Vita's 960x544 screen's pixels, doubled (template.xml's size)
++        bool bold = false;
++    };
++    // where in its frame (or its margins' box): -1 left / top, 0 centre, 1 right / bottom
++    struct LiveAlign {
++        int x = 0, y = 0;
++        float margin_left = 0, margin_right = 0, margin_top = 0, margin_bottom = 0; // Vita pixels
++    };
++    struct LiveFrame {
++        std::string id;
++        ps4ui::Image background, image;
++        LiveAlign image_align;
++        std::vector<LiveText> texts;
++        LiveAlign text_align;
++    };
++    std::vector<LiveFrame> live_frames;
 +};
 +
 +std::vector<Item> load_items(EmuEnvState &emuenv) {
@@ -8016,55 +8047,280 @@ index 00000000..4bb3acea
 +
 +// --- a game's LiveArea ---
 +
++// The Vita's LiveArea styles (template.xml's style): where the gate and each frame are, as the
++// distances of their top left corner from the right and the bottom of the 960x544 screen, and their
++// sizes (as Vita3K has them)
++struct LiveLayout {
++    float x, y, w, h;
++};
++struct LiveStyle {
++    const char *name;
++    float gate_x, gate_y;
++    std::vector<std::pair<std::string, LiveLayout>> frames;
++};
++const std::vector<LiveStyle> &live_styles() {
++    static const std::vector<LiveStyle> styles = {
++        { "a1", 620, 361, { { "frame1", { 900, 414, 260, 260 } }, { "frame2", { 320, 414, 260, 260 } }, { "frame3", { 900, 154, 840, 150 } } } },
++        { "a2", 620, 395, { { "frame1", { 900, 404, 260, 400 } }, { "frame2", { 320, 404, 260, 400 } }, { "frame3", { 640, 204, 320, 200 } } } },
++        { "a3", 620, 395, { { "frame1", { 900, 414, 260, 200 } }, { "frame2", { 320, 414, 260, 200 } }, { "frame3", { 900, 214, 260, 210 } }, { "frame4", { 640, 214, 320, 210 } }, { "frame5", { 320, 214, 260, 210 } } } },
++        { "a4", 620, 395, { { "frame1", { 900, 414, 260, 200 } }, { "frame2", { 320, 414, 260, 200 } }, { "frame3", { 900, 214, 840, 70 } }, { "frame4", { 900, 144, 840, 70 } }, { "frame5", { 900, 74, 840, 70 } } } },
++        { "a5", 380, 395, { { "frame1", { 900, 412, 480, 68 } }, { "frame2", { 900, 344, 480, 68 } }, { "frame3", { 900, 276, 480, 68 } }, { "frame4", { 900, 208, 480, 68 } }, { "frame5", { 900, 140, 480, 68 } }, { "frame6", { 900, 72, 480, 68 } }, { "frame7", { 420, 214, 360, 210 } } } },
++        { "psmobile", 380, 345, { { "frame1", { 866, 414, 446, 154 } }, { "frame2", { 866, 249.5f, 446, 109 } }, { "frame3", { 866, 119, 196, 58 } }, { "frame4", { 866, 34, 772, 30 } } } },
++    };
++    return styles;
++}
++const LiveStyle &live_style(const std::string &name) {
++    for (const LiveStyle &style : live_styles())
++        if (name == style.name)
++            return style;
++    return live_styles().front();
++}
++
++// The Vita's screen on ours: 960x544 scaled to our height, centered
++constexpr float LIVE_SCALE = static_cast<float>(H) / 544.f;
++constexpr float LIVE_X = (W - 960.f * LIVE_SCALE) / 2.f;
++struct LiveRect {
++    int x, y, w, h;
++};
++LiveRect live_rect(float vx, float vy, float vw, float vh) {
++    return { static_cast<int>(LIVE_X + vx * LIVE_SCALE), static_cast<int>(vy * LIVE_SCALE), static_cast<int>(vw * LIVE_SCALE), static_cast<int>(vh * LIVE_SCALE) };
++}
++// The gate: 280x158 on the Vita
++LiveRect gate_rect(const Item &item) {
++    const LiveStyle &style = live_style(item.livearea_style);
++    return live_rect(960.f - style.gate_x, 544.f - style.gate_y, 280.f, 158.f);
++}
++
++std::string strip_spaces(std::string s) {
++    s.erase(std::remove_if(s.begin(), s.end(), [](unsigned char ch) { return ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t'; }), s.end());
++    return s;
++}
++
++// Whether a node is for English: a <lang>en</lang> child or a <cntry lang="en"> one
++bool is_english(const pugi::xml_node &node) {
++    for (const pugi::xml_node lang : node.children("lang")) {
++        const std::string value = lang.child_value();
++        if (value == "en" || value == "en-gb" || value == "en-us")
++            return true;
++    }
++    const std::string cntry = node.child("cntry").attribute("lang").as_string();
++    return cntry == "en" || cntry == "en-gb" || cntry == "en-us";
++}
++
++// The file a node names, with a version per language: English's, else the default one's
++// ("default" on), else the first
++std::string pick_language(const pugi::xml_node &parent, const char *name) {
++    std::string english, preferred, fallback;
++    for (const pugi::xml_node node : parent.children(name)) {
++        const std::string text = strip_spaces(node.child_value());
++        if (text.empty())
++            continue;
++        if (fallback.empty())
++            fallback = text;
++        if (english.empty() && is_english(node))
++            english = text;
++        if (preferred.empty() && std::string(node.attribute("default").as_string()) == "on")
++            preferred = text;
++    }
++    return !english.empty() ? english : !preferred.empty() ? preferred : fallback;
++}
++
++// -1, 0 or 1 for left / top, centre, right / bottom
++int align_of(const char *value) {
++    const std::string v = value;
++    if (v == "left" || v == "top")
++        return -1;
++    if (v == "right" || v == "bottom")
++        return 1;
++    return 0;
++}
++
++// A picture of the template, at most the size of a box (in our pixels), and no bigger than the
++// Vita would show it
++ps4ui::Image live_image(const fs::path &contents, std::string name, int max_w, int max_h) {
++    if (name.empty())
++        return {};
++    std::replace(name.begin(), name.end(), '\\', '/');
++    std::string path = fs_utils::path_to_utf8(contents / name);
++    boost::system::error_code ec;
++    if (!fs::exists(path, ec)) {
++        // (the Vita doesn't tell case apart: startup_spanish.PNG)
++        const fs::path found = vfs::find_case_insensitive(contents, name);
++        if (found.empty())
++            return {};
++        path = fs_utils::path_to_utf8(found);
++    }
++    int w = 0, h = 0;
++    if (!ps4ui::image_size(path, w, h))
++        return {};
++    const float scale = std::min({ LIVE_SCALE, static_cast<float>(max_w) / w, static_cast<float>(max_h) / h });
++    return ps4ui::load_image(path, std::max(1, static_cast<int>(w * scale)), std::max(1, static_cast<int>(h * scale)));
++}
++
 +void ensure_livearea(Item &item, const fs::path &app_dir) {
 +    if (item.livearea_loaded)
 +        return;
 +    item.livearea_loaded = true;
 +    const fs::path contents = app_dir / "sce_sys" / "livearea" / "contents";
++    const LiveRect panel = live_rect(60, 44, 840, 500);
 +    boost::system::error_code ec;
-+    for (const char *name : { "bg0.png", "bg.png" }) {
-+        const fs::path bg = contents / name;
-+        if (fs::exists(bg, ec)) {
-+            item.livearea_bg = ps4ui::load_image(fs_utils::path_to_utf8(bg), W, H);
-+            break;
++    pugi::xml_document doc;
++    if (doc.load_file(fs_utils::path_to_utf8(contents / "template.xml").c_str())) {
++        const pugi::xml_node livearea = doc.child("livearea");
++        item.livearea_style = livearea.attribute("style").as_string("a1");
++        const LiveStyle &style = live_style(item.livearea_style);
++        item.livearea_bg = live_image(contents, pick_language(livearea.child("livearea-background"), "image"), panel.w, panel.h);
++        const LiveRect gate = gate_rect(item);
++        item.livearea_gate = live_image(contents, pick_language(livearea.child("gate"), "startup-image"), gate.w, gate.h);
++        // the frames the style has: each one's first live item (English's, if they differ by language)
++        for (const pugi::xml_node frame : livearea.children("frame")) {
++            const std::string id = frame.attribute("id").as_string();
++            const auto layout = std::find_if(style.frames.begin(), style.frames.end(), [&](const auto &f) { return f.first == id; });
++            if (layout == style.frames.end())
++                continue;
++            pugi::xml_node chosen;
++            for (const pugi::xml_node live : frame.children("liveitem")) {
++                if (is_english(live)) {
++                    chosen = live;
++                    break;
++                }
++                if (!chosen || std::string(live.attribute("default").as_string()) == "on")
++                    chosen = live;
++            }
++            if (!chosen)
++                continue;
++            const LiveRect r = live_rect(960.f - layout->second.x, 544.f - layout->second.y, layout->second.w, layout->second.h);
++            Item::LiveFrame f;
++            f.id = id;
++            f.background = live_image(contents, strip_spaces(chosen.child("background").child_value()), r.w, r.h);
++            f.image = live_image(contents, strip_spaces(chosen.child("image").child_value()), r.w, r.h);
++            const pugi::xml_node image = chosen.child("image");
++            f.image_align.x = align_of(image.attribute("align").as_string("center"));
++            f.image_align.y = align_of(image.attribute("valign").as_string("center"));
++            const pugi::xml_node text = chosen.child("text");
++            f.text_align.x = align_of(text.attribute("text-align").as_string(text.attribute("align").as_string("center")));
++            f.text_align.y = align_of(text.attribute("text-valign").as_string(text.attribute("valign").as_string("center")));
++            f.text_align.margin_left = text.attribute("margin-left").as_float(0.f);
++            f.text_align.margin_right = text.attribute("margin-right").as_float(0.f);
++            f.text_align.margin_top = text.attribute("margin-top").as_float(0.f);
++            f.text_align.margin_bottom = text.attribute("margin-bottom").as_float(0.f);
++            for (const pugi::xml_node str : text.children("str")) {
++                Item::LiveText t;
++                t.text = str.text().as_string();
++                std::string color = str.attribute("color").as_string();
++                if (!color.empty() && color[0] == '#')
++                    color.erase(0, 1);
++                t.color = color.empty() ? 0xFFFFFF : static_cast<uint32_t>(std::strtoul(color.c_str(), nullptr, 16));
++                t.size = str.attribute("size").as_float(0.f);
++                t.bold = std::string(str.attribute("bold").as_string()) == "on";
++                if (!t.text.empty())
++                    f.texts.push_back(std::move(t));
++            }
++            item.live_frames.push_back(std::move(f));
 +        }
 +    }
-+    const fs::path gate = contents / "startup.png";
-+    if (fs::exists(gate, ec))
-+        item.livearea_gate = ps4ui::load_image(fs_utils::path_to_utf8(gate), 560, 316);
++    // without a template (or without its pictures): the usual names
++    if (item.livearea_bg.empty()) {
++        for (const char *name : { "bg0.png", "bg.png" }) {
++            if (fs::exists(contents / name, ec)) {
++                item.livearea_bg = live_image(contents, name, panel.w, panel.h);
++                break;
++            }
++        }
++    }
++    if (item.livearea_gate.empty() && fs::exists(contents / "startup.png", ec)) {
++        const LiveRect gate = gate_rect(item);
++        item.livearea_gate = live_image(contents, "startup.png", gate.w, gate.h);
++    }
 +}
 +
-+// Where the gate (the start picture) is
-+constexpr int GATE_W = 620, GATE_H = 350, GATE_X = (W - GATE_W) / 2, GATE_Y = 400;
-+
-+void draw_livearea(Canvas &c, Item &item) {
-+    if (!item.livearea_bg.empty()) {
-+        c.clear_gradient(rgb(0x05080f), rgb(0x05080f));
-+        c.draw_image(item.livearea_bg, (W - item.livearea_bg.width) / 2, (H - item.livearea_bg.height) / 2);
-+        c.fill_rect(0, 0, W, H, rgb(0x000000, 70));
-+    } else {
-+        c.copy_from(vita_wallpaper());
++// Lines of a text in a box, wrapped to its width, as many as fit, aligned as the template says
++void live_text(Canvas &c, const LiveRect &box, const std::string &text, int px, Color color, int align_x, int align_y, Weight weight) {
++    std::vector<std::string> lines;
++    std::string line, word;
++    const auto flush_word = [&] {
++        if (word.empty())
++            return;
++        const std::string tried = line.empty() ? word : line + " " + word;
++        if (!line.empty() && c.text_width(tried, px) > box.w - 8) {
++            lines.push_back(line);
++            line = word;
++        } else {
++            line = tried;
++        }
++        word.clear();
++    };
++    for (const char ch : text) {
++        if (ch == '\n') {
++            flush_word();
++            lines.push_back(line);
++            line.clear();
++        } else if (ch == ' ') {
++            flush_word();
++        } else {
++            word += ch;
++        }
 +    }
-+    // the game: its bubble and name at the top left
++    flush_word();
++    if (!line.empty())
++        lines.push_back(line);
++    const int line_h = px * 5 / 4;
++    const int shown = std::max(1, std::min(static_cast<int>(lines.size()), box.h / line_h));
++    const int block = shown * line_h;
++    int y = (align_y < 0 ? box.y : align_y > 0 ? box.y + box.h - block : box.y + (box.h - block) / 2) + px;
++    for (int i = 0; i < shown; i++, y += line_h) {
++        const int width = c.text_width(lines[i], px, weight);
++        const int x = align_x < 0 ? box.x : align_x > 0 ? box.x + box.w - width : box.x + (box.w - width) / 2;
++        c.text(x + 2, y + 2, lines[i], px, rgb(0x000000, 140), weight);
++        c.text(x, y, lines[i], px, color, weight);
++    }
++}
++
++// A game's LiveArea as on the Vita: its background, its frames of pictures and text, and the gate
++// (the start picture with Start under it), over the wallpaper
++void draw_livearea(Canvas &c, Item &item) {
++    c.copy_from(vita_wallpaper());
++    c.fill_rect(0, 0, W, H, rgb(0x000000, 90));
++    const LiveRect panel = live_rect(60, 44, 840, 500);
++    c.fill_rect(panel.x, panel.y, panel.w, panel.h, rgb(0x94a4ad));
++    if (!item.livearea_bg.empty())
++        c.draw_image(item.livearea_bg, panel.x + (panel.w - item.livearea_bg.width) / 2, panel.y + (panel.h - item.livearea_bg.height) / 2);
++
++    const LiveStyle &style = live_style(item.livearea_style);
++    for (const Item::LiveFrame &frame : item.live_frames) {
++        const auto layout = std::find_if(style.frames.begin(), style.frames.end(), [&](const auto &f) { return f.first == frame.id; });
++        if (layout == style.frames.end())
++            continue;
++        const LiveRect r = live_rect(960.f - layout->second.x, 544.f - layout->second.y, layout->second.w, layout->second.h);
++        if (!frame.background.empty())
++            c.draw_image(frame.background, r.x + (r.w - frame.background.width) / 2, r.y + (r.h - frame.background.height) / 2);
++        if (!frame.image.empty()) {
++            const auto place = [](int align, int at, int room, int size) { return align < 0 ? at : align > 0 ? at + room - size : at + (room - size) / 2; };
++            c.draw_image(frame.image, place(frame.image_align.x, r.x, r.w, frame.image.width), place(frame.image_align.y, r.y, r.h, frame.image.height));
++        }
++        if (!frame.texts.empty()) {
++            const Item::LiveText &t = frame.texts.front();
++            const int px = std::max(18, static_cast<int>((t.size > 0 ? t.size : 12.f) * LIVE_SCALE * 0.75f));
++            const Item::LiveAlign &a = frame.text_align;
++            const LiveRect box = { r.x + static_cast<int>(a.margin_left * LIVE_SCALE), r.y + static_cast<int>(a.margin_top * LIVE_SCALE),
++                std::max(40, r.w - static_cast<int>((a.margin_left + a.margin_right) * LIVE_SCALE)),
++                std::max(px, r.h - static_cast<int>((a.margin_top + a.margin_bottom) * LIVE_SCALE)) };
++            live_text(c, box, t.text, px, rgb(t.color), a.x, a.y, t.bold ? Weight::Bold : Weight::Regular);
++        }
++    }
++
++    // the gate: the start picture (or the game's icon), its frame, and Start
++    const LiveRect gate = gate_rect(item);
++    c.fill_round_rect(gate.x - 4, gate.y - 4, gate.w + 8, gate.h + 8, 22, rgb(0xc0c0c0));
++    c.fill_round_rect(gate.x, gate.y, gate.w, gate.h, 18, rgb(0x2f3332));
 +    ensure_icons(item);
-+    const float bx = 200.f, by = 210.f, br = 104.f;
-+    c.fill_circle(bx + 3.f, by + 10.f, br + 3.f, rgb(0x000000, 80));
-+    if (!item.bubble.empty())
-+        c.draw_image_circle(item.bubble, bx, by, br);
-+    else
-+        c.fill_circle(bx, by, br, rgb(0x1b2a44));
-+    c.ring(bx, by, br - 1.5f, 3.f, rgb(0xffffff, 240));
-+    c.fill_round_rect(340, 130, W - 340 - 120, 170, 26, rgb(0x000000, 90));
-+    c.text(380, 206, item.entry.title, 56, TEXT, Weight::Bold, W - 380 - 160);
-+    c.text(380, 262, item.entry.title_id + (item.entry.app_ver.empty() ? "" : "   v" + item.entry.app_ver), 30, rgb(0xc8d6ee));
-+    // the gate: the game's start picture, with Start under it
-+    c.fill_round_rect(GATE_X - 14, GATE_Y - 14, GATE_W + 28, GATE_H + 120, 30, rgb(0x000000, 70));
-+    c.fill_round_rect(GATE_X - 12, GATE_Y - 12, GATE_W + 24, GATE_H + 112, 28, rgb(0xf4f7fb));
-+    c.fill_round_rect(GATE_X, GATE_Y, GATE_W, GATE_H, 18, rgb(0x0d1830));
 +    const ps4ui::Image &picture = !item.livearea_gate.empty() ? item.livearea_gate : item.large;
 +    if (!picture.empty())
-+        c.draw_image(picture, GATE_X + (GATE_W - picture.width) / 2, GATE_Y + (GATE_H - picture.height) / 2);
-+    c.text_centered(W / 2, GATE_Y + GATE_H + 72, "Start", 44, rgb(0x14284a), Weight::Bold);
++        c.draw_image(picture, gate.x + (gate.w - picture.width) / 2, gate.y + (gate.h - picture.height) / 2);
++    const int bw = static_cast<int>(120 * LIVE_SCALE), bh = static_cast<int>(32 * LIVE_SCALE);
++    const int bx = gate.x + (gate.w - bw) / 2, by = gate.y + gate.h - bh - static_cast<int>(8 * LIVE_SCALE);
++    c.fill_round_rect(bx, by, bw, bh, 18, rgb(0x14a8de));
++    c.text_centered(bx + bw / 2, by + bh / 2 + 15, "Start", 40, rgb(0xffffff), Weight::Bold);
 +}
 +
 +// A card peeled away from its top right corner, `d` px along the diagonal (0 to W + H): over
@@ -8892,7 +9148,8 @@ index 00000000..4bb3acea
 +                        const float e = smoothstep(0.f, 1.f, t);
 +                        const Item &item = items[live];
 +                        const ps4ui::Image &picture = !item.livearea_gate.empty() ? item.livearea_gate : item.large;
-+                        canvas.blit_scaled(picture, W / 2.f, GATE_Y + GATE_H / 2.f, 1.f + 1.6f * e);
++                        const LiveRect gate = gate_rect(item);
++                        canvas.blit_scaled(picture, gate.x + gate.w / 2.f, gate.y + gate.h / 2.f, 1.f + 2.4f * e);
 +                        canvas.fill_rect(0, 0, W, H, rgb(0x000000, static_cast<uint8_t>(255 * e)));
 +                        if (t >= 1.f) {
 +                            launching = false;
