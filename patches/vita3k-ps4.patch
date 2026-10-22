@@ -1412,7 +1412,7 @@ index 117569cf2..4c8552a5 100644
          result.font_names.emplace_back("NotoSansKR-Regular.otf");
          result.font_names.emplace_back("NotoSansCJK-Regular.ttc");
 diff --git a/vita3k/overlay/src/pause_overlay.cpp b/vita3k/overlay/src/pause_overlay.cpp
-index 3e2404bb..1cafc9d8 100644
+index 3e2404bb..140dfbfc 100644
 --- a/vita3k/overlay/src/pause_overlay.cpp
 +++ b/vita3k/overlay/src/pause_overlay.cpp
 @@ -19,21 +19,36 @@
@@ -1591,7 +1591,7 @@ index 3e2404bb..1cafc9d8 100644
 -        button.bg.set_pos(button_x, button_y);
 -        button.bg.set_size(k_button_w, k_button_h);
 +    // the heading: the menu's name, then the pages open ("HENkaku > Settings > Display")
-+    std::string title = m_menu.title.empty() ? std::string("Vita3K") : m_menu.title;
++    std::string title = m_menu.title.empty() ? std::string("HENkaku") : m_menu.title;
 +    for (const page_state &open : m_pages) {
 +        if (open.page)
 +            title += "  >  " + open.page->name;
@@ -2579,7 +2579,7 @@ index 00000000..9c33893b
 +} // namespace ps4ui
 diff --git a/vita3k/ps4/ps4_download.cpp b/vita3k/ps4/ps4_download.cpp
 new file mode 100644
-index 00000000..e3695b45
+index 00000000..923d1127
 --- /dev/null
 +++ b/vita3k/ps4/ps4_download.cpp
 @@ -0,0 +1,164 @@
@@ -2699,7 +2699,7 @@ index 00000000..e3695b45
 +        char details[CURL_ERROR_SIZE] = {};
 +        CURL *curl = curl_easy_init();
 +        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "Vita3K");
++        curl_easy_setopt(curl, CURLOPT_USERAGENT, "HENkaku (Vita3K)");
 +        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 +        curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
 +        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
@@ -2803,7 +2803,7 @@ index 00000000..01fdf0f1
 +} // namespace ps4download
 diff --git a/vita3k/ps4/ps4_launcher.cpp b/vita3k/ps4/ps4_launcher.cpp
 new file mode 100644
-index 00000000..b2c4102f
+index 00000000..96c65f1e
 --- /dev/null
 +++ b/vita3k/ps4/ps4_launcher.cpp
 @@ -0,0 +1,1985 @@
@@ -3005,8 +3005,8 @@ index 00000000..b2c4102f
 +}
 +
 +void header(Canvas &c, const app::FirmwareState &fw) {
-+    const int x = c.text(MARGIN, 128, "Vita3K", 76, TEXT, Weight::Bold);
-+    c.text(MARGIN + x + 18, 128, "for PS4", 38, ACCENT);
++    const int x = c.text(MARGIN, 128, "HENkaku", 76, TEXT, Weight::Bold);
++    c.text(MARGIN + x + 18, 128, "PS Vita on PS4", 38, ACCENT);
 +    const std::string version = version_text();
 +    c.text(W - MARGIN - c.text_width(version, 28), 92, version, 28, MUTED);
 +    // firmware status chips, right to left
@@ -3384,7 +3384,7 @@ index 00000000..b2c4102f
 +                // one of Vita3K's own (ux0/app/...): installing deletes where it goes first, which
 +                // is where it is
 +                if (fs_utils::path_to_utf8(p).rfind(fs_utils::path_to_utf8(emuenv.vita_fs_path), 0) == 0) {
-+                    finish(p, false, "it's in Vita3K's own folders already: start it from the list");
++                    finish(p, false, "it's in HENkaku's own folders already: start it from the list");
 +                    break;
 +                }
 +                const bool ok = install_contents(emuenv, p) > 0;
@@ -3672,7 +3672,7 @@ index 00000000..b2c4102f
 +        c.fill_round_rect(MARGIN, LIST_Y + 20, cw, 600, 32, rgb(0x14213a, 220));
 +        c.text(MARGIN + 64, LIST_Y + 120, "No games yet", 52, TEXT, Weight::Bold);
 +        const int y = c.text_wrapped(MARGIN + 64, LIST_Y + 200,
-+            "Press Triangle to install games. Vita3K installs:", 32, MUTED, cw - 128, 46);
++            "Press Triangle to install games. HENkaku installs:", 32, MUTED, cw - 128, 46);
 +        const char *lines[] = {
 +            ".vpk and .zip archives, and dumped game folders",
 +            ".pkg packages, with a .zrif file of the same name holding the zRIF",
@@ -3812,7 +3812,7 @@ index 00000000..b2c4102f
 +        lines = { "Cross opens it" };
 +        break;
 +    case Kind::GameFolder:
-+        lines = { "A dumped game: its files are copied into Vita3K", "Cross installs it" };
++        lines = { "A dumped game: its files are copied into HENkaku", "Cross installs it" };
 +        break;
 +    case Kind::Archive:
 +        lines = { "PS Vita app archive, " + size_text(e.size), "Cross installs it" };
@@ -3843,7 +3843,7 @@ index 00000000..b2c4102f
 +        c.fill_round_rect(MARGIN, BROWSER_Y + 10, cw, 400, 32, rgb(0x14213a, 220));
 +        c.text(MARGIN + 64, BROWSER_Y + 110, "Nothing to install here", 44, TEXT, Weight::Bold);
 +        c.text_wrapped(MARGIN + 64, BROWSER_Y + 180,
-+            "Vita3K installs .vpk and .zip archives, .pkg packages (with a .zrif file of the same name holding the zRIF), dumped game folders, PS Vita update files (.PUP) and licenses (.rif). Copy them here over FTP, or go back (Circle) and open a USB drive.",
++            "HENkaku installs .vpk and .zip archives, .pkg packages (with a .zrif file of the same name holding the zRIF), dumped game folders, PS Vita update files (.PUP) and licenses (.rif). Copy them here over FTP, or go back (Circle) and open a USB drive.",
 +            30, MUTED, cw - 128, 44);
 +        return;
 +    }
@@ -4027,7 +4027,7 @@ index 00000000..b2c4102f
 +        x += henkaku.width + 14;
 +    }
 +    x += c.text(x, 46, "HENkaku", 30, TEXT, Weight::Bold) + 16;
-+    c.text(x, 46, "Vita3K " + version_text(), 24, rgb(0xc8d6ee));
++    c.text(x, 46, version_text(), 24, rgb(0xc8d6ee));
 +    int right = W - 36;
 +    const std::string time = clock_text();
 +    right -= c.text_width(time, 32, Weight::Bold);
@@ -4321,8 +4321,8 @@ index 00000000..b2c4102f
 +void show_message(const std::string &title, const std::string &detail) {
 +    Canvas c(W, H);
 +    background(c);
-+    const int x = c.text(MARGIN, 128, "Vita3K", 76, TEXT, Weight::Bold);
-+    c.text(MARGIN + x + 18, 128, "for PS4", 38, ACCENT);
++    const int x = c.text(MARGIN, 128, "HENkaku", 76, TEXT, Weight::Bold);
++    c.text(MARGIN + x + 18, 128, "PS Vita on PS4", 38, ACCENT);
 +    c.text_centered(W / 2, H / 2 - 10, title, 56, TEXT, Weight::Bold);
 +    // one line centered, a longer one (an error) wrapped
 +    if (c.text_width(detail, 32) <= W - 2 * MARGIN)
@@ -4426,8 +4426,8 @@ index 00000000..b2c4102f
 +                root.push_back(section_item("PS Vita firmware"));
 +                root.push_back(action_item(fw.main_firmware ? "Download the font package from Sony" : "Download the firmware from Sony", [&] { firmware_requested = true; }));
 +            }
-+            root.push_back(section_item("Vita3K"));
-+            root.push_back(action_item("Quit Vita3K", [&] { quit_requested = true; }));
++            root.push_back(section_item("HENkaku"));
++            root.push_back(action_item("Quit HENkaku", [&] { quit_requested = true; }));
 +            settings_open(settings, "All games", std::move(root));
 +        }
 +        mode = Mode::Settings;
@@ -4844,7 +4844,7 @@ index 00000000..0210098f
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..a406fd9b
+index 00000000..5e0cf826
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
 @@ -0,0 +1,491 @@
@@ -5027,7 +5027,7 @@ index 00000000..a406fd9b
 +    FILE *f = std::fopen("/data/Vita3K/crash.log", "a");
 +    if (!f)
 +        return;
-+    std::fprintf(f, "\n== Vita3K for PS4 %s: %s (%s), the details are in vita3k.log (vita3k.prev.log once Vita3K started again)\n", app_version,
++    std::fprintf(f, "\n== HENkaku (Vita3K for PS4) %s: %s (%s), the details are in vita3k.log (vita3k.prev.log once Vita3K started again)\n", app_version,
 +        crash_emuenv->current_app_title.c_str(), crash_emuenv->app_info.app_title_id.c_str());
 +    std::fclose(f);
 +}
@@ -5230,7 +5230,7 @@ index 00000000..a406fd9b
 +// main, inside its catch-all
 +int run_app() {
 +    read_app_version();
-+    trace(std::string("main: Vita3K for PS4 ") + app_version);
++    trace(std::string("main: HENkaku (Vita3K for PS4) ") + app_version);
 +    Root root_paths;
 +    app::init_paths(root_paths);
 +    // the launcher's text: the PS Vita's fonts once the font package is installed
@@ -5281,7 +5281,7 @@ index 00000000..a406fd9b
 +    // the PS4 has Vulkan (RADV) only
 +    cfg.backend_renderer = "Vulkan";
 +
-+    ps4launcher::show_message("Vita3K", "Starting");
++    ps4launcher::show_message("HENkaku", "Starting");
 +    ps4pad::init();
 +
 +    // SDL's services Vita3K uses (no window: VideoOut; no sound: sceAudioOut)
@@ -5333,7 +5333,7 @@ index 00000000..a406fd9b
 +        // what nothing else caught goes on the screen (and in the logs) rather than the app vanishing
 +        trace(std::string("uncaught exception: ") + e.what());
 +        LOG_ERROR("Uncaught exception: {}", e.what());
-+        ps4launcher::show_message("Vita3K stopped", e.what());
++        ps4launcher::show_message("HENkaku stopped", e.what());
 +        std::this_thread::sleep_for(std::chrono::seconds(15));
 +        sceSystemServiceLoadExec("exit", nullptr);
 +        return 1;
@@ -5991,7 +5991,7 @@ index 00000000..16d557c9
 +} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_settings.cpp b/vita3k/ps4/ps4_settings.cpp
 new file mode 100644
-index 00000000..bfa5f816
+index 00000000..70a46844
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.cpp
 @@ -0,0 +1,475 @@
@@ -6277,7 +6277,7 @@ index 00000000..bfa5f816
 +}
 +
 +Item fsr_sharpness(EmuEnvState &emuenv) {
-+    return pref_choice("FSR 1 sharpness", { "Sharpest", "Sharp (Vita3K's)", "Medium", "Soft", "Softest" },
++    return pref_choice("FSR 1 sharpness", { "Sharpest", "Sharp (default)", "Medium", "Soft", "Softest" },
 +        [](const Prefs &p) { return p.fsr_sharpness; },
 +        [&emuenv](Prefs &p, int value) {
 +            p.fsr_sharpness = value;
@@ -6376,7 +6376,7 @@ index 00000000..bfa5f816
 +        LOG_WARN("PS4: couldn't write {}", PREFS_FILE);
 +        return;
 +    }
-+    std::fprintf(f, "# Vita3K for PS4: the frontend's own settings (HENkaku > System, Display, CPU)\n");
++    std::fprintf(f, "# HENkaku (Vita3K for PS4): the frontend's own settings (HENkaku > System, Display, CPU)\n");
 +    std::fprintf(f, "home = %s\n", g_prefs.bubbles ? "bubbles" : "list");
 +    std::fprintf(f, "fsr-sharpness = %d\n", g_prefs.fsr_sharpness);
 +    std::fprintf(f, "game-threads = %s\n", g_prefs.cluster_threads ? "cluster" : "all");
@@ -6403,7 +6403,7 @@ index 00000000..bfa5f816
 +
 +    std::vector<Item> system;
 +    system.push_back(section("Home screen"));
-+    system.push_back(pref_choice("Style", { "PS Vita (bubbles)", "Vita3K (list)" },
++    system.push_back(pref_choice("Style", { "PS Vita (bubbles)", "List" },
 +        [](const Prefs &p) { return p.bubbles ? 0 : 1; },
 +        [](Prefs &p, int value) { p.bubbles = value == 0; }));
 +    system.push_back(section("Buttons"));

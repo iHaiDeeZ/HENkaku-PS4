@@ -1,10 +1,10 @@
-# Vita3K for PS4
+# HENkaku (Vita3K for PS4)
 
-[Vita3K](https://github.com/Vita3K/Vita3K) (PlayStation Vita emulator) as a PS4 homebrew app, built
+**HENkaku** is [Vita3K](https://github.com/Vita3K/Vita3K) (PlayStation Vita emulator) as a PS4 homebrew app (title ID VITA00003, data in `/data/Vita3K`), built
 in WSL Ubuntu with the M33 / Resonance / DolphinPS4 / Crema PS4 toolchain (clang 21 + libc++ 21 on
 OpenOrbis).
 
-Status: **v00.15**. On the console the launcher works (text, firmware download, installing a VPK),
+Status: **v00.16**. On the console the launcher works (text, firmware download, installing a VPK),
 PKGj runs (renderer on RADV, audio, dynarmic, the network), and Mortal Kombat (PCSE00023) plays:
 v00.12 fixed the GPU hang at the start of a fight by turning Vita3K's memory mapping off (see
 "Graphics" below). Its fights ran at 30 fps where the game wants 60 (slow motion); v00.13 (fast
@@ -15,11 +15,14 @@ launcher rotated the game's log away), so v00.15 keeps the last game's log as `v
 v00.15 is the PS Vita look: a home screen of bubbles with a LiveArea for each game (Vita3K's list
 stays, HENkaku > System > Style), the **HENkaku** settings for all games and for each game, the
 in-game HENkaku menu (L3 + R3) in sections and pages, and FSR 1 working on the PS4 (32-bit
-shaders) with a sharpness setting. Remember to install each new package from `/data/pkg`.
+shaders) with a sharpness setting. v00.16 names the whole app HENkaku (its PS4 icon, home screen
+art and screens use the HENkaku ensō logo); it installs over Vita3K v00.15 and keeps its games
+and settings. Remember to install each new package from `/data/pkg`.
 
 ## Using it
 
-1. Install `out/Vita3K-vXX.YY.pkg` with GoldHEN's Package Installer and start **Vita3K**.
+1. Install `out/HENkaku-vXX.YY.pkg` (`out/Vita3K-vXX.YY.pkg` up to v00.15) with GoldHEN's Package
+   Installer and start **HENkaku**.
 2. The first time, the launcher downloads the PS Vita firmware (3.74, 128 MiB) and font package
    (54 MiB) from Sony's update server and installs them. Circle stops the download (it carries on
    later, and doesn't start by itself again); Square starts it. Without a connection, copy Sony's
@@ -217,15 +220,15 @@ scripts/save-patch.sh "message"     # commit ~/vita3k-build/src/vita3k and refre
 ```
 
 Run the scripts from WSL through `~/vita3k` (the space in "PS4 Projects" breaks linker flags).
-Upload from Windows (Git Bash): `scripts/upload-to-console.sh out/Vita3K-vXX.YY.pkg`.
+Upload from Windows (Git Bash): `scripts/upload-to-console.sh out/HENkaku-vXX.YY.pkg`.
 
 ## License
 
 GPL-2.0-or-later, as Vita3K ([LICENSE](LICENSE)): the patches are modifications of Vita3K and
 dynarmic (0BSD). The PS4 runtime in `port/` and the toolchain scripts come from the M33 / Resonance /
 DolphinPS4 / Crema ports; `port/mesa/ac_ps4_drm.c` is the RADV winsys of the PS4 Mesa port (MIT).
-`assets/henkaku.png` (the HENkaku bubble's and menu's ensō) is drawn by
-`scripts/make-henkaku-icon.py`, in the manner of the HENkaku logo, not copied from it.
+`assets/henkaku-logo.png` is the HENkaku ensō logo (HENkaku by team molecule); `scripts/make-henkaku-art.py`
+makes `assets/henkaku.png` (the menus' icon) and `sce_sys/icon0.png` / `pic1.png` from it.
 `fonts/` is Roboto 3.009 (from Vita3K's Tracy submodule), under the SIL Open Font License 1.1
 (`fonts/OFL-Roboto.txt`).
 No PS Vita firmware, Sony system files or games are included: supply your own.

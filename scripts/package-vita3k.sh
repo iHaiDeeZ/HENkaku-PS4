@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Package the PS4 Vita3K build (after rebuild-vita3k.sh) as Vita3K, VITA00003
-# (IV0000-VITA00003_00-VITA3KPS4EMU0000.pkg) into out/Vita3K-vXX.YY.pkg. Earlier packages in out/ stay.
+# Package the PS4 Vita3K build (after rebuild-vita3k.sh) as HENkaku, VITA00003
+# (IV0000-VITA00003_00-VITA3KPS4EMU0000.pkg) into out/HENkaku-vXX.YY.pkg (out/Vita3K-v*.pkg before v00.16). Earlier packages in out/ stay.
 #   VITA3K_VERSION=00.01 package-vita3k.sh
 # The console gets the package from Windows with scripts/upload-to-console.sh (uploads sent from WSL
 # were lost on the console).
@@ -26,7 +26,7 @@ echo "$VERSION" > "$STAGE/version.txt"
 cp -r "$SRC/data" "$STAGE/data"
 cp -r "$SRC/vita3k/shaders-builtin" "$STAGE/shaders-builtin"
 cp -r "$SRC/vita3k/icons" "$STAGE/icons"
-# the HENkaku menu's icon (an ensō drawn by scripts/make-henkaku-icon.py)
+# the menus' HENkaku icon (scripts/make-henkaku-art.py, from assets/henkaku-logo.png)
 cp "$HERE/../assets/henkaku.png" "$STAGE/icons/henkaku.png"
 cp "$SRC/COPYING.txt" "$STAGE/COPYING.txt"
 # The launcher's and the overlay's font until the PS Vita's font package is installed (Roboto, OFL;
@@ -35,11 +35,11 @@ cp -r "$HERE/../fonts" "$STAGE/fonts"
 # PkgTool's pkg_build crashes ("Sequence contains no elements") on empty folders.
 find "$STAGE" -type d -empty -delete
 # Vulkan (RADV on GNM) runs under the plain homebrew identity (4.5 GiB of direct memory).
-PKG="$(SFO_STYLE=plain NO_RIGHT_SPRX=1 DOLPHIN_PS4_MODULES_DIR=/nonexistent "$HERE/make-pkg.sh" "$STAGE" VITA00003 "Vita3K" "$VERSION" VITA3KPS4EMU "$PS4_BUILD_ROOT/out" | tail -1)"
+PKG="$(SFO_STYLE=plain NO_RIGHT_SPRX=1 DOLPHIN_PS4_MODULES_DIR=/nonexistent "$HERE/make-pkg.sh" "$STAGE" VITA00003 "HENkaku" "$VERSION" VITA3KPS4EMU "$PS4_BUILD_ROOT/out" | tail -1)"
 ls -la "$PKG"
 # a copy next to the repo (E:\PS4 Projects\Vita3K\out), easy to find from Windows; *.pkg is ignored by git
 mkdir -p "$HERE/../out"
-NAME="Vita3K-v$VERSION.pkg"
+NAME="HENkaku-v$VERSION.pkg"
 cp "$PKG" "$HERE/../out/$NAME"
 # Keep the symbols of every packaged build: crash logs must be symbolized against the exact binary.
 mkdir -p "$PS4_BUILD_ROOT/oelf"

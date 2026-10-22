@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Puts a Vita3K package in the console's /data/pkg and removes this app's older packages there
-# (Vita3K-v*, IV0000-VITA00003*; other apps' are left alone).
-#   scripts/upload-to-console.sh out/Vita3K-vXX.YY.pkg
+# Puts a HENkaku (Vita3K) package in the console's /data/pkg and removes this app's older packages there
+# (HENkaku-v*, Vita3K-v*, IV0000-VITA00003*; other apps' are left alone).
+#   scripts/upload-to-console.sh out/HENkaku-vXX.YY.pkg
 # Run it from Windows (Git Bash), not from WSL: uploads sent from inside WSL were undone on the
 # console a minute later (M33, 2026-10-12), while the same steps from Windows stayed.
 set -euo pipefail
@@ -22,9 +22,9 @@ for try in 1 2 3; do
     settled && break
     echo "console: $NAME didn't stay, uploading again"
 done
-for old in $(listing | grep -E '^(Vita3K-v[0-9.]+|IV0000-VITA00003_00-[A-Z0-9]+)[.]pkg$' | grep -vx "$NAME"); do
+for old in $(listing | grep -E '^((HENkaku|Vita3K)-v[0-9.]+|IV0000-VITA00003_00-[A-Z0-9]+)[.]pkg$' | grep -vx "$NAME"); do
     if curl -sS "$HOST/" -Q "DELE /data/pkg/$old" > /dev/null; then echo "console: removed old $old"; else echo "console: could not remove $old"; fi
     sleep 15
 done
 settled || { echo "console: $NAME went missing after the cleanup, uploading again"; curl -sS -T "$PKG" "$HOST/data/pkg/"; settled; }
-listing | grep -E '^(Vita3K-v|IV0000-VITA00003)' | sed 's/^/console has: /'
+listing | grep -E '^(HENkaku-v|Vita3K-v|IV0000-VITA00003)' | sed 's/^/console has: /'
