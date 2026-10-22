@@ -1842,8 +1842,39 @@ index 006cf39f..9df4d0a7 100644
  }
  
  bool read_app_file(FileBuffer &buf, const fs::path &vita_fs_path, const std::string &app_path, const fs::path &vfs_file_path) {
+diff --git a/vita3k/kernel/include/kernel/kernel_object.h b/vita3k/kernel/include/kernel/kernel_object.h
+index f70b3397..1328a821 100644
+--- a/vita3k/kernel/include/kernel/kernel_object.h
++++ b/vita3k/kernel/include/kernel/kernel_object.h
+@@ -17,6 +17,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <kernel/types.h>
+ 
+ #include <cassert>
+@@ -51,6 +52,9 @@ public:
+ 
+     SceUID uid{};
+ 
++    // Whether it was deleted, without taking its lock (a lookup cache checks its entries with it)
++    bool was_deleted() const { return deleted.load(std::memory_order_acquire); }
++
+ protected:
+     // Locks the object, which guards its fields. The lock is empty if the object was deleted. Only
+     // the object's own methods take it.
+@@ -76,7 +80,7 @@ private:
+     }
+ 
+     mutable std::mutex mutex;
+-    bool deleted = false;
++    std::atomic<bool> deleted{ false };
+ };
+ 
+ // Base of a kernel object type with a single class, which uid_class names.
 diff --git a/vita3k/kernel/include/kernel/sync_primitives.h b/vita3k/kernel/include/kernel/sync_primitives.h
-index 80c44ba4..7812715a 100644
+index 80c44ba4..538c122b 100644
 --- a/vita3k/kernel/include/kernel/sync_primitives.h
 +++ b/vita3k/kernel/include/kernel/sync_primitives.h
 @@ -173,6 +173,8 @@ public:
@@ -1855,6 +1886,18 @@ index 80c44ba4..7812715a 100644
  
  protected:
      struct WaitEntry {
+@@ -218,6 +220,11 @@ public:
+ 
+ typedef std::shared_ptr<Mutex> MutexPtr;
+ 
++// A lightweight mutex by UID, as KernelObjects::find<LwMutex>, through a small cache per host
++// thread: the lock and unlock calls games make tens of thousands of times a second otherwise each
++// look it up in the kernel's map under its lock. A cached mutex that was deleted is looked up again.
++MutexPtr find_lw_mutex(KernelObjects &objects, SceUID uid);
++
+ class RWLock final : public WithUidClass<SyncPrimitive, UidClass::rw_lock> {
+ public:
+     RWLock(SceUInt32 attr, const char *name);
 diff --git a/vita3k/kernel/include/kernel/thread/thread_state.h b/vita3k/kernel/include/kernel/thread/thread_state.h
 index 4c4694be..af094577 100644
 --- a/vita3k/kernel/include/kernel/thread/thread_state.h
@@ -1869,7 +1912,7 @@ index 4c4694be..af094577 100644
      bool is_deleted();
      // The status a thread that ended exited with, or NOT_DORMANT or DORMANT if it hasn't ended
 diff --git a/vita3k/kernel/src/kernel.cpp b/vita3k/kernel/src/kernel.cpp
-index 97794b3d..40e7f599 100644
+index 97794b3d..fa68ee27 100644
 --- a/vita3k/kernel/src/kernel.cpp
 +++ b/vita3k/kernel/src/kernel.cpp
 @@ -23,6 +23,7 @@
@@ -1894,7 +1937,19 @@ index 97794b3d..40e7f599 100644
  int CorenumAllocator::new_corenum() {
      const std::lock_guard<std::mutex> guard(lock);
  
-@@ -63,6 +71,13 @@ static int SDLCALL thread_function(void *data) {
+@@ -50,6 +58,11 @@ void CorenumAllocator::set_max_core_count(const std::size_t max) {
+     alloc.set_maximum(max);
+ }
+ 
++// The guest thread this host thread runs: most calls ask for the calling thread, which can't be
++// deleted while it runs (a lookup under the kernel's lock and the thread's own lock otherwise)
++static thread_local ThreadStatePtr t_running_thread;
++static thread_local const KernelState *t_running_kernel = nullptr;
++
+ // TODO implement cross platform debug thread name setter and eliminate SDL thread
+ struct ThreadParams {
+     KernelState *kernel = nullptr;
+@@ -63,6 +76,15 @@ static int SDLCALL thread_function(void *data) {
      ThreadParams params = *static_cast<const ThreadParams *>(data);
      SDL_SignalSemaphore(params.host_may_destroy_params);
      ThreadStatePtr thread = std::move(params.thread);
@@ -1905,10 +1960,30 @@ index 97794b3d..40e7f599 100644
 +    ps4_perf_thread_id(thread->id);
 +    ps4_place_guest_thread();
 +#endif
++    t_running_thread = thread;
++    t_running_kernel = params.kernel;
  #ifdef TRACY_ENABLE
      if (!thread->name.empty()) {
          tracy::SetThreadName(thread->name.c_str());
-@@ -326,3 +341,58 @@ SceKernelModuleInfo *KernelState::find_module_by_addr(Address address) {
+@@ -73,6 +95,8 @@ static int SDLCALL thread_function(void *data) {
+ #endif
+ 
+     thread->run_loop();
++    t_running_thread.reset();
++    t_running_kernel = nullptr;
+     const uint32_t r0 = read_reg(*thread->cpu, 0);
+     const SceUID id = thread->id;
+     const int processor_id = get_processor_id(*thread->cpu);
+@@ -149,6 +173,8 @@ uint64_t KernelState::process_time_at(uint64_t clock_time) const {
+ }
+ 
+ ThreadStatePtr KernelState::get_thread(SceUID thread_id) {
++    if (t_running_kernel == this && t_running_thread && t_running_thread->id == thread_id)
++        return t_running_thread;
+     const ThreadStatePtr thread = lock_and_find(thread_id, threads, mutex);
+     // A deleted thread stays in threads until its host thread ends, but guest calls can't find it
+     if (thread && thread->is_deleted())
+@@ -326,3 +352,58 @@ SceKernelModuleInfo *KernelState::find_module_by_addr(Address address) {
      }
      return nullptr;
  }
@@ -1968,7 +2043,7 @@ index 97794b3d..40e7f599 100644
 +}
 +#endif
 diff --git a/vita3k/kernel/src/sync_primitives.cpp b/vita3k/kernel/src/sync_primitives.cpp
-index 78029915..1e21caeb 100644
+index 78029915..baf00c6a 100644
 --- a/vita3k/kernel/src/sync_primitives.cpp
 +++ b/vita3k/kernel/src/sync_primitives.cpp
 @@ -586,6 +586,13 @@ void Mutex::release_ended_owner(const ThreadState &thread) {
@@ -1985,11 +2060,33 @@ index 78029915..1e21caeb 100644
  void Mutex::hand_over() {
      owner = 0;
      if (auto *waiter = waiters.front()) {
+@@ -615,6 +622,21 @@ SceInt32 Mutex::cancel(const ThreadStatePtr &thread, SceInt32 new_count, SceUInt
+     return SCE_KERNEL_OK;
+ }
+ 
++MutexPtr find_lw_mutex(KernelObjects &objects, SceUID uid) {
++    struct Entry {
++        const KernelObjects *objects = nullptr;
++        SceUID uid = 0;
++        MutexPtr mutex;
++    };
++    static thread_local Entry cache[16];
++    Entry &entry = cache[static_cast<uint32_t>(uid) % std::size(cache)];
++    if (entry.objects == &objects && entry.uid == uid && entry.mutex && !entry.mutex->was_deleted())
++        return entry.mutex;
++    MutexPtr mutex = objects.find<LwMutex>(uid);
++    entry = { &objects, uid, mutex };
++    return mutex;
++}
++
+ SceInt32 LwMutex::info(SceKernelLwMutexInfo &info) const {
+     const auto guard = lock();
+     if (!guard)
 diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
-index c01e4699..a8706f3d 100644
+index c01e4699..c71a71be 100644
 --- a/vita3k/kernel/src/thread.cpp
 +++ b/vita3k/kernel/src/thread.cpp
-@@ -32,6 +32,89 @@
+@@ -32,6 +32,95 @@
  #include <sstream>
  #include <utility>
  
@@ -2017,11 +2114,13 @@ index c01e4699..a8706f3d 100644
 +// (blocked: 0.3 ms) or ran a time slice (10 ms), so a thread blocked on the host never stalls the rest.
 +namespace {
 +
++// The owner changes under the mutex; it marks its own calls without it (most calls: the thread
++// that runs keeps its core), which the others read when they wait for the core
 +struct VitaCore {
 +    std::mutex mutex;
-+    const void *owner = nullptr;
-+    bool in_call = false;
-+    uint64_t since = 0; // when the owner took the core or entered its call (TSC)
++    std::atomic<const void *> owner{ nullptr };
++    std::atomic<bool> in_call{ false };
++    std::atomic<uint64_t> since{ 0 }; // when the owner took the core or entered its call (TSC)
 +};
 +VitaCore g_vita_cores[3];
 +
@@ -2044,6 +2143,11 @@ index c01e4699..a8706f3d 100644
 +
 +void vita_core_take(int core, const void *self) {
 +    VitaCore &c = g_vita_cores[core];
++    if (c.owner.load(std::memory_order_acquire) == self) {
++        c.in_call.store(false, std::memory_order_relaxed);
++        c.since.store(__builtin_ia32_rdtsc(), std::memory_order_release);
++        return;
++    }
 +    std::unique_lock<std::mutex> lock(c.mutex);
 +    while (c.owner && c.owner != self && __builtin_ia32_rdtsc() - c.since < (c.in_call ? 300 : 10000) * ticks_per_us()) {
 +        lock.unlock();
@@ -2057,10 +2161,9 @@ index c01e4699..a8706f3d 100644
 +
 +void vita_core_call(int core, const void *self) {
 +    VitaCore &c = g_vita_cores[core];
-+    const std::lock_guard<std::mutex> lock(c.mutex);
-+    if (c.owner == self) {
-+        c.in_call = true;
-+        c.since = __builtin_ia32_rdtsc();
++    if (c.owner.load(std::memory_order_acquire) == self) {
++        c.since.store(__builtin_ia32_rdtsc(), std::memory_order_relaxed);
++        c.in_call.store(true, std::memory_order_release);
 +    }
 +}
 +
@@ -2079,7 +2182,7 @@ index c01e4699..a8706f3d 100644
  // Set in the wait type of a wait that runs callbacks
  constexpr SceUInt32 WAITTYPE_CB_BIT = 0x80000000U;
  // What a thread waiting for a thread signal reports as its wait UID on a Vita, which isn't a UID
-@@ -190,6 +273,10 @@ void ThreadState::request_removal() {
+@@ -190,6 +279,10 @@ void ThreadState::request_removal() {
  }
  
  void ThreadState::run_loop(bool top_level) {
@@ -2090,7 +2193,7 @@ index c01e4699..a8706f3d 100644
      bool guest_returned = false;
  
      // Set thread-local CPU state so signal handlers can access it. The guard puts back what was
-@@ -248,6 +335,12 @@ void ThreadState::run_loop(bool top_level) {
+@@ -248,6 +341,12 @@ void ThreadState::run_loop(bool top_level) {
      while (true) {
          // This level is done once its guest function returned or the thread is ending
          if (exiting() || guest_returned) {
@@ -2103,7 +2206,7 @@ index c01e4699..a8706f3d 100644
              // A nested level returns to the one below it
              if (!top_level)
                  break;
-@@ -272,6 +365,10 @@ void ThreadState::run_loop(bool top_level) {
+@@ -272,6 +371,10 @@ void ThreadState::run_loop(bool top_level) {
  
          // Park until we have something to do.
          if (status != ThreadStatus::running) {
@@ -2114,7 +2217,7 @@ index c01e4699..a8706f3d 100644
              status_cond.wait(lock, [&] { return status == ThreadStatus::running || exiting(); });
              continue;
          }
-@@ -297,17 +394,59 @@ void ThreadState::run_loop(bool top_level) {
+@@ -297,17 +400,59 @@ void ThreadState::run_loop(bool top_level) {
              if (exiting())
                  break;
              const bool do_step = std::exchange(step_requested, false);
@@ -2174,7 +2277,7 @@ index c01e4699..a8706f3d 100644
                  clear_exclusive(*cpu);
              }
  
-@@ -501,6 +640,11 @@ bool ThreadState::is_deleted() {
+@@ -501,6 +646,11 @@ bool ThreadState::is_deleted() {
      return status == ThreadStatus::deleted;
  }
  
@@ -3278,6 +3381,59 @@ index 426a3db7..b153c347 100644
  
      return 0;
  }
+diff --git a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+index 6b5a9155..f1482605 100644
+--- a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
++++ b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+@@ -651,7 +651,7 @@ EXPORT(int, _sceKernelLockLwMutex, Ptr<SceKernelLwMutexWork> workarea, int lock_
+         return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+ 
+     const auto lwmutexid = workarea.get(emuenv.mem)->uid;
+-    const MutexPtr mutex = emuenv.kernel.objects.find<LwMutex>(lwmutexid);
++    const MutexPtr mutex = find_lw_mutex(emuenv.kernel.objects, lwmutexid);
+     if (!mutex)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_MUTEX_ID);
+     return mutex->acquire(emuenv.mem, emuenv.kernel.get_thread(thread_id), lock_count, ptimeout, false);
+diff --git a/vita3k/modules/SceLibKernel/SceLibKernel.cpp b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
+index a02c7b6a..a3a65a84 100644
+--- a/vita3k/modules/SceLibKernel/SceLibKernel.cpp
++++ b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
+@@ -1583,7 +1583,7 @@ EXPORT(int, sceKernelLockLwMutexCB, Ptr<SceKernelLwMutexWork> workarea, int lock
+         return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+ 
+     const auto lwmutexid = workarea.get(emuenv.mem)->uid;
+-    const MutexPtr mutex = emuenv.kernel.objects.find<LwMutex>(lwmutexid);
++    const MutexPtr mutex = find_lw_mutex(emuenv.kernel.objects, lwmutexid);
+     if (!mutex)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_MUTEX_ID);
+     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+@@ -1880,7 +1880,7 @@ EXPORT(int, sceKernelStopUnloadModule, SceUID uid, SceSize args, Ptr<const void>
+ EXPORT(int, sceKernelTryLockLwMutex, Ptr<SceKernelLwMutexWork> workarea, int lock_count) {
+     TRACY_FUNC(sceKernelTryLockLwMutex, workarea, lock_count);
+     const auto lwmutexid = workarea.get(emuenv.mem)->uid;
+-    const MutexPtr mutex = emuenv.kernel.objects.find<LwMutex>(lwmutexid);
++    const MutexPtr mutex = find_lw_mutex(emuenv.kernel.objects, lwmutexid);
+     if (!mutex)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_MUTEX_ID);
+     return mutex->try_acquire(emuenv.mem, emuenv.kernel.get_thread(thread_id), lock_count);
+@@ -1947,7 +1947,7 @@ EXPORT(int, sceKernelUnloadModule, SceUID uid, SceUInt32 flags, const void *pOpt
+ EXPORT(int, sceKernelUnlockLwMutex, Ptr<SceKernelLwMutexWork> workarea, int unlock_count) {
+     TRACY_FUNC(sceKernelUnlockLwMutex, workarea, unlock_count);
+     const auto lwmutexid = workarea.get(emuenv.mem)->uid;
+-    const MutexPtr mutex = emuenv.kernel.objects.find<LwMutex>(lwmutexid);
++    const MutexPtr mutex = find_lw_mutex(emuenv.kernel.objects, lwmutexid);
+     // A delete clears the owner in the work area, so a Vita reports the unlock as not owned
+     if (!mutex)
+         return RET_ERROR(SCE_KERNEL_ERROR_LW_MUTEX_NOT_OWNED);
+@@ -1962,7 +1962,7 @@ EXPORT(int, sceKernelUnlockLwMutex_0, Ptr<SceKernelLwMutexWork> workarea, int un
+ EXPORT(int, sceKernelUnlockLwMutex2, Ptr<SceKernelLwMutexWork> workarea, int unlock_count) {
+     TRACY_FUNC(sceKernelUnlockLwMutex2, workarea, unlock_count);
+     const auto lwmutexid = workarea.get(emuenv.mem)->uid;
+-    const MutexPtr mutex = emuenv.kernel.objects.find<LwMutex>(lwmutexid);
++    const MutexPtr mutex = find_lw_mutex(emuenv.kernel.objects, lwmutexid);
+     // A delete clears the owner in the work area, so a Vita reports the unlock as not owned
+     if (!mutex)
+         return RET_ERROR(SCE_KERNEL_ERROR_LW_MUTEX_NOT_OWNED);
 diff --git a/vita3k/ngs/include/ngs/modules/player.h b/vita3k/ngs/include/ngs/modules/player.h
 index 0eb48f99..c187aae3 100644
 --- a/vita3k/ngs/include/ngs/modules/player.h
