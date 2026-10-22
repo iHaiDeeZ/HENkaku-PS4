@@ -760,7 +760,7 @@ index 4c4694be..af094577 100644
      bool is_deleted();
      // The status a thread that ended exited with, or NOT_DORMANT or DORMANT if it hasn't ended
 diff --git a/vita3k/kernel/src/kernel.cpp b/vita3k/kernel/src/kernel.cpp
-index 97794b3d..42316451 100644
+index 97794b3d..40e7f599 100644
 --- a/vita3k/kernel/src/kernel.cpp
 +++ b/vita3k/kernel/src/kernel.cpp
 @@ -23,6 +23,7 @@
@@ -771,20 +771,21 @@ index 97794b3d..42316451 100644
  #include <kernel/thread/thread_state.h>
  
  #include <cpu/functions.h>
-@@ -33,6 +34,12 @@
+@@ -33,6 +34,13 @@
  #include <SDL3/SDL_mutex.h>
  #include <SDL3/SDL_thread.h>
  
 +#ifdef __PS4__
 +extern "C" void ps4_watch_thread(const char *name); // port/ps4_sampler.cpp
 +extern "C" void ps4_perf_guest_thread(const char *name); // vita3k/ps4/ps4_perf.cpp
++extern "C" void ps4_perf_thread_id(int id);
 +extern "C" void ps4_place_guest_thread(); // vita3k/ps4/ps4_main.cpp: which cores
 +#endif
 +
  int CorenumAllocator::new_corenum() {
      const std::lock_guard<std::mutex> guard(lock);
  
-@@ -63,6 +70,12 @@ static int SDLCALL thread_function(void *data) {
+@@ -63,6 +71,13 @@ static int SDLCALL thread_function(void *data) {
      ThreadParams params = *static_cast<const ThreadParams *>(data);
      SDL_SignalSemaphore(params.host_may_destroy_params);
      ThreadStatePtr thread = std::move(params.thread);
@@ -792,12 +793,13 @@ index 97794b3d..42316451 100644
 +    // the guest's name for it in the port's thread list (the perf lines, stack dumps)
 +    ps4_watch_thread(thread->name.empty() ? "guest thread" : thread->name.c_str());
 +    ps4_perf_guest_thread(thread->name.empty() ? "guest thread" : thread->name.c_str());
++    ps4_perf_thread_id(thread->id);
 +    ps4_place_guest_thread();
 +#endif
  #ifdef TRACY_ENABLE
      if (!thread->name.empty()) {
          tracy::SetThreadName(thread->name.c_str());
-@@ -326,3 +339,58 @@ SceKernelModuleInfo *KernelState::find_module_by_addr(Address address) {
+@@ -326,3 +341,58 @@ SceKernelModuleInfo *KernelState::find_module_by_addr(Address address) {
      }
      return nullptr;
  }
@@ -875,10 +877,10 @@ index 78029915..1e21caeb 100644
      owner = 0;
      if (auto *waiter = waiters.front()) {
 diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
-index c01e4699..2ee9d8ee 100644
+index c01e4699..a8706f3d 100644
 --- a/vita3k/kernel/src/thread.cpp
 +++ b/vita3k/kernel/src/thread.cpp
-@@ -32,6 +32,88 @@
+@@ -32,6 +32,89 @@
  #include <sstream>
  #include <utility>
  
@@ -889,7 +891,8 @@ index c01e4699..2ee9d8ee 100644
 +extern "C" void ps4_perf_import(uint32_t nid, uint64_t ticks);
 +extern "C" void ps4_perf_import_begin(uint32_t nid, uint32_t arg0);
 +extern "C" void ps4_perf_code_begin(void *cpu, void (*halt)(void *));
-+extern "C" bool ps4_perf_code_end();
++extern "C" int ps4_perf_code_end();
++extern "C" void ps4_perf_sample(uint32_t pc);
 +extern "C" bool ps4_vita_cores(); // vita3k/ps4/ps4_settings.cpp
 +extern "C" uint64_t sceKernelGetTscFrequency();
 +
@@ -967,7 +970,7 @@ index c01e4699..2ee9d8ee 100644
  // Set in the wait type of a wait that runs callbacks
  constexpr SceUInt32 WAITTYPE_CB_BIT = 0x80000000U;
  // What a thread waiting for a thread signal reports as its wait UID on a Vita, which isn't a UID
-@@ -190,6 +272,10 @@ void ThreadState::request_removal() {
+@@ -190,6 +273,10 @@ void ThreadState::request_removal() {
  }
  
  void ThreadState::run_loop(bool top_level) {
@@ -978,7 +981,7 @@ index c01e4699..2ee9d8ee 100644
      bool guest_returned = false;
  
      // Set thread-local CPU state so signal handlers can access it. The guard puts back what was
-@@ -248,6 +334,12 @@ void ThreadState::run_loop(bool top_level) {
+@@ -248,6 +335,12 @@ void ThreadState::run_loop(bool top_level) {
      while (true) {
          // This level is done once its guest function returned or the thread is ending
          if (exiting() || guest_returned) {
@@ -991,7 +994,7 @@ index c01e4699..2ee9d8ee 100644
              // A nested level returns to the one below it
              if (!top_level)
                  break;
-@@ -272,6 +364,10 @@ void ThreadState::run_loop(bool top_level) {
+@@ -272,6 +365,10 @@ void ThreadState::run_loop(bool top_level) {
  
          // Park until we have something to do.
          if (status != ThreadStatus::running) {
@@ -1002,7 +1005,7 @@ index c01e4699..2ee9d8ee 100644
              status_cond.wait(lock, [&] { return status == ThreadStatus::running || exiting(); });
              continue;
          }
-@@ -297,17 +393,56 @@ void ThreadState::run_loop(bool top_level) {
+@@ -297,17 +394,59 @@ void ThreadState::run_loop(bool top_level) {
              if (exiting())
                  break;
              const bool do_step = std::exchange(step_requested, false);
@@ -1029,7 +1032,10 @@ index c01e4699..2ee9d8ee 100644
 +#ifdef __PS4__
 +            const uint64_t run_end = __builtin_ia32_rdtsc();
 +            // the perf report stopped a thread that ran guest code for seconds without a call: where
-+            if (ps4_perf_code_end()) {
++            const int stopped_for = ps4_perf_code_end();
++            if (stopped_for & 2)
++                ps4_perf_sample(read_pc(*cpu) | (is_thumb_mode(*cpu) ? 1 : 0));
++            if (stopped_for & 1) {
 +                const uint32_t pc = read_pc(*cpu);
 +                LOG_INFO("perf: {} spins in guest code at {} ({}), lr {}, r0-r3 {} {} {} {}", name, log_hex(pc), disassemble(*cpu, pc), log_hex(read_lr(*cpu)),
 +                    log_hex(read_reg(*cpu, 0)), log_hex(read_reg(*cpu, 1)), log_hex(read_reg(*cpu, 2)), log_hex(read_reg(*cpu, 3)));
@@ -1059,7 +1065,7 @@ index c01e4699..2ee9d8ee 100644
                  clear_exclusive(*cpu);
              }
  
-@@ -501,6 +636,11 @@ bool ThreadState::is_deleted() {
+@@ -501,6 +640,11 @@ bool ThreadState::is_deleted() {
      return status == ThreadStatus::deleted;
  }
  
@@ -6280,10 +6286,10 @@ index 00000000..0210098f
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..ef37d762
+index 00000000..88434498
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
-@@ -0,0 +1,499 @@
+@@ -0,0 +1,539 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -6322,6 +6328,9 @@ index 00000000..ef37d762
 +#include "ps4_settings.h"
 +#include "ps4_wsi.h"
 +
++#include <cpu/functions.h>
++#include <kernel/state.h>
++#include <kernel/thread/thread_state.h>
 +#include <app/functions.h>
 +#include <app/session_controller.h>
 +#include <config/functions.h>
@@ -6367,6 +6376,42 @@ index 00000000..ef37d762
 +// kernel/src/kernel.cpp: every guest thread's wait, and who holds what it waits for
 +void ps4_log_waits(KernelState &kernel);
 +
++// The profiler's hottest places in each busy guest thread's code: the share of its samples, the
++// module and offset (to find in the game's code), and the code from there (the run the JIT
++// compiled as a block, up to its first branch)
++void log_profile(const EmuEnvState &emuenv) {
++    // (the kernel's lookups lock it, so they aren't const)
++    KernelState &kernel = const_cast<KernelState &>(emuenv.kernel);
++    for (const ps4perf::ProfileThread &thread : ps4perf::take_profile(16)) {
++        if (thread.total < 500) // a thread that ran guest code for under a second of the ten
++            continue;
++        const ThreadStatePtr guest = kernel.get_thread(thread.id);
++        LOG_INFO("profile: {}: {} samples", thread.name, thread.total);
++        for (const auto &[pc_bits, count] : thread.hottest) {
++            const bool thumb = pc_bits & 1;
++            const uint32_t pc = pc_bits & ~1u;
++            std::string where = fmt::format("{:08X}", pc);
++            if (const SceKernelModuleInfo *module = kernel.find_module_by_addr(pc))
++                where = fmt::format("{}+0x{:X}", module->module_name, pc - module->segments[0].vaddr.address());
++            std::string code;
++            if (guest && guest->cpu) {
++                uint32_t at = pc;
++                for (int i = 0; i < 10; i++) {
++                    uint16_t size = 0;
++                    const std::string insn = disassemble(*guest->cpu, at, thumb, &size);
++                    if (size == 0)
++                        break;
++                    code += (i ? "; " : "") + insn;
++                    at += size;
++                    if (insn.starts_with("b") || insn.starts_with("pop") || insn.find("pc") != std::string::npos)
++                        break;
++                }
++            }
++            LOG_INFO("profile:   {:4.1f}% {}{} {}", 100.0 * count / thread.total, where, thumb ? " (thumb)" : "", code);
++        }
++    }
++}
++
 +namespace {
 +
 +// Every 10 s in the log while a game runs: its frame rate, the emulated vblanks (60 a second when
@@ -6399,6 +6444,7 @@ index 00000000..ef37d762
 +                wait_logs++;
 +                ps4_log_waits(emuenv.kernel);
 +            }
++            log_profile(emuenv);
 +        } else {
 +            ps4perf::report(0, 0);
 +        }
@@ -7121,10 +7167,10 @@ index 00000000..ff30f0d3
 +} // namespace ps4pad
 diff --git a/vita3k/ps4/ps4_perf.cpp b/vita3k/ps4/ps4_perf.cpp
 new file mode 100644
-index 00000000..dc091b99
+index 00000000..454e5bd2
 --- /dev/null
 +++ b/vita3k/ps4/ps4_perf.cpp
-@@ -0,0 +1,341 @@
+@@ -0,0 +1,422 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -7163,6 +7209,9 @@ index 00000000..dc091b99
 +#include <cstring>
 +#include <random>
 +#include <string>
++#include <mutex>
++#include <thread>
++#include <unordered_map>
 +#include <vector>
 +
 +#include <sys/types.h>
@@ -7195,6 +7244,12 @@ index 00000000..dc091b99
 +    std::atomic<void *> cpu{ nullptr };
 +    void (*halt)(void *) = nullptr;
 +    std::atomic<bool> halted_for_pc{ false };
++    // the profiler: a sample asked for (the thread stopped), and the samples by pc
++    int id = 0;
++    std::atomic<bool> sample_requested{ false };
++    std::mutex samples_mutex;
++    std::unordered_map<uint32_t, uint32_t> samples;
++    uint64_t sample_count = 0;
 +};
 +
 +GuestThread g_threads[kMaxThreads];
@@ -7208,7 +7263,13 @@ index 00000000..dc091b99
 +
 +} // namespace
 +
++namespace {
++void sampler_loop();
++} // namespace
++
 +extern "C" void ps4_perf_guest_thread(const char *name) {
++    static std::once_flag sampler;
++    std::call_once(sampler, [] { std::thread(sampler_loop).detach(); });
 +    const int index = g_count.fetch_add(1);
 +    if (index >= kMaxThreads) {
 +        t_thread = nullptr;
@@ -7237,13 +7298,52 @@ index 00000000..dc091b99
 +    thread->code_start.store(__builtin_ia32_rdtsc(), std::memory_order_release);
 +}
 +
-+extern "C" bool ps4_perf_code_end() {
++extern "C" bool ps4_profiler(); // vita3k/ps4/ps4_settings.cpp
++
++extern "C" int ps4_perf_code_end() {
 +    GuestThread *const thread = t_thread;
 +    if (!thread)
-+        return false;
++        return 0;
 +    thread->code_start.store(0, std::memory_order_release);
-+    return thread->halted_for_pc.exchange(false);
++    return (thread->halted_for_pc.exchange(false) ? 1 : 0) | (thread->sample_requested.exchange(false) ? 2 : 0);
 +}
++
++extern "C" void ps4_perf_thread_id(int id) {
++    if (t_thread)
++        t_thread->id = id;
++}
++
++extern "C" void ps4_perf_sample(uint32_t pc) {
++    GuestThread *const thread = t_thread;
++    if (!thread)
++        return;
++    const std::lock_guard<std::mutex> lock(thread->samples_mutex);
++    thread->samples[pc]++;
++    thread->sample_count++;
++}
++
++namespace {
++
++// Stops each thread that runs guest code 500 times a second, which then takes a sample of where
++// it is (kernel/src/thread.cpp) and goes on: about a microsecond each
++void sampler_loop() {
++    while (true) {
++        std::this_thread::sleep_for(std::chrono::milliseconds(2));
++        if (!ps4_profiler())
++            continue;
++        const int count = std::min(g_count.load(), kMaxThreads);
++        for (int i = 0; i < count; i++) {
++            GuestThread &thread = g_threads[i];
++            if (!thread.ready.load(std::memory_order_acquire) || !thread.halt)
++                continue;
++            if (thread.code_start.load(std::memory_order_acquire) == 0 || thread.sample_requested.exchange(true))
++                continue;
++            thread.halt(thread.cpu.load(std::memory_order_relaxed));
++        }
++    }
++}
++
++} // namespace
 +
 +extern "C" void ps4_perf_import_begin(uint32_t nid, uint32_t arg0) {
 +    GuestThread *const thread = t_thread;
@@ -7385,6 +7485,33 @@ index 00000000..dc091b99
 +    return longest;
 +}
 +
++std::vector<ProfileThread> take_profile(size_t top) {
++    std::vector<ProfileThread> profile;
++    const int count = std::min(g_count.load(), kMaxThreads);
++    for (int i = 0; i < count; i++) {
++        GuestThread &thread = g_threads[i];
++        if (!thread.ready.load(std::memory_order_acquire))
++            continue;
++        ProfileThread entry;
++        {
++            const std::lock_guard<std::mutex> lock(thread.samples_mutex);
++            if (thread.sample_count == 0)
++                continue;
++            entry.total = thread.sample_count;
++            entry.hottest.assign(thread.samples.begin(), thread.samples.end());
++            thread.samples.clear();
++            thread.sample_count = 0;
++        }
++        entry.name = thread.name;
++        entry.id = thread.id;
++        std::sort(entry.hottest.begin(), entry.hottest.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
++        if (entry.hottest.size() > top)
++            entry.hottest.resize(top);
++        profile.push_back(std::move(entry));
++    }
++    return profile;
++}
++
 +// --- Large pages ---------------------------------------------------------------------------
 +
 +extern "C" {
@@ -7468,10 +7595,10 @@ index 00000000..dc091b99
 +} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_perf.h b/vita3k/ps4/ps4_perf.h
 new file mode 100644
-index 00000000..273e4e27
+index 00000000..4291971e
 --- /dev/null
 +++ b/vita3k/ps4/ps4_perf.h
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,63 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -7492,6 +7619,9 @@ index 00000000..273e4e27
 +#pragma once
 +
 +#include <cstdint>
++#include <string>
++#include <utility>
++#include <vector>
 +
 +// Called by the emulator's libraries (declared there by hand): a guest thread starts (its name in
 +// the report), a run of guest code ended, an import returned (its NID). Ticks are the TSC's.
@@ -7503,7 +7633,12 @@ index 00000000..273e4e27
 +// A run of guest code starts (the CPU, and how to stop it from another thread), and ends: whether
 +// the report stopped it to see where it spins
 +extern "C" void ps4_perf_code_begin(void *cpu, void (*halt)(void *));
-+extern "C" bool ps4_perf_code_end();
++// (bit 0: stopped to log a spin, bit 1: stopped for a profile sample)
++extern "C" int ps4_perf_code_end();
++// The guest thread's UID (the profile log finds its CPU by it), and a profile sample: where its
++// guest code was when the profiler stopped it (the Thumb bit in bit 0)
++extern "C" void ps4_perf_thread_id(int id);
++extern "C" void ps4_perf_sample(uint32_t pc);
 +
 +namespace ps4perf {
 +
@@ -7512,6 +7647,16 @@ index 00000000..273e4e27
 +// Returns how long the longest stuck thread has been in its call (s)
 +double report(double seconds, double ticks_per_ms);
 +
++// The profile since the last call, per thread with samples: where its guest code was, sampled
++// 500 times a second while it ran (ps4_main.cpp logs the hottest places with their code)
++struct ProfileThread {
++    std::string name;
++    int id = 0;
++    uint64_t total = 0;
++    std::vector<std::pair<uint32_t, uint32_t>> hottest; // pc (Thumb bit 0), samples
++};
++std::vector<ProfileThread> take_profile(size_t top);
++
 +// Logs how fast random reads are through a 2 MiB aligned mapping and a misaligned one of the same
 +// direct memory: whether the PS4 gives the guest memory large pages
 +void benchmark_large_pages();
@@ -7519,10 +7664,10 @@ index 00000000..273e4e27
 +} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_settings.cpp b/vita3k/ps4/ps4_settings.cpp
 new file mode 100644
-index 00000000..12c0c2b9
+index 00000000..a3a9e9ab
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.cpp
-@@ -0,0 +1,592 @@
+@@ -0,0 +1,602 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -7923,6 +8068,9 @@ index 00000000..12c0c2b9
 +        items.push_back(pref_choice("Threads on one Vita core", { "Side by side", "One at a time (as on the Vita)" },
 +            [](const Prefs &p) { return p.vita_cores ? 1 : 0; },
 +            [](Prefs &p, int value) { p.vita_cores = value == 1; }, {}));
++        items.push_back(pref_choice("Profiler (hot game code in the log)", { "Off", "On" },
++            [](const Prefs &p) { return p.profiler ? 1 : 0; },
++            [](Prefs &p, int value) { p.profiler = value == 1; }, {}));
 +    }
 +    return items;
 +}
@@ -7955,6 +8103,8 @@ index 00000000..12c0c2b9
 +            g_prefs.frame_overlap = value != "vita3k";
 +        else if (key == "vita-cores")
 +            g_prefs.vita_cores = value != "parallel";
++        else if (key == "profiler")
++            g_prefs.profiler = value == "on";
 +        else if (key == "theme")
 +            g_prefs.theme = std::clamp(std::atoi(value.c_str()), 0, static_cast<int>(theme_names().size()) - 1);
 +        else if (key == "moving-wallpaper")
@@ -7977,6 +8127,7 @@ index 00000000..12c0c2b9
 +    std::fprintf(f, "game-threads = %s\n", g_prefs.cluster_threads ? "cluster" : "all");
 +    std::fprintf(f, "frame-queue = %s\n", g_prefs.frame_overlap ? "vita" : "vita3k");
 +    std::fprintf(f, "vita-cores = %s\n", g_prefs.vita_cores ? "vita" : "parallel");
++    std::fprintf(f, "profiler = %s\n", g_prefs.profiler ? "on" : "off");
 +    std::fprintf(f, "theme = %d\n", g_prefs.theme);
 +    std::fprintf(f, "moving-wallpaper = %s\n", g_prefs.moving_wallpaper ? "on" : "off");
 +    std::fprintf(f, "wallpaper = %s\n", g_prefs.wallpaper.empty() ? "wave" : g_prefs.wallpaper.c_str());
@@ -7990,6 +8141,10 @@ index 00000000..12c0c2b9
 +} // namespace ps4settings
 +
 +// SceGxm (sceGxmDisplayQueueAddEntry) asks
++extern "C" bool ps4_profiler() {
++    return ps4settings::prefs().profiler;
++}
++
 +extern "C" bool ps4_vita_cores() {
 +    return ps4settings::prefs().vita_cores;
 +}
@@ -8117,10 +8272,10 @@ index 00000000..12c0c2b9
 +} // namespace ps4settings
 diff --git a/vita3k/ps4/ps4_settings.h b/vita3k/ps4/ps4_settings.h
 new file mode 100644
-index 00000000..11adb308
+index 00000000..bd2a6377
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.h
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,85 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -8172,6 +8327,8 @@ index 00000000..11adb308
 +    // the threads a game pins to one Vita core run one at a time, switching when one blocks, as on
 +    // the Vita (some games deadlock when they run side by side), or all side by side
 +    bool vita_cores = true;
++    // samples where the game's threads run, and logs the hottest code every 10 s
++    bool profiler = true;
 +    // the home screen's look: a theme (its colours, theme_names()), its wave moving, and the
 +    // wallpaper: the theme's wave, or a picture's file name in wallpaper_dir()
 +    int theme = 0;
