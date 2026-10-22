@@ -4,7 +4,7 @@
 in WSL Ubuntu with the M33 / Resonance / DolphinPS4 / Crema PS4 toolchain (clang 21 + libc++ 21 on
 OpenOrbis).
 
-Status: **v00.20**. On the console the launcher works (text, firmware download, installing a VPK),
+Status: **v00.21**. On the console the launcher works (text, firmware download, installing a VPK),
 PKGj runs (renderer on RADV, audio, dynarmic, the network), and Mortal Kombat (PCSE00023) plays:
 v00.12 fixed the GPU hang at the start of a fight by turning Vita3K's memory mapping off (see
 "Graphics" below). Its fights ran at 30 fps where the game wants 60 (slow motion); v00.13 (fast
@@ -33,7 +33,7 @@ game and render threads about half busy): Vita3K made sceGxmDisplayQueueAddEntry
 display queue of 1, wait until that very frame was on screen, so building a frame, the renderer and
 the vblank ran one after another, and a frame a little over 16.7 ms took 33. v00.18 waits only for
 the frame before, as the Vita does (HENkaku > CPU, or Speed in game: Frame queue), and the perf line
-adds how long frames wait for the renderer. v00.20 logs which call a stuck game thread waits in (and where one spins). v00.19 adds HENkaku > Look (themes, a moving wave,
+adds how long frames wait for the renderer. v00.20 logs which call a stuck game thread waits in (and where one spins); v00.21 adds who holds the locks they wait for. v00.19 adds HENkaku > Look (themes, a moving wave,
 pictures from `/data/Vita3K/wallpapers` as the wallpaper) and an About page.
 
 HENkaku for the PS4 is made by **iHaiDeeZ / ShiroKlein** ([github.com/iHaiDeeZ](https://github.com/iHaiDeeZ)).

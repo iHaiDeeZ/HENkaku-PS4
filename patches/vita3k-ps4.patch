@@ -673,11 +673,45 @@ index 6e673d1c..f84a9a8a 100644
  }
  
  static void reset_swapchain_cycle(DisplayState &display, Address sync_object) {
+diff --git a/vita3k/kernel/include/kernel/sync_primitives.h b/vita3k/kernel/include/kernel/sync_primitives.h
+index 80c44ba4..7812715a 100644
+--- a/vita3k/kernel/include/kernel/sync_primitives.h
++++ b/vita3k/kernel/include/kernel/sync_primitives.h
+@@ -173,6 +173,8 @@ public:
+     SceInt32 cancel(const ThreadStatePtr &thread, SceInt32 new_count, SceUInt32 *num_wait_threads);
+     // Gives the mutex to its next waiter if thread, which is ending, owns it.
+     void release_ended_owner(const ThreadState &thread);
++    // Who holds it (0: nobody), how many times, and how many threads wait for it (a freeze's log)
++    void holder(SceUID &owner, SceInt32 &count, size_t &waiting) const;
+ 
+ protected:
+     struct WaitEntry {
+diff --git a/vita3k/kernel/include/kernel/thread/thread_state.h b/vita3k/kernel/include/kernel/thread/thread_state.h
+index 4c4694be..af094577 100644
+--- a/vita3k/kernel/include/kernel/thread/thread_state.h
++++ b/vita3k/kernel/include/kernel/thread/thread_state.h
+@@ -110,6 +110,8 @@ struct ThreadState {
+ 
+     // Status and info
+     ThreadStatus get_status() const;
++    // What it waits on now (type 0: nothing)
++    WaitTarget get_wait_target() const;
+     // Whether the thread is deleted, so guest calls can't find it
+     bool is_deleted();
+     // The status a thread that ended exited with, or NOT_DORMANT or DORMANT if it hasn't ended
 diff --git a/vita3k/kernel/src/kernel.cpp b/vita3k/kernel/src/kernel.cpp
-index 97794b3d..2ee78719 100644
+index 97794b3d..7e3caf90 100644
 --- a/vita3k/kernel/src/kernel.cpp
 +++ b/vita3k/kernel/src/kernel.cpp
-@@ -33,6 +33,12 @@
+@@ -23,6 +23,7 @@
+ #include <kernel/state.h>
+ #include <mem/functions.h>
+ 
++#include <kernel/sync_primitives.h>
+ #include <kernel/thread/thread_state.h>
+ 
+ #include <cpu/functions.h>
+@@ -33,6 +34,12 @@
  #include <SDL3/SDL_mutex.h>
  #include <SDL3/SDL_thread.h>
  
@@ -690,7 +724,7 @@ index 97794b3d..2ee78719 100644
  int CorenumAllocator::new_corenum() {
      const std::lock_guard<std::mutex> guard(lock);
  
-@@ -63,6 +69,12 @@ static int SDLCALL thread_function(void *data) {
+@@ -63,6 +70,12 @@ static int SDLCALL thread_function(void *data) {
      ThreadParams params = *static_cast<const ThreadParams *>(data);
      SDL_SignalSemaphore(params.host_may_destroy_params);
      ThreadStatePtr thread = std::move(params.thread);
@@ -703,8 +737,85 @@ index 97794b3d..2ee78719 100644
  #ifdef TRACY_ENABLE
      if (!thread->name.empty()) {
          tracy::SetThreadName(thread->name.c_str());
+@@ -326,3 +339,58 @@ SceKernelModuleInfo *KernelState::find_module_by_addr(Address address) {
+     }
+     return nullptr;
+ }
++
++#ifdef __PS4__
++// PS4: every guest thread, what it waits on, and who holds the mutexes it waits for: the log of a
++// freeze (vita3k/ps4/ps4_main.cpp calls it when a thread stays in a call)
++void ps4_log_waits(KernelState &kernel) {
++    std::vector<ThreadStatePtr> threads;
++    {
++        const std::lock_guard<std::mutex> guard(kernel.mutex);
++        for (const auto &[id, thread] : kernel.threads)
++            threads.push_back(thread);
++    }
++    const auto thread_name = [&](SceUID id) -> std::string {
++        for (const auto &thread : threads)
++            if (thread->id == id)
++                return fmt::format("{} ({})", thread->name, id);
++        return fmt::format("ended thread {}", id);
++    };
++    const auto mutex_text = [&](const Mutex &mutex) {
++        SceUID owner = 0;
++        SceInt32 count = 0;
++        size_t waiting = 0;
++        mutex.holder(owner, count, waiting);
++        return fmt::format("mutex {} \"{}\", held by {} ({}x), {} waiting", mutex.uid, mutex.name, owner ? thread_name(owner) : std::string("nobody"), count, waiting);
++    };
++    LOG_INFO("waits: {} guest threads", threads.size());
++    for (const auto &thread : threads) {
++        const WaitTarget target = thread->get_wait_target();
++        const ThreadStatus status = thread->get_status();
++        if (target.type == 0) {
++            LOG_INFO("waits: {} ({}): status {}, not waiting", thread->name, thread->id, static_cast<SceUInt32>(status));
++            continue;
++        }
++        std::string what = fmt::format("object {}", target.id);
++        if (const auto object = kernel.objects.find(target.id)) {
++            switch (object->get_uid_class()) {
++            case UidClass::mutex:
++            case UidClass::lw_mutex:
++                what = mutex_text(static_cast<const Mutex &>(*object));
++                break;
++            case UidClass::cond:
++            case UidClass::lw_cond: {
++                const auto &cond = static_cast<const Condvar &>(*object);
++                what = fmt::format("cond {} \"{}\" ({} waiting), its {}", cond.uid, cond.name, cond.num_waiters(), mutex_text(*cond.associated_mutex));
++                break;
++            }
++            default:
++                what = fmt::format("object {} of class {} \"{}\"", target.id, static_cast<SceUInt32>(object->get_uid_class()),
++                    object->get_uid_class() == UidClass::thread ? std::string() : static_cast<const SyncPrimitive &>(*object).name);
++                break;
++            }
++        }
++        LOG_INFO("waits: {} ({}): wait type {}, on {}", thread->name, thread->id, log_hex(target.type), what);
++    }
++}
++#endif
+diff --git a/vita3k/kernel/src/sync_primitives.cpp b/vita3k/kernel/src/sync_primitives.cpp
+index 78029915..1e21caeb 100644
+--- a/vita3k/kernel/src/sync_primitives.cpp
++++ b/vita3k/kernel/src/sync_primitives.cpp
+@@ -586,6 +586,13 @@ void Mutex::release_ended_owner(const ThreadState &thread) {
+     hand_over();
+ }
+ 
++void Mutex::holder(SceUID &owner_out, SceInt32 &count_out, size_t &waiting_out) const {
++    const auto guard = lock();
++    owner_out = owner;
++    count_out = lock_count;
++    waiting_out = guard ? waiters.size() : 0;
++}
++
+ void Mutex::hand_over() {
+     owner = 0;
+     if (auto *waiter = waiters.front()) {
 diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
-index c01e4699..8b22a962 100644
+index c01e4699..cdd59fa5 100644
 --- a/vita3k/kernel/src/thread.cpp
 +++ b/vita3k/kernel/src/thread.cpp
 @@ -32,6 +32,16 @@
@@ -760,6 +871,18 @@ index c01e4699..8b22a962 100644
                  clear_exclusive(*cpu);
              }
  
+@@ -501,6 +533,11 @@ bool ThreadState::is_deleted() {
+     return status == ThreadStatus::deleted;
+ }
+ 
++WaitTarget ThreadState::get_wait_target() const {
++    const std::lock_guard<std::mutex> guard(mutex);
++    return wait_target;
++}
++
+ ThreadStatus ThreadState::get_status() const {
+     const std::lock_guard<std::mutex> lock(mutex);
+     return status;
 diff --git a/vita3k/mem/CMakeLists.txt b/vita3k/mem/CMakeLists.txt
 index 2e2bd287..659ab47a 100644
 --- a/vita3k/mem/CMakeLists.txt
@@ -5922,10 +6045,10 @@ index 00000000..0210098f
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..abb6e465
+index 00000000..ef37d762
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
-@@ -0,0 +1,491 @@
+@@ -0,0 +1,499 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -6006,6 +6129,9 @@ index 00000000..abb6e465
 +extern "C" void ps4_thread_busy_report(char *out, size_t size, int min_percent);
 +extern "C" long long ps4_wait_total(int slot);
 +
++// kernel/src/kernel.cpp: every guest thread's wait, and who holds what it waits for
++void ps4_log_waits(KernelState &kernel);
++
 +namespace {
 +
 +// Every 10 s in the log while a game runs: its frame rate, the emulated vblanks (60 a second when
@@ -6032,7 +6158,12 @@ index 00000000..abb6e465
 +        if (started) {
 +            LOG_INFO("perf: {} fps, {:.0f} vblanks/s; render thread: waits for the game {} ms/s, shows frames {} ms/s, waits for the GPU {} ms/s; frames wait for the renderer {} ms/s; the game waits for vblanks {} ms/s; busy: {}",
 +                emuenv.fps, (vblank_count - vblanks) / seconds, ms[1], ms[2], ms[3], ms[4], ms[0], busy);
-+            ps4perf::report(seconds, (tsc - last_tsc) / (seconds * 1000.0));
++            // a thread in one call for 15 s: the waits behind it, a few times
++            static int wait_logs = 0;
++            if (ps4perf::report(seconds, (tsc - last_tsc) / (seconds * 1000.0)) >= 15.0 && wait_logs < 3) {
++                wait_logs++;
++                ps4_log_waits(emuenv.kernel);
++            }
 +        } else {
 +            ps4perf::report(0, 0);
 +        }
@@ -6755,10 +6886,10 @@ index 00000000..ff30f0d3
 +} // namespace ps4pad
 diff --git a/vita3k/ps4/ps4_perf.cpp b/vita3k/ps4/ps4_perf.cpp
 new file mode 100644
-index 00000000..c2cd8754
+index 00000000..dc091b99
 --- /dev/null
 +++ b/vita3k/ps4/ps4_perf.cpp
-@@ -0,0 +1,338 @@
+@@ -0,0 +1,341 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -6933,7 +7064,8 @@ index 00000000..c2cd8754
 +
 +} // namespace
 +
-+void report(double seconds, double ticks_per_ms) {
++double report(double seconds, double ticks_per_ms) {
++    double longest = 0;
 +    // the first call only takes the counters as they are
 +    const bool log = seconds > 0 && ticks_per_ms > 0;
 +    if (!log)
@@ -6993,6 +7125,7 @@ index 00000000..c2cd8754
 +                // (a thread that ended inside its exit call stays there)
 +                if (in_s < 2.0 || std::strstr(name, "Exit"))
 +                    continue;
++                longest = std::max(longest, in_s);
 +                char part[128];
 +                snprintf(part, sizeof(part), "%s%s(0x%x) for %.0f s", stuck.empty() ? "" : ", then ", name,
 +                    thread.current_arg[d].load(std::memory_order_relaxed), in_s);
@@ -7014,6 +7147,7 @@ index 00000000..c2cd8754
 +        }
 +        LOG_INFO("perf: {}: guest code {:.0f} ms/s, imports {:.0f} ms/s ({:.0f} calls/s): {}", thread.name, code_ms, imports_ms, import_calls, line);
 +    }
++    return longest;
 +}
 +
 +// --- Large pages ---------------------------------------------------------------------------
@@ -7099,10 +7233,10 @@ index 00000000..c2cd8754
 +} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_perf.h b/vita3k/ps4/ps4_perf.h
 new file mode 100644
-index 00000000..8835bb87
+index 00000000..273e4e27
 --- /dev/null
 +++ b/vita3k/ps4/ps4_perf.h
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,45 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -7140,7 +7274,8 @@ index 00000000..8835bb87
 +
 +// One log line per guest thread busy in the last `seconds`: its time in guest code and in its
 +// biggest imports (ms a second, calls a second)
-+void report(double seconds, double ticks_per_ms);
++// Returns how long the longest stuck thread has been in its call (s)
++double report(double seconds, double ticks_per_ms);
 +
 +// Logs how fast random reads are through a 2 MiB aligned mapping and a misaligned one of the same
 +// direct memory: whether the PS4 gives the guest memory large pages
