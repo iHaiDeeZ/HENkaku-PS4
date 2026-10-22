@@ -1162,7 +1162,7 @@ index 5ce4c807..59ac584a 100644
      if (emuenv.display.abort.load())
          return SCE_DISPLAY_ERROR_NO_PIXEL_DATA;
 diff --git a/vita3k/modules/SceGxm/SceGxm.cpp b/vita3k/modules/SceGxm/SceGxm.cpp
-index 4c864368..a1c051e8 100644
+index 4c864368..3c301676 100644
 --- a/vita3k/modules/SceGxm/SceGxm.cpp
 +++ b/vita3k/modules/SceGxm/SceGxm.cpp
 @@ -48,6 +48,11 @@
@@ -1177,9 +1177,15 @@ index 4c864368..a1c051e8 100644
  template <>
  std::string to_debug_str<SceGxmColorFormat>(const MemState &mem, SceGxmColorFormat type) {
      switch (type) {
-@@ -893,6 +898,11 @@ std::string to_debug_str<SceGxmTransferFlags>(const MemState &mem, SceGxmTransfe
+@@ -892,7 +897,17 @@ std::string to_debug_str<SceGxmTransferFlags>(const MemState &mem, SceGxmTransfe
+     return std::to_string(type);
  }
  
++#ifdef __PS4__
++extern "C" bool ps4_frame_overlap(); // vita3k/ps4/ps4_settings.cpp
++extern "C" void ps4_wait_add(int slot, long long ns); // port/ps4_sampler.cpp
++#endif
++
  static void display_entry_thread(EmuEnvState &emuenv) {
 +#ifdef __PS4__
 +    // runs the game's display callbacks (its vblank waits) on the guest thread SceGxmDisplayQueue
@@ -1189,7 +1195,43 @@ index 4c864368..a1c051e8 100644
      auto &display_queue = emuenv.gxm.display_queue;
      const Address callback_address = emuenv.gxm.params.displayQueueCallback.address();
      const ThreadStatePtr display_thread = emuenv.kernel.get_thread(emuenv.gxm.display_queue_thread);
-@@ -2296,6 +2306,16 @@ EXPORT(int, sceGxmDisplayQueueFinish) {
+@@ -909,6 +924,10 @@ static void display_entry_thread(EmuEnvState &emuenv) {
+         SceGxmSyncObject *old_sync = display_callback->old_sync.get(emuenv.mem);
+         SceGxmSyncObject *new_sync = display_callback->new_sync.get(emuenv.mem);
+ 
++#ifdef __PS4__
++        // (the perf line: how long frames wait for the renderer before they can be shown)
++        const auto wait_start = std::chrono::steady_clock::now();
++#endif
+         // sceGxmDisplayQueueAddEntry waits for both buffers to complete
+         if (renderer::wishlist(old_sync, display_callback->old_sync_timestamp) == renderer::SyncWaitResult::Shutdown) {
+             return;
+@@ -918,6 +937,9 @@ static void display_entry_thread(EmuEnvState &emuenv) {
+                 return;
+             }
+         }
++#ifdef __PS4__
++        ps4_wait_add(4, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_start).count());
++#endif
+ 
+         // check if we're shutting down before calling run_guest_function to avoid deadlock
+         if (emuenv.display.abort.load()) {
+@@ -2282,7 +2304,13 @@ EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<Sce
+ 
+     renderer::send_single_command(*emuenv.renderer, nullptr, renderer::CommandOpcode::NewFrame, false, frame, &emuenv.display, active_renderer_context);
+ 
+-    if (emuenv.gxm.params.displayQueueMaxPendingCount == 1)
++    if (emuenv.gxm.params.displayQueueMaxPendingCount == 1
++#ifdef __PS4__
++        // as on the Vita: the push above waited for the frame before; this one is shown while the
++        // game builds the next (its buffers stay apart on the host, which draws in order)
++        && !ps4_frame_overlap()
++#endif
++    )
+         // double buffering, not handled by the queue configuration
+         emuenv.gxm.display_queue.wait_empty();
+ 
+@@ -2296,6 +2324,16 @@ EXPORT(int, sceGxmDisplayQueueFinish) {
      return 0;
  }
  
@@ -1206,7 +1248,7 @@ index 4c864368..a1c051e8 100644
  static void gxmSetUniformBuffers(renderer::State &state, GxmState &gxm, SceGxmContext *context, const SceGxmProgram &program, std::span<UniformBuffer> buffers, const UniformBufferSizes &sizes, const MemState &mem) {
      for (size_t i = 0; i < buffers.size(); i++) {
          if (!buffers[i] || sizes.at(i) == 0) {
-@@ -2391,10 +2411,10 @@ static int gxmDrawElementGeneral(EmuEnvState &emuenv, const char *export_name, c
+@@ -2391,10 +2429,10 @@ static int gxmDrawElementGeneral(EmuEnvState &emuenv, const char *export_name, c
          // we don't need to get the vertex buffer size with memory mapping
          if (indexType == SCE_GXM_INDEX_FORMAT_U16) {
              const uint16_t *const data = static_cast<const uint16_t *>(indices_ptr);
@@ -1219,7 +1261,7 @@ index 4c864368..a1c051e8 100644
          }
      }
  
-@@ -2513,10 +2533,10 @@ EXPORT(int, sceGxmDrawPrecomputed, SceGxmContext *context, SceGxmPrecomputedDraw
+@@ -2513,10 +2551,10 @@ EXPORT(int, sceGxmDrawPrecomputed, SceGxmContext *context, SceGxmPrecomputedDraw
          // we don't need to get the vertex buffer size with memory mapping
          if (draw->index_format == SCE_GXM_INDEX_FORMAT_U16) {
              const uint16_t *const data = draw->index_data.cast<const uint16_t>().get(emuenv.mem);
@@ -1232,7 +1274,7 @@ index 4c864368..a1c051e8 100644
          }
      }
  
-@@ -2884,6 +2904,8 @@ EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params) {
+@@ -2884,6 +2922,8 @@ EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params) {
      // the case where displayQueueMaxPendingCount is 1 handled in sceGxmDisplayQueueAddEntry
      const uint32_t max_queue_size = std::max(std::min(params->displayQueueMaxPendingCount, 3U) - 1, 1U);
      emuenv.gxm.display_queue.maxPendingCount_ = max_queue_size;
@@ -5718,7 +5760,7 @@ index 00000000..0210098f
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..5e0cf826
+index 00000000..abb6e465
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
 @@ -0,0 +1,491 @@
@@ -5817,8 +5859,8 @@ index 00000000..5e0cf826
 +        char busy[768];
 +        ps4_thread_busy_report(busy, sizeof(busy), 3);
 +        const double seconds = std::chrono::duration<double>(now - last).count();
-+        long long ms[4];
-+        for (int i = 0; i < 4; i++) {
++        long long ms[5];
++        for (int i = 0; i < 5; i++) {
 +            const long long total = ps4_wait_total(i);
 +            ms[i] = static_cast<long long>((total - waits[i]) / 1e6 / seconds);
 +            waits[i] = total;
@@ -5826,8 +5868,8 @@ index 00000000..5e0cf826
 +        const uint64_t vblank_count = emuenv.display.vblank_count.load();
 +        const uint64_t tsc = __builtin_ia32_rdtsc();
 +        if (started) {
-+            LOG_INFO("perf: {} fps, {:.0f} vblanks/s; render thread: waits for the game {} ms/s, shows frames {} ms/s, waits for the GPU {} ms/s; the game waits for vblanks {} ms/s; busy: {}",
-+                emuenv.fps, (vblank_count - vblanks) / seconds, ms[1], ms[2], ms[3], ms[0], busy);
++            LOG_INFO("perf: {} fps, {:.0f} vblanks/s; render thread: waits for the game {} ms/s, shows frames {} ms/s, waits for the GPU {} ms/s; frames wait for the renderer {} ms/s; the game waits for vblanks {} ms/s; busy: {}",
++                emuenv.fps, (vblank_count - vblanks) / seconds, ms[1], ms[2], ms[3], ms[4], ms[0], busy);
 +            ps4perf::report(seconds, (tsc - last_tsc) / (seconds * 1000.0));
 +        } else {
 +            ps4perf::report(0, 0);
@@ -5844,7 +5886,7 @@ index 00000000..5e0cf826
 +    std::chrono::steady_clock::time_point last{}, next{};
 +    uint64_t vblanks = 0;
 +    uint64_t last_tsc = 0;
-+    long long waits[4] = {};
++    long long waits[5] = {};
 +};
 +
 +// vita3k.prev.log to vita3k.game.log when it's a game's run (it has "Game started:")
@@ -6865,10 +6907,10 @@ index 00000000..16d557c9
 +} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_settings.cpp b/vita3k/ps4/ps4_settings.cpp
 new file mode 100644
-index 00000000..70a46844
+index 00000000..53caec32
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.cpp
-@@ -0,0 +1,475 @@
+@@ -0,0 +1,495 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -7205,6 +7247,12 @@ index 00000000..70a46844
 +    return items;
 +}
 +
++Item frame_queue_choice() {
++    return pref_choice("Frame queue", { "Vita3K's (waits for each frame)", "As on the Vita (smoother)" },
++        [](const Prefs &p) { return p.frame_overlap ? 1 : 0; },
++        [](Prefs &p, int value) { p.frame_overlap = value == 1; }, {});
++}
++
 +std::vector<Item> cpu_items(const std::shared_ptr<Scope> &scope, bool global, const std::string &next_start) {
 +    std::vector<Item> items;
 +    items.push_back(choice<bool>(scope, "CPU optimisations", { "On (fast)", "Off (accurate, slow)" }, { true, false }, &Config::CurrentConfig::cpu_opt, next_start));
@@ -7212,6 +7260,7 @@ index 00000000..70a46844
 +        items.push_back(pref_choice("Game threads", { "On all cores", "On one cluster" },
 +            [](const Prefs &p) { return p.cluster_threads ? 1 : 0; },
 +            [](Prefs &p, int value) { p.cluster_threads = value == 1; }, next_start));
++        items.push_back(frame_queue_choice());
 +    }
 +    return items;
 +}
@@ -7240,6 +7289,8 @@ index 00000000..70a46844
 +            g_prefs.fsr_sharpness = std::clamp(std::atoi(value.c_str()), 0, static_cast<int>(std::size(SHARPENING_STOPS)) - 1);
 +        else if (key == "game-threads")
 +            g_prefs.cluster_threads = value == "cluster";
++        else if (key == "frame-queue")
++            g_prefs.frame_overlap = value != "vita3k";
 +    }
 +    std::fclose(f);
 +}
@@ -7254,12 +7305,22 @@ index 00000000..70a46844
 +    std::fprintf(f, "home = %s\n", g_prefs.bubbles ? "bubbles" : "list");
 +    std::fprintf(f, "fsr-sharpness = %d\n", g_prefs.fsr_sharpness);
 +    std::fprintf(f, "game-threads = %s\n", g_prefs.cluster_threads ? "cluster" : "all");
++    std::fprintf(f, "frame-queue = %s\n", g_prefs.frame_overlap ? "vita" : "vita3k");
 +    std::fclose(f);
 +}
 +
 +float fsr_sharpening(int index) {
 +    return SHARPENING_STOPS[std::clamp(index, 0, static_cast<int>(std::size(SHARPENING_STOPS)) - 1)];
 +}
++
++} // namespace ps4settings
++
++// SceGxm (sceGxmDisplayQueueAddEntry) asks
++extern "C" bool ps4_frame_overlap() {
++    return ps4settings::prefs().frame_overlap;
++}
++
++namespace ps4settings {
 +
 +std::string icon_path() {
 +    return "/app0/icons/henkaku.png";
@@ -7332,6 +7393,7 @@ index 00000000..70a46844
 +    std::vector<Item> speed;
 +    speed.push_back(choice<bool>(live, "Shader compiling", { "In the background", "Before drawing" }, { true, false }, &Config::CurrentConfig::async_pipeline_compilation));
 +    speed.push_back(choice<bool>(live, "FPS hack (30 to 60)", { "Off", "On" }, { false, true }, &Config::CurrentConfig::fps_hack));
++    speed.push_back(frame_queue_choice());
 +
 +    items.push_back(section("Now"));
 +    items.push_back(page("Display", std::move(display), "FPS, filters, FSR 1"));
@@ -7346,10 +7408,10 @@ index 00000000..70a46844
 +} // namespace ps4settings
 diff --git a/vita3k/ps4/ps4_settings.h b/vita3k/ps4/ps4_settings.h
 new file mode 100644
-index 00000000..c8f9da44
+index 00000000..e58e6fe8
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.h
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,66 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -7395,6 +7457,9 @@ index 00000000..c8f9da44
 +    // the game's threads on the first four cores (one Jaguar cluster, sharing their L2 cache), or
 +    // on all six like everything else
 +    bool cluster_threads = false;
++    // a game that keeps one frame in its display queue (Mortal Kombat) may build the next one while
++    // that frame waits for its vblank, as on the Vita, where Vita3K waits until it is shown
++    bool frame_overlap = true;
 +};
 +Prefs &prefs();
 +void load_prefs();
