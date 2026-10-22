@@ -5076,7 +5076,7 @@ index 4eb1f4f0..bd26315a 100644
      // 8) Choose the ux0 destination (a cart image is always a full app)
 diff --git a/vita3k/ps4/ps4.cmake b/vita3k/ps4/ps4.cmake
 new file mode 100644
-index 00000000..fb8d5aaa
+index 00000000..c172de60
 --- /dev/null
 +++ b/vita3k/ps4/ps4.cmake
 @@ -0,0 +1,41 @@
@@ -5107,7 +5107,7 @@ index 00000000..fb8d5aaa
 +
 +# archive.h and the other headers next to main.cpp
 +target_include_directories(vita3k PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-+target_link_libraries(vita3k PRIVATE camera emuenv mem overlay pugixml::pugixml stb vulkan SDL3::SDL3)
++target_link_libraries(vita3k PRIVATE camera emuenv mem np overlay pugixml::pugixml stb vulkan SDL3::SDL3)
 +# the launcher's firmware download (ps4_download.cpp)
 +target_link_libraries(vita3k PRIVATE libcurl)
 +
@@ -6610,10 +6610,10 @@ index 00000000..01fdf0f1
 +} // namespace ps4download
 diff --git a/vita3k/ps4/ps4_launcher.cpp b/vita3k/ps4/ps4_launcher.cpp
 new file mode 100644
-index 00000000..2d91803f
+index 00000000..27a666cd
 --- /dev/null
 +++ b/vita3k/ps4/ps4_launcher.cpp
-@@ -0,0 +1,2956 @@
+@@ -0,0 +1,3302 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -6656,7 +6656,9 @@ index 00000000..2d91803f
 +#include <app/functions.h>
 +#include <app/state.h>
 +#include <emuenv/state.h>
++#include <io/state.h>
 +#include <io/vfs.h>
++#include <np/trophy/collection.h>
 +#include <packages/functions.h>
 +#include <packages/license.h>
 +#include <packages/pkg.h>
@@ -6670,6 +6672,7 @@ index 00000000..2d91803f
 +#include <orbis/VideoOut.h>
 +
 +#include <algorithm>
++#include <array>
 +#include <atomic>
 +#include <cctype>
 +#include <chrono>
@@ -6931,8 +6934,20 @@ index 00000000..2d91803f
 +
 +// --- the apps ---
 +
++// The PS Vita firmware's own apps the home screen shows first, as on the Vita (with their LiveAreas,
++// from vs0:app): started, each opens HENkaku's screen for it
++enum class SystemApp : uint8_t {
++    None,
++    Settings, // HENkaku's settings
++    ContentManager, // the install browser
++    Trophies, // the Trophy Collection
++};
++
 +struct Item {
 +    app::AppEntry entry;
++    // a firmware app's (its folder in dir); a game's folder is ux0/app/<entry.path>
++    SystemApp system = SystemApp::None;
++    fs::path dir;
 +    bool icons_loaded = false;
 +    ps4ui::Image small;
 +    ps4ui::Image large;
@@ -6954,6 +6969,11 @@ index 00000000..2d91803f
 +    struct LiveAlign {
 +        int x = 0, y = 0;
 +        float margin_left = 0, margin_right = 0, margin_top = 0, margin_bottom = 0; // Vita pixels
++        // a picture placed by its centre's distance from the frame's (x and y, Vita pixels, y up)
++        bool offset = false;
++        float offset_x = 0, offset_y = 0;
++        // a text beside the frame's picture (origin "image"): 1 right of it, -1 left of it
++        int outside = 0;
 +    };
 +    struct LiveFrame {
 +        std::string id;
@@ -6965,14 +6985,41 @@ index 00000000..2d91803f
 +    std::vector<LiveFrame> live_frames;
 +};
 +
++struct FirmwareApp {
++    SystemApp app;
++    const char *title_id;
++    const char *title;
++};
++const FirmwareApp FIRMWARE_APPS[] = {
++    { SystemApp::Settings, "NPXS10015", "Settings" },
++    { SystemApp::ContentManager, "NPXS10026", "Content Manager" },
++    { SystemApp::Trophies, "NPXS10008", "Trophy Collection" },
++};
++
++// The firmware's apps (when the firmware is installed), then the games by name
 +std::vector<Item> load_items(EmuEnvState &emuenv) {
 +    std::vector<Item> items;
++    for (const FirmwareApp &app : FIRMWARE_APPS) {
++        const fs::path dir = emuenv.vita_fs_path / "vs0" / "app" / app.title_id;
++        boost::system::error_code ec;
++        if (!fs::exists(dir / "sce_sys" / "livearea" / "contents" / "template.xml", ec))
++            continue;
++        Item item;
++        item.entry.title = app.title;
++        item.entry.title_id = app.title_id;
++        item.entry.path = std::string("vs0:") + app.title_id;
++        item.entry.icon_path = fs_utils::path_to_utf8(dir / "sce_sys" / "icon0.png");
++        item.system = app.app;
++        item.dir = dir;
++        items.push_back(std::move(item));
++    }
++    const auto games = static_cast<std::ptrdiff_t>(items.size());
 +    for (auto &entry : app::get_apps(emuenv)) {
 +        Item item;
 +        item.entry = std::move(entry);
 +        items.push_back(std::move(item));
 +    }
-+    std::sort(items.begin(), items.end(), [](const Item &a, const Item &b) {
++    std::sort(items.begin() + games, items.end(), [](const Item &a, const Item &b) {
 +        return string_utils::tolower(a.entry.title) < string_utils::tolower(b.entry.title);
 +    });
 +    return items;
@@ -8495,9 +8542,22 @@ index 00000000..2d91803f
 +            const pugi::xml_node image = chosen.child("image");
 +            f.image_align.x = align_of(image.attribute("align").as_string("center"));
 +            f.image_align.y = align_of(image.attribute("valign").as_string("center"));
++            if (image.attribute("x") || image.attribute("y")) {
++                f.image_align.offset = true;
++                f.image_align.offset_x = image.attribute("x").as_float(0.f);
++                f.image_align.offset_y = image.attribute("y").as_float(0.f);
++            }
 +            const pugi::xml_node text = chosen.child("text");
 +            f.text_align.x = align_of(text.attribute("text-align").as_string(text.attribute("align").as_string("center")));
 +            f.text_align.y = align_of(text.attribute("text-valign").as_string(text.attribute("valign").as_string("center")));
++            if (std::string(text.attribute("origin").as_string()) == "image") {
++                const std::string beside = text.attribute("align").as_string();
++                f.text_align.outside = beside == "outside-right" ? 1 : beside == "outside-left" ? -1 : 0;
++                if (f.text_align.outside != 0) {
++                    f.text_align.x = -f.text_align.outside;
++                    f.text_align.y = 0;
++                }
++            }
 +            f.text_align.margin_left = text.attribute("margin-left").as_float(0.f);
 +            f.text_align.margin_right = text.attribute("margin-right").as_float(0.f);
 +            f.text_align.margin_top = text.attribute("margin-top").as_float(0.f);
@@ -8592,17 +8652,30 @@ index 00000000..2d91803f
 +        const LiveRect r = live_rect(960.f - layout->second.x, 544.f - layout->second.y, layout->second.w, layout->second.h);
 +        if (!frame.background.empty())
 +            c.draw_image(frame.background, r.x + (r.w - frame.background.width) / 2, r.y + (r.h - frame.background.height) / 2);
++        // (where the picture went: a text may go beside it)
++        LiveRect picture{ 0, 0, 0, 0 };
 +        if (!frame.image.empty()) {
 +            const auto place = [](int align, int at, int room, int size) { return align < 0 ? at : align > 0 ? at + room - size : at + (room - size) / 2; };
-+            c.draw_image(frame.image, place(frame.image_align.x, r.x, r.w, frame.image.width), place(frame.image_align.y, r.y, r.h, frame.image.height));
++            int ix = place(frame.image_align.x, r.x, r.w, frame.image.width), iy = place(frame.image_align.y, r.y, r.h, frame.image.height);
++            if (frame.image_align.offset) {
++                ix = r.x + r.w / 2 + static_cast<int>(frame.image_align.offset_x * LIVE_SCALE) - frame.image.width / 2;
++                iy = r.y + r.h / 2 - static_cast<int>(frame.image_align.offset_y * LIVE_SCALE) - frame.image.height / 2;
++            }
++            c.draw_image(frame.image, ix, iy);
++            picture = { ix, iy, frame.image.width, frame.image.height };
 +        }
 +        if (!frame.texts.empty()) {
 +            const Item::LiveText &t = frame.texts.front();
 +            const int px = std::max(18, static_cast<int>((t.size > 0 ? t.size : 12.f) * LIVE_SCALE * 0.75f));
 +            const Item::LiveAlign &a = frame.text_align;
-+            const LiveRect box = { r.x + static_cast<int>(a.margin_left * LIVE_SCALE), r.y + static_cast<int>(a.margin_top * LIVE_SCALE),
++            LiveRect box = { r.x + static_cast<int>(a.margin_left * LIVE_SCALE), r.y + static_cast<int>(a.margin_top * LIVE_SCALE),
 +                std::max(40, r.w - static_cast<int>((a.margin_left + a.margin_right) * LIVE_SCALE)),
 +                std::max(px, r.h - static_cast<int>((a.margin_top + a.margin_bottom) * LIVE_SCALE)) };
++            if (a.outside != 0 && picture.w > 0) {
++                const int gap = static_cast<int>(12 * LIVE_SCALE);
++                box = a.outside > 0 ? LiveRect{ picture.x + picture.w + gap, picture.y, std::max(40, r.x + r.w - (picture.x + picture.w + gap)), picture.h }
++                                    : LiveRect{ r.x, picture.y, std::max(40, picture.x - gap - r.x), picture.h };
++            }
 +            live_text(c, box, t.text, px, rgb(t.color), a.x, a.y, t.bold ? Weight::Bold : Weight::Regular);
 +        }
 +    }
@@ -8826,6 +8899,183 @@ index 00000000..2d91803f
 +        28, MUTED, tw, 42);
 +}
 +
++// --- the Trophy Collection (the firmware's app opens it) ---
++
++struct TrophyLine {
++    std::string name, detail, icon_path;
++    int grade = 0; // 1 platinum, 2 gold, 3 silver, 4 bronze
++    bool hidden = false;
++    bool earned = false;
++    int64_t earned_at = 0; // Unix time
++};
++struct TrophyGame {
++    std::string title, icon_path;
++    int total = 0, earned = 0;
++    std::array<int, 5> by_grade{}; // the earned ones, by grade
++    std::vector<TrophyLine> trophies;
++};
++struct TrophyView {
++    std::vector<TrophyGame> games;
++    int game = -1; // whose trophies are open (-1: the games)
++    int selected = 0, top = 0;
++    // pictures by path and size, loaded as they come into view
++    std::map<std::string, ps4ui::Image> pictures;
++};
++
++constexpr int TROPHY_Y = 236;
++constexpr int TROPHY_H = 740;
++constexpr int TROPHY_GAME_ROW = 148;
++constexpr int TROPHY_ROW = 114;
++
++Color grade_color(int grade) {
++    switch (grade) {
++    case 1: return rgb(0xbcd8f2);
++    case 2: return rgb(0xf2c230);
++    case 3: return rgb(0xc6ccd4);
++    case 4: return rgb(0xd08a4e);
++    default: return MUTED;
++    }
++}
++
++const char *grade_name(int grade) {
++    switch (grade) {
++    case 1: return "Platinum";
++    case 2: return "Gold";
++    case 3: return "Silver";
++    case 4: return "Bronze";
++    default: return "";
++    }
++}
++
++// "21 Oct 2026", in the PS4's time zone
++std::string date_text(int64_t when) {
++    time_t utc = static_cast<time_t>(when), local = utc;
++    uint32_t tsec[4] = {};
++    uint32_t dst = 0;
++    if (ps4l_utc_to_local(utc, &local, tsec, &dst) != 0)
++        local = utc;
++    std::tm tm{};
++    gmtime_r(&local, &tm);
++    static const char *const MONTHS[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
++    return fmt::format("{} {} {}", tm.tm_mday, MONTHS[std::clamp(tm.tm_mon, 0, 11)], tm.tm_year + 1900);
++}
++
++// A grade's dot and how many: returns the x after it
++int grade_count(Canvas &c, int x, int y, int grade, int count, int px) {
++    c.fill_circle(x + px * 0.4f, y - px * 0.36f, px * 0.36f, grade_color(grade));
++    x += static_cast<int>(px * 0.95f);
++    return x + c.text(x, y, std::to_string(count), px, TEXT) + px;
++}
++
++// The games with trophies (their progress), or a game's trophies (picture, name, what it's for,
++// grade, when it was earned), in the Trophy Collection's gold
++void draw_trophies(Canvas &c, TrophyView &view, const ps4ui::Image &icon) {
++    static const Canvas made = [] {
++        Canvas b(W, H);
++        b.clear_gradient(rgb(0x2a1f0c), rgb(0x050403));
++        b.fill_circle(1650, -160, 640, rgb(0xf2c230, 18));
++        return b;
++    }();
++    c.copy_from(made);
++    const Color GOLD = rgb(0xf2c230);
++    const auto picture = [&](const std::string &path, int w, int h) -> const ps4ui::Image & {
++        const std::string key = fmt::format("{}@{}x{}", path, w, h);
++        auto it = view.pictures.find(key);
++        if (it == view.pictures.end())
++            it = view.pictures.emplace(key, path.empty() ? ps4ui::Image{} : ps4ui::load_image(path, w, h)).first;
++        return it->second;
++    };
++
++    int tx = MARGIN;
++    if (!icon.empty()) {
++        c.draw_image(icon, MARGIN, 60);
++        tx += icon.width + 30;
++    }
++    c.text(tx, 122, "Trophy Collection", 66, TEXT, Weight::Bold);
++    if (view.game < 0) {
++        int earned = 0, total = 0;
++        std::array<int, 5> grades{};
++        for (const TrophyGame &g : view.games) {
++            earned += g.earned;
++            total += g.total;
++            for (size_t k = 0; k < grades.size(); k++)
++                grades[k] += g.by_grade[k];
++        }
++        int x = tx + 4 + c.text(tx + 4, 176, fmt::format("{} of {} trophies", earned, total), 32, GOLD) + 40;
++        for (int grade = 1; grade <= 4; grade++)
++            x = grade_count(c, x, 176, grade, grades[grade], 30);
++    } else {
++        c.text(tx + 4, 176, view.games[view.game].title, 32, GOLD, Weight::Regular, W - tx - MARGIN);
++    }
++    c.fill_rect(MARGIN, 206, W - 2 * MARGIN, 2, rgb(0xffffff, 30));
++
++    const bool games = view.game < 0;
++    const int count = games ? static_cast<int>(view.games.size()) : static_cast<int>(view.games[view.game].trophies.size());
++    if (count == 0) {
++        c.text_centered(W / 2, H / 2, games ? "No trophies yet: games add theirs when they start" : "This game has no trophies", 36, MUTED);
++        return;
++    }
++    const int row_h = games ? TROPHY_GAME_ROW : TROPHY_ROW;
++    const int rows = TROPHY_H / row_h;
++    view.selected = std::clamp(view.selected, 0, count - 1);
++    if (view.selected < view.top)
++        view.top = view.selected;
++    if (view.selected >= view.top + rows)
++        view.top = view.selected - rows + 1;
++    const int right = W - MARGIN - 38;
++    for (int i = view.top; i < std::min(count, view.top + rows); i++) {
++        const int y = TROPHY_Y + (i - view.top) * row_h;
++        const bool sel = i == view.selected;
++        c.fill_round_rect(MARGIN, y, W - 2 * MARGIN, row_h - 10, 18, sel ? rgb(0xf2c230, 64) : rgb(0xffffff, 14));
++        if (sel)
++            c.fill_round_rect(MARGIN, y + 16, 6, row_h - 42, 3, GOLD);
++        if (games) {
++            const TrophyGame &g = view.games[i];
++            // its trophy pack's picture (320x176 on the Vita), the name, a bar of how far it is, the grades
++            const ps4ui::Image &art = picture(g.icon_path, 218, 120);
++            if (!art.empty())
++                c.draw_image(art, MARGIN + 30, y + (row_h - 10 - art.height) / 2);
++            const int x = MARGIN + 30 + 218 + 36;
++            const int grades_w = 4 * 110;
++            c.text(x, y + 56, g.title, 36, TEXT, sel ? Weight::Bold : Weight::Regular, right - grades_w - 40 - x);
++            const int bar_w = 520, bar_y = y + 82;
++            c.fill_round_rect(x, bar_y, bar_w, 14, 7, rgb(0xffffff, 40));
++            if (g.total > 0 && g.earned > 0)
++                c.fill_round_rect(x, bar_y, std::max(14, bar_w * g.earned / g.total), 14, 7, GOLD);
++            c.text(x + bar_w + 24, bar_y + 14, fmt::format("{} / {}   {}%", g.earned, g.total, g.total ? 100 * g.earned / g.total : 0), 26, MUTED);
++            int gx = right - grades_w;
++            for (int grade = 1; grade <= 4; grade++)
++                gx = std::max(gx, grade_count(c, gx, y + 84, grade, g.by_grade[grade], 30));
++        } else {
++            const TrophyLine &t = view.games[view.game].trophies[i];
++            const bool secret = t.hidden && !t.earned;
++            // its picture (dimmed until earned; a secret one's is a question mark)
++            const int size = 92, ix = MARGIN + 30, iy = y + (row_h - 10 - size) / 2;
++            const ps4ui::Image &art = secret ? picture({}, size, size) : picture(t.icon_path, size, size);
++            if (!art.empty()) {
++                c.draw_image(art, ix, iy);
++                if (!t.earned)
++                    c.fill_rect(ix, iy, art.width, art.height, rgb(0x000000, 150));
++            } else {
++                c.fill_round_rect(ix, iy, size, size, 14, rgb(0x2b2416));
++                c.text_centered(ix + size / 2, iy + size / 2 + 16, "?", 48, MUTED, Weight::Bold);
++            }
++            const int x = ix + size + 32, info_w = 330;
++            c.text(x, y + 46, secret ? "Hidden trophy" : t.name, 32, t.earned ? TEXT : rgb(0xc9c2b0), sel ? Weight::Bold : Weight::Regular, right - info_w - 40 - x);
++            if (!secret)
++                c.text(x, y + 86, t.detail, 24, MUTED, Weight::Regular, right - info_w - 40 - x);
++            const int gx = right - info_w;
++            c.fill_circle(gx + 14.f, y + 36.f, 13.f, grade_color(t.grade));
++            c.text(gx + 38, y + 46, grade_name(t.grade), 28, grade_color(t.grade), Weight::Bold);
++            c.text(gx, y + 86, t.earned ? (t.earned_at > 0 ? "Earned " + date_text(t.earned_at) : std::string("Earned")) : std::string("Not earned"), 24, t.earned ? OK : MUTED);
++        }
++    }
++    if (view.top > 0)
++        c.text_centered(W / 2, TROPHY_Y - 8, "...", 30, MUTED, Weight::Bold);
++    if (view.top + rows < count)
++        c.text_centered(W / 2, TROPHY_Y + TROPHY_H + 26, "...", 30, MUTED, Weight::Bold);
++}
++
 +// Lines the launcher adds to the HENkaku settings (the firmware download, Quit)
 +SItem section_item(std::string name) {
 +    SItem item;
@@ -8840,6 +9090,39 @@ index 00000000..2d91803f
 +    item.name = std::move(name);
 +    item.run = std::move(run);
 +    return item;
++}
++
++// The games' trophies (ux0/user/<user>/trophy: what games add when they start), by name
++std::vector<TrophyGame> load_trophies(EmuEnvState &emuenv) {
++    np::trophy::CollectionSource source;
++    source.io = &emuenv.io;
++    source.vita_fs_path = emuenv.vita_fs_path;
++    source.user_id = emuenv.io.user_id.empty() ? std::string("00") : emuenv.io.user_id;
++    source.lang = static_cast<uint32_t>(emuenv.cfg.sys_lang);
++    std::vector<TrophyGame> games;
++    try {
++        for (const std::string &id : np::trophy::list_collection_ids(source)) {
++            np::trophy::CollectionSnapshot snapshot;
++            if (!np::trophy::load_collection(source, id, snapshot))
++                continue;
++            TrophyGame game;
++            game.title = snapshot.title;
++            game.icon_path = snapshot.icon_path;
++            game.total = snapshot.total;
++            game.earned = snapshot.unlocked;
++            for (size_t k = 0; k < game.by_grade.size(); k++)
++                game.by_grade[k] = snapshot.grade_unlocked[k];
++            for (const np::trophy::TrophyRecord &t : snapshot.trophies)
++                game.trophies.push_back({ t.name, t.detail, t.icon_path, t.grade, t.hidden, t.earned, static_cast<int64_t>(t.timestamp) });
++            games.push_back(std::move(game));
++        }
++    } catch (const std::exception &e) {
++        LOG_ERROR("PS4 launcher: reading the trophies failed: {}", e.what());
++    }
++    std::sort(games.begin(), games.end(), [](const TrophyGame &a, const TrophyGame &b) {
++        return string_utils::tolower(a.title) < string_utils::tolower(b.title);
++    });
++    return games;
 +}
 +
 +} // namespace
@@ -8929,6 +9212,7 @@ index 00000000..2d91803f
 +        LiveArea, // a game's
 +        Settings, // the HENkaku settings: all games', or a game's
 +        About, // who made HENkaku
++        Trophies, // the Trophy Collection
 +    };
 +    Mode mode = Mode::Home;
 +    Mode settings_return = Mode::Home;
@@ -8937,6 +9221,9 @@ index 00000000..2d91803f
 +    int tile = 0; // the bubbles'
 +    int live = -1; // the game whose LiveArea is on screen
 +    SettingsView settings;
++    TrophyView trophies;
++    Mode trophies_return = Mode::Home;
++    ps4ui::Image trophies_icon;
 +    bool quit_requested = false;
 +    bool about_requested = false;
 +    bool firmware_requested = false;
@@ -8966,7 +9253,7 @@ index 00000000..2d91803f
 +        if (!picture) {
 +            picture = std::make_unique<Canvas>(W, H);
 +            Item &item = items[find_item(path)];
-+            ensure_livearea(item, emuenv.vita_fs_path / "ux0" / "app" / item.entry.path);
++            ensure_livearea(item, item.dir.empty() ? emuenv.vita_fs_path / "ux0" / "app" / item.entry.path : item.dir);
 +            draw_livearea(*picture, item);
 +        }
 +        return *picture;
@@ -9064,6 +9351,29 @@ index 00000000..2d91803f
 +            settings_open(settings, "All games", std::move(root));
 +        }
 +        mode = Mode::Settings;
++    };
++    // A firmware app started (from its LiveArea, or the list): HENkaku's screen for it
++    const auto open_system = [&](const Item &item) {
++        switch (item.system) {
++        case SystemApp::Settings:
++            open_settings(-1);
++            break;
++        case SystemApp::ContentManager:
++            open_browser();
++            break;
++        case SystemApp::Trophies:
++            trophies_return = mode;
++            trophies.games = load_trophies(emuenv);
++            trophies.game = -1;
++            trophies.selected = trophies.top = 0;
++            trophies.pictures.clear();
++            if (trophies_icon.empty())
++                trophies_icon = ps4ui::load_image(item.entry.icon_path, 124, 124);
++            mode = Mode::Trophies;
++            break;
++        case SystemApp::None:
++            break;
++        }
 +    };
 +    // What's missing of the firmware comes from Sony by itself, unless the user stopped that
 +    // before or copied update files to install
@@ -9210,7 +9520,7 @@ index 00000000..2d91803f
 +                        pending_open = tile;
 +                        pending_at = now + std::chrono::milliseconds(200);
 +                        dirty = true;
-+                    } else if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && t.kind == TileKind::Game) {
++                    } else if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && t.kind == TileKind::Game && items[t.item].system == SystemApp::None) {
 +                        open_settings(t.item);
 +                        dirty = true;
 +                    }
@@ -9226,10 +9536,12 @@ index 00000000..2d91803f
 +                        dirty = true;
 +                    }
 +                    if ((pressed & ORBIS_PAD_BUTTON_CROSS) && count > 0) {
-+                        if (auto choice = start_game(selected))
++                        if (items[selected].system != SystemApp::None)
++                            open_system(items[selected]);
++                        else if (auto choice = start_game(selected))
 +                            return *choice;
 +                        dirty = true;
-+                    } else if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && count > 0) {
++                    } else if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && count > 0 && items[selected].system == SystemApp::None) {
 +                        open_settings(selected);
 +                        dirty = true;
 +                    }
@@ -9250,7 +9562,7 @@ index 00000000..2d91803f
 +                    // the gate opens: its picture grows into the game
 +                    launching = true;
 +                    launch_at = now;
-+                } else if (pressed & ORBIS_PAD_BUTTON_SQUARE) {
++                } else if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && live >= 0 && items[live].system == SystemApp::None) {
 +                    open_settings(live);
 +                } else if (pressed & ORBIS_PAD_BUTTON_CIRCLE) {
 +                    show_card(0);
@@ -9328,6 +9640,30 @@ index 00000000..2d91803f
 +                    mode = Mode::Settings;
 +                dirty |= pressed != 0;
 +                break;
++
++            case Mode::Trophies: {
++                // the games, Cross a game's trophies, Circle back
++                const int count = trophies.game < 0 ? static_cast<int>(trophies.games.size()) : static_cast<int>(trophies.games[trophies.game].trophies.size());
++                const int rows = TROPHY_H / (trophies.game < 0 ? TROPHY_GAME_ROW : TROPHY_ROW);
++                if (dy != 0 && count > 0)
++                    trophies.selected = std::clamp(trophies.selected + dy, 0, count - 1);
++                if ((pressed & (ORBIS_PAD_BUTTON_L1 | ORBIS_PAD_BUTTON_R1)) && count > 0)
++                    trophies.selected = std::clamp(trophies.selected + ((pressed & ORBIS_PAD_BUTTON_L1) ? -rows : rows), 0, count - 1);
++                if ((pressed & ORBIS_PAD_BUTTON_CROSS) && trophies.game < 0 && count > 0) {
++                    trophies.game = trophies.selected;
++                    trophies.selected = trophies.top = 0;
++                } else if (pressed & ORBIS_PAD_BUTTON_CIRCLE) {
++                    if (trophies.game >= 0) {
++                        trophies.selected = trophies.game;
++                        trophies.top = 0;
++                        trophies.game = -1;
++                    } else {
++                        mode = trophies_return;
++                    }
++                }
++                dirty |= dy != 0 || pressed != 0;
++                break;
++            }
 +
 +            case Mode::Browser: {
 +                const int count = static_cast<int>(entries.size());
@@ -9460,7 +9796,9 @@ index 00000000..2d91803f
 +                        canvas.fill_rect(0, 0, W, H, rgb(0x000000, static_cast<uint8_t>(255 * e)));
 +                        if (t >= 1.f) {
 +                            launching = false;
-+                            if (auto choice = start_game(live))
++                            if (items[live].system != SystemApp::None)
++                                open_system(items[live]);
++                            else if (auto choice = start_game(live))
 +                                return *choice;
 +                        }
 +                    }
@@ -9473,7 +9811,7 @@ index 00000000..2d91803f
 +                    if (mode == Mode::Home) {
 +                        const Tile &t = tiles[tile];
 +                        hints.push_back({ Pad::Cross, t.kind == TileKind::Henkaku ? "Settings" : t.kind == TileKind::Install ? "Install games" : "Open" });
-+                        if (t.kind == TileKind::Game)
++                        if (t.kind == TileKind::Game && items[t.item].system == SystemApp::None)
 +                            hints.push_back({ Pad::Square, "Game settings" });
 +                        hints.push_back({ Pad::Triangle, "Install" });
 +                        if (!cards.empty())
@@ -9481,7 +9819,8 @@ index 00000000..2d91803f
 +                        hints.push_back({ Pad::Options, "HENkaku" });
 +                    } else {
 +                        hints.push_back({ Pad::Cross, "Start" });
-+                        hints.push_back({ Pad::Square, "Game settings" });
++                        if (live >= 0 && items[live].system == SystemApp::None)
++                            hints.push_back({ Pad::Square, "Game settings" });
 +                        hints.push_back({ Pad::Circle, "Home" });
 +                        hints.push_back({ Pad::Triangle, "Close" });
 +                        if (cards.size() > 1)
@@ -9517,8 +9856,9 @@ index 00000000..2d91803f
 +                    header(canvas, fw);
 +                    draw_list(canvas, items, selected, top);
 +                    if (!items.empty()) {
-+                        hints.push_back({ Pad::Cross, "Start" });
-+                        hints.push_back({ Pad::Square, "Game settings" });
++                        hints.push_back({ Pad::Cross, items[selected].system != SystemApp::None ? "Open" : "Start" });
++                        if (items[selected].system == SystemApp::None)
++                            hints.push_back({ Pad::Square, "Game settings" });
 +                    }
 +                    hints.push_back({ Pad::Triangle, "Install games" });
 +                    hints.push_back({ Pad::Options, "HENkaku" });
@@ -9541,6 +9881,12 @@ index 00000000..2d91803f
 +            }
 +            case Mode::About:
 +                draw_about(canvas, henkaku_about);
++                hints.push_back({ Pad::Circle, "Back" });
++                break;
++            case Mode::Trophies:
++                draw_trophies(canvas, trophies, trophies_icon);
++                if (trophies.game < 0 && !trophies.games.empty())
++                    hints.push_back({ Pad::Cross, "Trophies" });
 +                hints.push_back({ Pad::Circle, "Back" });
 +                break;
 +            case Mode::Browser:
