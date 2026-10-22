@@ -9777,7 +9777,7 @@ index ed8c71ad..093208ad 100644
          dispatch.init();
  #endif
 diff --git a/vita3k/renderer/src/vulkan/scene.cpp b/vita3k/renderer/src/vulkan/scene.cpp
-index acd85ab5..8ab9d9fe 100644
+index acd85ab5..95eb1d1e 100644
 --- a/vita3k/renderer/src/vulkan/scene.cpp
 +++ b/vita3k/renderer/src/vulkan/scene.cpp
 @@ -19,6 +19,10 @@
@@ -9791,7 +9791,36 @@ index acd85ab5..8ab9d9fe 100644
  
  #include <config/state.h>
  #include <spdlog/fmt/bin_to_hex.h>
-@@ -305,6 +309,15 @@ static void bind_vertex_streams(VKContext &context, MemState &mem, uint32_t inst
+@@ -250,7 +254,9 @@ static void draw_bind_descriptors(VKContext &context, MemState &mem) {
+ }
+ 
+ // vertex count is only used with double buffer mapping
+-static void bind_vertex_streams(VKContext &context, MemState &mem, uint32_t instance_count, uint32_t max_index) {
++// first_vertex: the lowest index the draw uses, from which per-vertex streams are copied (the draw
++// then subtracts it from its indices: vertexOffset), 0 to copy them whole
++static void bind_vertex_streams(VKContext &context, MemState &mem, uint32_t instance_count, uint32_t max_index, uint32_t first_vertex = 0) {
+     GxmRecordState &state = context.record;
+     const SceGxmVertexProgram &vertex_program = *state.vertex_program.get(mem);
+     VertexProgram *vkvert = vertex_program.renderer_data.get();
+@@ -299,12 +305,33 @@ static void bind_vertex_streams(VKContext &context, MemState &mem, uint32_t inst
+             } else {
+                 const uint8_t *stream = state.vertex_streams[i].data.get(mem);
+                 uint32_t stream_size = state.vertex_streams[i].size;
++#ifdef __PS4__
++                // only from the draw's first vertex: a game that keeps many models in one buffer had
++                // its whole buffer copied up to each draw's last vertex (God of War II: 20-50 us a draw)
++                const SceGxmVertexStream &gxm_stream = vertex_program.streams[i];
++                if (first_vertex > 0 && gxm_stream.stride > 0 && !gxm::is_stream_instancing(static_cast<SceGxmIndexSource>(gxm_stream.indexSource))) {
++                    const uint64_t skip = static_cast<uint64_t>(first_vertex) * gxm_stream.stride;
++                    if (skip < stream_size) {
++                        stream += skip;
++                        stream_size -= static_cast<uint32_t>(skip);
++                    }
++                }
++#endif
+ #ifdef __APPLE__
+                 // Vulkan allows any stride, but Metal only allows multiples of 4.
+                 const bool restride = vertex_program.streams[i].stride % 4 != 0;
                  if (restride) {
                      restride_stream(stream, stream_size, vertex_program.streams[i].stride);
                  }
@@ -9807,7 +9836,7 @@ index acd85ab5..8ab9d9fe 100644
  #endif
                  context.vertex_stream_ring_buffer.allocate(context.prerender_cmd, stream_size, stream);
                  context.vertex_stream_offsets[i] = context.vertex_stream_ring_buffer.data_offset;
-@@ -469,6 +482,10 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
+@@ -469,6 +496,10 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
          context.begin_visibility_query();
      }
  
@@ -9818,7 +9847,7 @@ index acd85ab5..8ab9d9fe 100644
      // do we need to check for a pipeline change?
      if (context.refresh_pipeline || type != context.last_primitive) {
          context.refresh_pipeline = false;
-@@ -501,6 +518,9 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
+@@ -501,6 +532,9 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
      }
  
      const bool use_memory_mapping = context.state.features.enable_memory_mapping;
@@ -9828,7 +9857,7 @@ index acd85ab5..8ab9d9fe 100644
  
      // update uniforms if needed
      // first update the buffer and texture count
-@@ -549,8 +569,14 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
+@@ -549,8 +583,14 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
          memcpy(&context.prev_frag_ublock, &frag_ublock, sizeof(frag_ublock));
      }
  
@@ -9843,21 +9872,51 @@ index acd85ab5..8ab9d9fe 100644
  
      // Upload index data.
      vk::IndexType index_type = (format == SCE_GXM_INDEX_FORMAT_U16) ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
-@@ -580,8 +606,14 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
+@@ -580,8 +620,34 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
          context.render_cmd.bindIndexBuffer(context.index_stream_ring_buffer.handle(), context.index_stream_ring_buffer.data_offset, index_type);
      }
  
++    // the lowest index: the vertex streams are copied from there (bind_vertex_streams)
++    uint32_t first_vertex = 0;
++#ifdef __PS4__
++    if (!use_memory_mapping && !ordered_indices && count > 0) {
++        if (format == SCE_GXM_INDEX_FORMAT_U16) {
++            const uint16_t *data = static_cast<const uint16_t *>(indices_ptr);
++            uint16_t lowest = data[0];
++            for (size_t i = 1; i < count; i++)
++                lowest = std::min(lowest, data[i]);
++            first_vertex = lowest;
++        } else {
++            const uint32_t *data = static_cast<const uint32_t *>(indices_ptr);
++            uint32_t lowest = data[0];
++            for (size_t i = 1; i < count; i++)
++                lowest = std::min(lowest, data[i]);
++            first_vertex = std::min<uint32_t>(lowest, 0x7FFFFFFF);
++        }
++    }
++#endif
++
 +#ifdef __PS4__
 +    phase.next(ps4stats::phase_ticks[ps4stats::PhaseVertices]);
 +#endif
      // bind the vertex streams
-     bind_vertex_streams(context, mem, instance_count, max_index);
+-    bind_vertex_streams(context, mem, instance_count, max_index);
++    bind_vertex_streams(context, mem, instance_count, max_index, first_vertex);
 +#ifdef __PS4__
 +    phase.next(ps4stats::phase_ticks[ps4stats::PhaseRecord]);
 +#endif
  
      if (ordered_fetch) {
          if (ordered_indices) {
+@@ -598,7 +664,7 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
+             }
+         }
+     } else {
+-        context.render_cmd.drawIndexed(count, instance_count, 0, 0, 0);
++        context.render_cmd.drawIndexed(count, instance_count, 0, -static_cast<int32_t>(first_vertex), 0);
+     }
+     if (maskupdate && count && instance_count && context.record.writing_mask < 0.5f)
+         context.render_target->mask_may_reject = true;
 diff --git a/vita3k/renderer/src/vulkan/screen_filters.cpp b/vita3k/renderer/src/vulkan/screen_filters.cpp
 index 192dba99..4ae1b08b 100644
 --- a/vita3k/renderer/src/vulkan/screen_filters.cpp
