@@ -9059,13 +9059,16 @@ index 689060fb..11e3e88a 100644
                  LOG_ERROR("Could not wait for fences.");
                  assert(false);
 diff --git a/vita3k/renderer/src/vulkan/pipeline_cache.cpp b/vita3k/renderer/src/vulkan/pipeline_cache.cpp
-index ff6d0c5b..fc18359a 100644
+index ff6d0c5b..854eb9a6 100644
 --- a/vita3k/renderer/src/vulkan/pipeline_cache.cpp
 +++ b/vita3k/renderer/src/vulkan/pipeline_cache.cpp
-@@ -36,6 +36,11 @@
+@@ -36,6 +36,14 @@
  #define XXH_INLINE_ALL
  #include <xxhash.h>
  
++#include <mutex>
++#include <set>
++
 +#ifdef __PS4__
 +extern "C" void ps4_watch_thread(const char *name); // port/ps4_sampler.cpp
 +extern "C" void ps4_thread_cpu_tick();
@@ -9074,7 +9077,41 @@ index ff6d0c5b..fc18359a 100644
  namespace renderer::vulkan {
  
  // Size of the record containing what is needed for the pipeline construction (what is after is dynamic state)
-@@ -854,7 +859,13 @@ void PipelineCache::compiler_thread(MemState &mem) {
+@@ -227,6 +235,12 @@ void PipelineCache::init(bool support_rasterized_order_access) {
+         }
+ 
+         state.features.support_rgb_attributes = unsupported_rgb_vertex_attribute_formats.empty();
++#ifdef __PS4__
++        std::string unsupported;
++        for (const auto fmt : unsupported_rgb_vertex_attribute_formats)
++            unsupported += " " + vk::to_string(fmt);
++        LOG_INFO("PS4 GPU: scaled vertex formats {}, 3-component vertex formats it can't read:{}", support_scaled_vertex_attribute ? "supported" : "unsupported", unsupported.empty() ? " none" : unsupported);
++#endif
+     }
+ 
+     support_coherent_framebuffer_fetch = support_rasterized_order_access;
+@@ -815,6 +829,20 @@ vk::PipelineVertexInputStateCreateInfo PipelineCache::get_vertex_input_state(con
+             }
+         }
+ 
++#ifdef __PS4__
++        {
++            // each kind of vertex attribute once (a game whose geometry comes out wrong)
++            static std::mutex seen_mutex;
++            static std::set<uint64_t> seen;
++            const SceGxmVertexStream &stream = vertex_program.streams[attribute.streamIndex];
++            const uint64_t key = (uint64_t(attribute.format) << 48) ^ (uint64_t(attribute.componentCount) << 40) ^ (uint64_t(info.regformat) << 39) ^ (uint64_t(info.gxm_type) << 32)
++                ^ (uint64_t(stream.stride) << 16) ^ (uint64_t(attribute.offset & 0xF) << 8) ^ uint64_t(static_cast<uint32_t>(format) & 0xFF);
++            const std::lock_guard<std::mutex> guard(seen_mutex);
++            if (seen.size() < 200 && seen.insert(key).second)
++                LOG_INFO("PS4 vertex attribute: gxm format {} x{}, {}type {}, integer {} signed {}, stream stride {} offset {} -> {} x{}", static_cast<int>(attribute.format), static_cast<int>(attribute.componentCount),
++                    info.regformat ? "regformat, " : "", static_cast<int>(info.gxm_type), info.is_integer, info.is_signed, stream.stride, attribute.offset, vk::to_string(format), static_cast<int>(component_count));
++        }
++#endif
+         for (uint32_t i = 0; i < array_size; i++) {
+             attr_descr.push_back(vk::VertexInputAttributeDescription{
+                 .location = info.location + i,
+@@ -854,7 +882,13 @@ void PipelineCache::compiler_thread(MemState &mem) {
  
      // just a single loop, waiting for a pipeline compile request and compiling it
      CompileRequest *request;
@@ -9195,6 +9232,34 @@ index 192dba99..4ae1b08b 100644
      };
      cmd_buffer.pushConstants(pipeline_layout_rcas, vk::ShaderStageFlagBits::eCompute, 0, sizeof(RcasConstant), &rcas_constant);
      cmd_buffer.dispatch(dispatch_x, dispatch_y, 1);
+diff --git a/vita3k/renderer/src/vulkan/texture.cpp b/vita3k/renderer/src/vulkan/texture.cpp
+index 3a0120c1..0e1ac2c1 100644
+--- a/vita3k/renderer/src/vulkan/texture.cpp
++++ b/vita3k/renderer/src/vulkan/texture.cpp
+@@ -15,6 +15,7 @@
+ // with this program; if not, write to the Free Software Foundation, Inc.,
+ // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+ 
++#include <set>
+ #include <renderer/vulkan/functions.h>
+ 
+ #include <renderer/vulkan/gxm_to_vulkan.h>
+@@ -385,6 +386,15 @@ void VKTextureCache::configure_texture(const SceGxmTexture &gxm_texture) {
+         vk_format = bcn_to_rgba8(vk_format);
+     if (gxm_texture.gamma_mode)
+         vk_format = linear_to_srgb(vk_format);
++#ifdef __PS4__
++    {
++        // each texture format once, with how it is read (a game whose pictures come out wrong)
++        static std::set<uint32_t> seen;
++        if (seen.size() < 100 && seen.insert(static_cast<uint32_t>(format) ^ (static_cast<uint32_t>(gxm_texture.texture_type()) << 2)).second)
++            LOG_INFO("PS4 texture: gxm format {:08X}, type {}, {}x{}, {} mips -> {}, swizzle {} {} {} {}", static_cast<uint32_t>(format), static_cast<uint32_t>(gxm_texture.texture_type()), width, height, mip_count,
++                vk::to_string(vk_format), vk::to_string(swizzle.r), vk::to_string(swizzle.g), vk::to_string(swizzle.b), vk::to_string(swizzle.a));
++    }
++#endif
+ 
+     current_texture->mip_count = mip_count;
+     current_texture->is_cube = is_cube;
 diff --git a/vita3k/shader/include/shader/spirv_recompiler.h b/vita3k/shader/include/shader/spirv_recompiler.h
 index f93de644..cbe7d451 100644
 --- a/vita3k/shader/include/shader/spirv_recompiler.h
