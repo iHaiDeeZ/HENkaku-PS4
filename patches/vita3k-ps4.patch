@@ -703,11 +703,50 @@ index 54e89f88..e3308cfc 100644
      config.enable_cycle_counting = false;
  
      return std::make_unique<Dynarmic::A32::Jit>(config);
+diff --git a/vita3k/display/include/display/state.h b/vita3k/display/include/display/state.h
+index 6bf8833c..e0480df8 100644
+--- a/vita3k/display/include/display/state.h
++++ b/vita3k/display/include/display/state.h
+@@ -22,7 +22,9 @@
+ #include <mem/ptr.h>
+ #include <util/types.h>
+ 
++#include <algorithm>
+ #include <atomic>
++#include <chrono>
+ #include <memory>
+ #include <mutex>
+ #include <thread>
+@@ -41,6 +43,8 @@ struct DisplayFrameInfo {
+     uint32_t pitch = 0;
+     uint32_t pixelformat = SCE_DISPLAY_PIXELFORMAT_A8B8G8R8;
+     SceIVector2 image_size = { 0, 0 };
++    // when the game queued it, in vblanks (vblank_count and a part of the next; frame generation)
++    double vblank_time = 0.0;
+ };
+ 
+ struct PredictedDisplayFrame {
+@@ -69,6 +73,15 @@ struct DisplayState {
+     std::atomic<bool> imgui_render{ true };
+     std::atomic<bool> fullscreen{ false };
+     std::atomic<std::uint64_t> vblank_count{ 0 };
++    // when the last vblank came (steady clock, ns) and their period (averaged): with
++    // display_info_mutex held, the time now in vblanks
++    int64_t vblank_ns = 0;
++    int64_t vblank_period_ns = 16683333;
++    double vblank_time() const {
++        const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++        const double part = vblank_ns && vblank_period_ns > 0 ? static_cast<double>(now - vblank_ns) / static_cast<double>(vblank_period_ns) : 0.0;
++        return static_cast<double>(vblank_count.load()) + std::clamp(part, 0.0, 0.999);
++    }
+     WaitQueue<VBlankWaitEntry> vblank_waiters;
+     std::atomic<uint64_t> last_setframe_vblank_count = 0;
+     std::map<SceUID, CallbackPtr> vblank_callbacks{};
 diff --git a/vita3k/display/src/display.cpp b/vita3k/display/src/display.cpp
-index 6e673d1c..987850af 100644
+index 6e673d1c..a8cac400 100644
 --- a/vita3k/display/src/display.cpp
 +++ b/vita3k/display/src/display.cpp
-@@ -27,6 +27,12 @@
+@@ -27,6 +27,13 @@
  #include <motion/functions.h>
  #include <touch/functions.h>
  
@@ -715,12 +754,13 @@ index 6e673d1c..987850af 100644
 +extern "C" void ps4_watch_thread(const char *name); // port/ps4_sampler.cpp
 +extern "C" void ps4_wait_add(int slot, long long ns);
 +extern "C" bool ps4_wait_vblank(unsigned timeout_us); // vita3k/ps4/ps4_wsi.cpp
++extern "C" bool ps4_frame_generation(); // vita3k/ps4/ps4_settings.cpp
 +#endif
 +
  // Code heavily influenced by PPSSSPP's SceDisplay.cpp
  
  static constexpr int TARGET_FPS = 60;
-@@ -37,6 +43,9 @@ static constexpr int max_expected_swapchain_size = 6;
+@@ -37,6 +44,9 @@ static constexpr int max_expected_swapchain_size = 6;
  
  static void vblank_sync_thread(EmuEnvState &emuenv) {
      DisplayState &display = emuenv.display;
@@ -730,10 +770,28 @@ index 6e673d1c..987850af 100644
  
      while (!display.abort.load()) {
          {
-@@ -67,6 +76,11 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
+@@ -45,6 +55,12 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
+             {
+                 const std::lock_guard<std::mutex> guard_info(display.display_info_mutex);
+                 ++display.vblank_count;
++                // when it came, and the period (frames' times in vblanks)
++                const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++                const int64_t since = now_ns - display.vblank_ns;
++                if (display.vblank_ns && since > 8000000 && since < 25000000)
++                    display.vblank_period_ns += (since - display.vblank_period_ns) / 16;
++                display.vblank_ns = now_ns;
+ 
+                 // in this case, even though no new game frames are being rendered, we still need to update the screen
+                 if (emuenv.kernel.is_threads_paused() || (emuenv.common_dialog.status == SCE_COMMON_DIALOG_STATUS_RUNNING))
+@@ -67,6 +83,16 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
                  return waiter.entry.target_vcount <= display.vblank_count;
              });
          }
++#ifdef __PS4__
++        // frame generation: the render thread gives the screen an image at every vblank
++        if (ps4_frame_generation() && emuenv.renderer)
++            emuenv.renderer->present_ticks.fetch_add(1, std::memory_order_relaxed);
++#endif
 +#ifdef __PS4__
 +        // the next vblank is the display's (59.94 a second, in step with the flips)
 +        if (ps4_wait_vblank(50000))
@@ -742,7 +800,7 @@ index 6e673d1c..987850af 100644
          const auto time_ms = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
          const auto time_left = TARGET_MICRO_PER_FRAME - (time_ms % TARGET_MICRO_PER_FRAME);
          std::this_thread::sleep_for(std::chrono::microseconds(time_left));
-@@ -87,8 +101,15 @@ void wait_vblank(DisplayState &display, const ThreadStatePtr &wait_thread, const
+@@ -87,8 +113,15 @@ void wait_vblank(DisplayState &display, const ThreadStatePtr &wait_thread, const
      if (target_vcount <= display.vblank_count)
          return;
  
@@ -758,6 +816,41 @@ index 6e673d1c..987850af 100644
  }
  
  static void reset_swapchain_cycle(DisplayState &display, Address sync_object) {
+@@ -153,6 +186,7 @@ DisplayFrameInfo *predict_next_image(EmuEnvState &emuenv, Address sync_object) {
+         // set the next framebuffer image here
+         frame = new DisplayFrameInfo;
+         *frame = display.predicted_frames[display.predicted_frame_position].frame_info;
++        frame->vblank_time = display.vblank_time();
+     }
+ 
+     return frame;
+@@ -165,6 +199,7 @@ void update_prediction(EmuEnvState &emuenv, DisplayFrameInfo &frame) {
+ 
+     if (!display.predicting) {
+         display.next_rendered_frame = frame;
++        display.next_rendered_frame.vblank_time = display.vblank_time();
+         emuenv.renderer->should_display = true;
+     }
+ 
+@@ -172,7 +207,9 @@ void update_prediction(EmuEnvState &emuenv, DisplayFrameInfo &frame) {
+         if (pred_frame.sync_object != sync_object)
+             continue;
+ 
+-        if (memcmp(&pred_frame.frame_info, &frame, sizeof(DisplayFrameInfo)) == 0)
++        const DisplayFrameInfo &expected = pred_frame.frame_info;
++        if (expected.base == frame.base && expected.pitch == frame.pitch && expected.pixelformat == frame.pixelformat
++            && expected.image_size.x == frame.image_size.x && expected.image_size.y == frame.image_size.y)
+             // we got what we expected, fine
+             return;
+ 
+@@ -183,6 +220,7 @@ void update_prediction(EmuEnvState &emuenv, DisplayFrameInfo &frame) {
+     if (display.predicting) {
+         LOG_TRACE("Mispredicted the next swapchain image");
+         display.next_rendered_frame = frame;
++        display.next_rendered_frame.vblank_time = display.vblank_time();
+         emuenv.renderer->should_display = true;
+     }
+ 
 diff --git a/vita3k/emuenv/include/emuenv/app_util.h b/vita3k/emuenv/include/emuenv/app_util.h
 index e701e78d..218cb05b 100644
 --- a/vita3k/emuenv/include/emuenv/app_util.h
@@ -3625,10 +3718,10 @@ index 6403d07e..8d030b92 100644
              finished = true;
              break;
 diff --git a/vita3k/overlay/include/overlay/pause_overlay.h b/vita3k/overlay/include/overlay/pause_overlay.h
-index 6c5147b7..a87f7cbd 100644
+index 6c5147b7..404c7c97 100644
 --- a/vita3k/overlay/include/overlay/pause_overlay.h
 +++ b/vita3k/overlay/include/overlay/pause_overlay.h
-@@ -23,21 +23,50 @@
+@@ -23,21 +23,51 @@
  #include <overlay/overlay.h>
  #include <overlay/user_interface.h>
  
@@ -3655,7 +3748,8 @@ index 6c5147b7..a87f7cbd 100644
 +    };
 +    kind type = kind::choice;
 +    std::string name;
-+    // dimmed next to the name: when a choice takes effect, what a page holds
++    // a few words more (the launcher shows them next to the name when there's room; the in-game
++    // menu doesn't)
 +    std::string note;
 +    // a choice: its values, which one is in use, and how another is applied (both run while the
 +    // menu is open)
@@ -3686,7 +3780,7 @@ index 6c5147b7..a87f7cbd 100644
  struct pause_overlay : public user_interface {
      explicit pause_overlay(app::AppSessionController &session_controller);
  
-@@ -47,36 +76,95 @@ struct pause_overlay : public user_interface {
+@@ -47,36 +77,98 @@ struct pause_overlay : public user_interface {
      void on_touch_pressed(float vx, float vy) override;
  
  private:
@@ -3704,6 +3798,9 @@ index 6c5147b7..a87f7cbd 100644
 +        rounded_rect bg;
 +        label text;
 +        label value_text;
++        // the name's and the value's room (the widest value; the name gets the rest)
++        uint16_t name_w = 0;
++        uint16_t value_w = 0;
 +        int shown = -1;
 +        bool visible = false;
 +    };
@@ -3858,10 +3955,10 @@ index 117569cf2..4c8552a5 100644
          result.font_names.emplace_back("NotoSansKR-Regular.otf");
          result.font_names.emplace_back("NotoSansCJK-Regular.ttc");
 diff --git a/vita3k/overlay/src/pause_overlay.cpp b/vita3k/overlay/src/pause_overlay.cpp
-index 3e2404bb..0ca2475e 100644
+index 3e2404bb..96a283ea 100644
 --- a/vita3k/overlay/src/pause_overlay.cpp
 +++ b/vita3k/overlay/src/pause_overlay.cpp
-@@ -19,21 +19,36 @@
+@@ -19,21 +19,85 @@
  
  #include <lang/state.h>
  #include <overlay/types.h>
@@ -3881,6 +3978,55 @@ index 3e2404bb..0ca2475e 100644
 +
 +std::mutex s_menu_mutex;
 +pause_menu s_menu;
++
++uint16_t text_width(const label &l) {
++    uint16_t w = 0, h = 0;
++    l.measure_text(w, h, true);
++    return w;
++}
++
++// Sets a label's text, cut short with "..." when it's wider than max_w: the menu's names and values
++// never run into each other
++void set_fitting_text(label &l, const std::string &text, uint16_t max_w) {
++    l.set_text(text);
++    if (max_w == 0 || text_width(l) <= max_w)
++        return;
++    // the longest start, in whole UTF-8 characters, that fits with the dots
++    std::vector<size_t> starts;
++    for (size_t i = 0; i < text.size();) {
++        starts.push_back(i);
++        const unsigned char c = static_cast<unsigned char>(text[i]);
++        i += c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
++    }
++    const auto cut = [&](size_t kept) {
++        std::string s = text.substr(0, starts[kept]);
++        while (!s.empty() && s.back() == ' ')
++            s.pop_back();
++        return s + "...";
++    };
++    size_t lo = 0, hi = starts.size() - 1;
++    while (lo < hi) {
++        const size_t mid = (lo + hi + 1) / 2;
++        l.set_text(cut(mid));
++        if (text_width(l) <= max_w)
++            lo = mid;
++        else
++            hi = mid - 1;
++    }
++    l.set_text(cut(lo));
++}
++
++// How wide a text is in the menu's font
++uint16_t width_of(const std::string &text, uint16_t size, bool bold) {
++    label probe;
++    probe.set_font(k_pause_overlay_font, size, bold);
++    probe.set_text(text);
++    return text_width(probe);
++}
++
++std::string choice_text(const pause_menu_item &item, int index) {
++    return item.set ? "<  " + item.values[index] + "  >" : item.values[index];
++}
 +} // namespace
 +
 +void set_pause_menu(pause_menu menu) {
@@ -3898,7 +4044,7 @@ index 3e2404bb..0ca2475e 100644
  
      m_bg_dimmer.set_pos(0, 0);
      m_bg_dimmer.set_size(virtual_width, virtual_height);
-@@ -42,72 +57,230 @@ pause_overlay::pause_overlay(app::AppSessionController &session_controller)
+@@ -42,72 +106,242 @@ pause_overlay::pause_overlay(app::AppSessionController &session_controller)
  
      m_card.back_color = k_color_card_bg;
      m_card.border_radius = k_card_radius;
@@ -3939,8 +4085,8 @@ index 3e2404bb..0ca2475e 100644
 +    m_title.back_color = k_transparent;
 +
 +    // the game, at the right of the heading
-+    m_subtitle.set_text(m_session_controller.get_active_app_title());
 +    m_subtitle.set_font(k_pause_overlay_font, k_section_font_size, false);
++    set_fitting_text(m_subtitle, m_session_controller.get_active_app_title(), k_card_w / 2 - 20);
 +    m_subtitle.align_text(overlay_element::right);
 +    m_subtitle.fore_color = k_color_muted;
 +    m_subtitle.back_color = k_transparent;
@@ -3980,18 +4126,28 @@ index 3e2404bb..0ca2475e 100644
 +        r.bg.back_color = k_color_btn_normal;
 +        r.bg.border_radius = k_row_radius;
 +        r.bg.border_color = k_transparent;
-+        r.text.set_text(text);
 +        r.text.set_font(k_pause_overlay_font, section ? k_section_font_size : k_font_size, true);
 +        r.text.align_text(overlay_element::left);
 +        r.text.fore_color = section ? k_color_section : k_color_text;
 +        r.text.back_color = k_transparent;
++        // the value's room: its widest value (at most a little over half the line), the name the rest
++        if (type == row_kind::choice) {
++            for (size_t v = 0; v < item->values.size(); v++)
++                r.value_w = std::max(r.value_w, width_of(choice_text(*item, static_cast<int>(v)), k_font_size, true));
++            r.value_w = std::min<uint16_t>(r.value_w, k_row_w * 11 / 20);
++        } else if (type == row_kind::page) {
++            r.value_w = width_of(">", k_font_size, false);
++        }
++        r.name_w = section ? static_cast<uint16_t>(k_row_w - 8)
++                           : static_cast<uint16_t>(k_row_w - 2 * k_text_inset - (r.value_w ? r.value_w + 16 : 0));
++        set_fitting_text(r.text, text, r.name_w);
 +        if (type == row_kind::choice || type == row_kind::page) {
 +            r.value_text.set_font(k_pause_overlay_font, k_font_size, type == row_kind::choice);
 +            r.value_text.align_text(overlay_element::right);
 +            r.value_text.fore_color = type == row_kind::choice ? k_color_focus_ring : k_color_muted;
 +            r.value_text.back_color = k_transparent;
 +            if (type == row_kind::page)
-+                r.value_text.set_text(item->note.empty() ? std::string(">") : item->note + "   >");
++                r.value_text.set_text(">");
 +        }
 +        m_rows.push_back(std::move(r));
 +    };
@@ -4001,7 +4157,7 @@ index 3e2404bb..0ca2475e 100644
 +            add(row_kind::section, &item, item.name);
 +            break;
 +        case pause_menu_item::kind::choice:
-+            add(row_kind::choice, &item, item.note.empty() ? item.name : item.name + "  (" + item.note + ")");
++            add(row_kind::choice, &item, item.name);
 +            break;
 +        case pause_menu_item::kind::page:
 +            add(row_kind::page, &item, item.name);
@@ -4033,7 +4189,9 @@ index 3e2404bb..0ca2475e 100644
 +        if (open.page)
 +            title += "  >  " + open.page->name;
 +    }
-+    m_title.set_text(title);
++    // (the first page has the game's name in the heading's right half)
++    const int title_left = m_icon ? 18 + k_icon_size + 12 : 20;
++    set_fitting_text(m_title, title, static_cast<uint16_t>((m_pages.size() == 1 ? k_card_w / 2 : k_card_w - 20) - title_left));
 +    build_hints();
 +
 +    // on a line that can be picked
@@ -4146,9 +4304,9 @@ index 3e2404bb..0ca2475e 100644
 +        const int16_t text_y = static_cast<int16_t>(y + (h - font) / 2 + k_text_voffset);
 +        const uint16_t inset = r.type == row_kind::section ? 4 : k_text_inset;
 +        r.text.set_pos(static_cast<int16_t>(row_x + inset), text_y);
-+        r.text.set_size(static_cast<uint16_t>(k_row_w * 3 / 5 - inset), font + 4);
-+        r.value_text.set_pos(static_cast<int16_t>(row_x + k_row_w * 2 / 5), text_y);
-+        r.value_text.set_size(static_cast<uint16_t>(k_row_w * 3 / 5 - k_text_inset), font + 4);
++        r.text.set_size(static_cast<uint16_t>(r.name_w + 4), font + 4);
++        r.value_text.set_pos(static_cast<int16_t>(row_x + k_row_w - k_text_inset - r.value_w - 4), text_y);
++        r.value_text.set_size(static_cast<uint16_t>(r.value_w + 4), font + 4);
 +        y = static_cast<int16_t>(y + h + k_row_gap);
      }
  
@@ -4182,7 +4340,7 @@ index 3e2404bb..0ca2475e 100644
      }
  }
  
-@@ -124,61 +297,128 @@ bool pause_overlay::poll_dialog(DialogState &dialog, int date_format, int sys_bu
+@@ -124,61 +358,128 @@ bool pause_overlay::poll_dialog(DialogState &dialog, int date_format, int sys_bu
      return true;
  }
  
@@ -4350,7 +4508,7 @@ index 3e2404bb..0ca2475e 100644
              return;
          }
      }
-@@ -190,19 +430,47 @@ compiled_resource pause_overlay::get_compiled() {
+@@ -190,19 +491,47 @@ compiled_resource pause_overlay::get_compiled() {
      if (!visible)
          return result;
  
@@ -4387,7 +4545,7 @@ index 3e2404bb..0ca2475e 100644
 +            const int current = (count > 0 && item.get) ? std::clamp(item.get(), 0, count - 1) : -1;
 +            if (current != r.shown) {
 +                r.shown = current;
-+                r.value_text.set_text(current < 0 ? std::string() : item.set ? "<  " + item.values[current] + "  >" : item.values[current]);
++                set_fitting_text(r.value_text, current < 0 ? std::string() : choice_text(item, current), r.value_w);
 +            }
 +            result.add(r.value_text.get_compiled());
 +        } else if (r.type == row_kind::page) {
@@ -4406,7 +4564,7 @@ index 3e2404bb..0ca2475e 100644
  
      return result;
  }
-@@ -219,13 +487,7 @@ bool pause_overlay::is_cancel_button(pad_button button) const {
+@@ -219,13 +548,7 @@ bool pause_overlay::is_cancel_button(pad_button button) const {
      return button == pad_button::circle;
  }
  
@@ -4421,7 +4579,7 @@ index 3e2404bb..0ca2475e 100644
      const float pulse = 0.5f + 0.5f * std::sin(m_focus_pulse_time * 3.0f);
      const float a = 0.85f + 0.15f * pulse;
  
-@@ -235,7 +497,7 @@ void pause_overlay::draw_focus_ring(compiled_resource &res) const {
+@@ -235,7 +558,7 @@ void pause_overlay::draw_focus_ring(compiled_resource &res) const {
      ring.back_color = { k_color_focus_ring.r, k_color_focus_ring.g, k_color_focus_ring.b, 0.15f * a };
      ring.border_size = k_focus_ring_thickness;
      ring.border_color = { k_color_focus_ring.r, k_color_focus_ring.g, k_color_focus_ring.b, a };
@@ -4431,7 +4589,7 @@ index 3e2404bb..0ca2475e 100644
  }
  
 diff --git a/vita3k/overlay/src/perf_overlay.cpp b/vita3k/overlay/src/perf_overlay.cpp
-index b5b30616..7f14196b 100644
+index b5b30616..f0e13b5d 100644
 --- a/vita3k/overlay/src/perf_overlay.cpp
 +++ b/vita3k/overlay/src/perf_overlay.cpp
 @@ -26,6 +26,10 @@
@@ -4451,9 +4609,9 @@ index b5b30616..7f14196b 100644
      std::string text;
 +    std::string fps = std::to_string(m_fps);
 +#ifdef __PS4__
-+    // frame generation: the game's frames and the in-between ones
-+    if (ps4_frame_doubling())
-+        fps = fmt::format("{} ({} on screen)", m_fps, std::min<uint32_t>(m_fps * 2, 60));
++    // frame generation: the screen gets 60 images a second, the game's frames and made ones
++    if (ps4_frame_doubling() && m_fps < 58)
++        fps = fmt::format("{} (60 on screen)", m_fps);
 +#endif
  
      switch (m_detail) {
@@ -4560,10 +4718,67 @@ index a2e1a30f..d4543455 100644
 +bool get_param_info(sfo::SfoAppInfo &app_info, const vfs::FileBuffer &param, int sys_lang);
  } // namespace sfo
 diff --git a/vita3k/packages/src/pkg.cpp b/vita3k/packages/src/pkg.cpp
-index 1c5a5bd0..37c4fa15 100644
+index 1c5a5bd0..7f20a3b6 100644
 --- a/vita3k/packages/src/pkg.cpp
 +++ b/vita3k/packages/src/pkg.cpp
-@@ -209,7 +209,21 @@ bool install_pkg(const fs::path &pkg_path, EmuEnvState &emuenv, std::string &p_z
+@@ -27,6 +27,7 @@
+ #include <rif2zrif.h>
+ 
+ #include <io/functions.h>
++#include <io/vfs.h>
+ 
+ #include <config/state.h>
+ #include <emuenv/state.h>
+@@ -40,6 +41,9 @@
+ #include <util/bytes.h>
+ #include <util/log.h>
+ 
++#include <algorithm>
++#include <cctype>
++
+ // Credits to mmozeiko https://github.com/mmozeiko/pkg2zip
+ 
+ static void ctr_init(uint8_t *counter, uint8_t *iv, uint64_t n) {
+@@ -64,12 +68,33 @@ bool decrypt_install_nonpdrm(EmuEnvState &emuenv, const fs::path &drmlicpath, co
+     F00DEncryptorTypes f00d_enc_type = F00DEncryptorTypes::native;
+     std::string f00d_arg = std::string();
+ 
+-    PfsProgressCallback pfs_progress = nullptr;
+-    if (progress_callback) {
+-        pfs_progress = [&progress_callback](std::uint64_t processed, std::uint64_t total, const std::string &) {
++    // Each encrypted file goes as soon as its decrypted copy is written (the parser has read what it
++    // needs of the dump before): the dump needs room for one more file, not a whole second copy of
++    // itself (a game copied in encrypted, NPS Browser's, filled a PS4's storage). The parser names each
++    // file by its full path (the dump's folder, then files.db's names), once before it and once after.
++    // The license (sce_sys/package) stays: it's copied after.
++    const std::string source_root = title_id_src.generic_string();
++    std::uint64_t done_bytes = 0;
++    const PfsProgressCallback pfs_progress = [&](std::uint64_t processed, std::uint64_t total, const std::string &file) {
++        if (processed > done_bytes) {
++            done_bytes = processed;
++            std::string relative = file.size() > source_root.size() && file.compare(0, source_root.size(), source_root) == 0 ? file.substr(source_root.size()) : std::string();
++            while (!relative.empty() && relative.front() == '/')
++                relative.erase(0, 1);
++            std::string upper = relative;
++            std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
++            if (!relative.empty() && relative.find("..") == std::string::npos && !upper.starts_with("SCE_SYS/PACKAGE") && !upper.starts_with("SCE_PFS")) {
++                boost::system::error_code ec;
++                fs::path source = title_id_src / fs_utils::utf8_to_path(relative);
++                if (!fs::is_regular_file(source, ec))
++                    source = vfs::find_case_insensitive(title_id_src, fs_utils::utf8_to_path(relative));
++                if (!source.empty() && fs::is_regular_file(source, ec))
++                    fs::remove(source, ec);
++            }
++        }
++        if (progress_callback)
+             progress_callback(total ? static_cast<float>(processed) / static_cast<float>(total) : 1.f);
+-        };
+-    }
++    };
+ 
+     if ((execute(zRIF, title_id_src, title_id_dst, f00d_enc_type, f00d_arg, pfs_progress) < 0) && (title_path.string().find("theme") == std::string::npos))
+         return false;
+@@ -209,7 +234,21 @@ bool install_pkg(const fs::path &pkg_path, EmuEnvState &emuenv, std::string &p_z
      fseek(infile, sfo_offset, SEEK_SET);
      fread(sfo_buffer.data(), sfo_buffer.size(), 1, infile);
      sfo::load(sfo_file, sfo_buffer);
@@ -5756,10 +5971,10 @@ index 00000000..6f5ad8c6
 +} // namespace ps4ui
 diff --git a/vita3k/ps4/ps4_controls.cpp b/vita3k/ps4/ps4_controls.cpp
 new file mode 100644
-index 00000000..e8d5cffe
+index 00000000..8a9d8601
 --- /dev/null
 +++ b/vita3k/ps4/ps4_controls.cpp
-@@ -0,0 +1,297 @@
+@@ -0,0 +1,294 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -5815,7 +6030,7 @@ index 00000000..e8d5cffe
 +const float PLACES[9][2] = { { 0.5f, 0.5f }, { 0.2f, 0.5f }, { 0.8f, 0.5f }, { 0.5f, 0.2f }, { 0.5f, 0.8f }, { 0.2f, 0.2f }, { 0.8f, 0.2f },
 +    { 0.2f, 0.8f }, { 0.8f, 0.8f } };
 +
-+const char *const TOUCHPAD_NAMES[TouchpadUseCount] = { "Front screen", "Rear touch pad", "Left half front, right half rear", "Nothing" };
++const char *const TOUCHPAD_NAMES[TouchpadUseCount] = { "Front", "Rear", "Both halves", "Off" };
 +const char *const TOUCHPAD_KEYS[TouchpadUseCount] = { "front", "back", "split", "off" };
 +
 +// The actions' names in the menus and keys in the files
@@ -5826,11 +6041,11 @@ index 00000000..e8d5cffe
 +    static const std::vector<ActionName> names = [] {
 +        std::vector<ActionName> list = { { "Nothing", "none" }, { "Cross", "cross" }, { "Circle", "circle" }, { "Square", "square" },
 +            { "Triangle", "triangle" }, { "Up", "up" }, { "Down", "down" }, { "Left", "left" }, { "Right", "right" }, { "L", "l" }, { "R", "r" },
-+            { "START", "start" }, { "SELECT", "select" }, { "PS TV L2 (PS TV games)", "l2" }, { "PS TV R2 (PS TV games)", "r2" }, { "PS TV L3 (PS TV games)", "l3" }, { "PS TV R3 (PS TV games)", "r3" } };
++            { "START", "start" }, { "SELECT", "select" }, { "PS TV L2", "l2" }, { "PS TV R2", "r2" }, { "PS TV L3", "l3" }, { "PS TV R3", "r3" } };
 +        for (int i = 0; i < 9; i++)
-+            list.push_back({ std::string("Front touch, ") + PLACE_NAMES[i], std::string("front-") + PLACE_KEYS[i] });
++            list.push_back({ std::string("Front ") + PLACE_NAMES[i], std::string("front-") + PLACE_KEYS[i] });
 +        for (int i = 0; i < 9; i++)
-+            list.push_back({ std::string("Rear touch, ") + PLACE_NAMES[i], std::string("back-") + PLACE_KEYS[i] });
++            list.push_back({ std::string("Rear ") + PLACE_NAMES[i], std::string("back-") + PLACE_KEYS[i] });
 +        return list;
 +    }();
 +    return names;
@@ -6009,7 +6224,7 @@ index 00000000..e8d5cffe
 +std::vector<Item> items(const std::string &app_path) {
 +    std::vector<Item> list;
 +    if (!app_path.empty()) {
-+        list.push_back(choice("Controls used", { "All games' controls", "This game's own" },
++        list.push_back(choice("Controls", { "All games", "This game" },
 +            [app_path] {
 +                const std::lock_guard<std::recursive_mutex> lock(mutex);
 +                static std::map<std::string, bool> own;
@@ -6025,21 +6240,19 @@ index 00000000..e8d5cffe
 +                else if (value == 0)
 +                    std::remove(file_of(app_path).c_str());
 +                reload_running();
-+            },
-+            "changes below go to the controls used"));
++            }));
 +    }
 +
 +    std::vector<std::string> touchpad_names(std::begin(TOUCHPAD_NAMES), std::end(TOUCHPAD_NAMES));
 +    list.push_back(section("Touch pad"));
-+    list.push_back(choice("Touch pad surface", touchpad_names,
++    list.push_back(choice("Touch pad", touchpad_names,
 +        [app_path] { return static_cast<int>(effective(app_path).touchpad); },
-+        [app_path](int value) { change(app_path, [value](Controls &c) { c.touchpad = static_cast<uint8_t>(value); }); },
-+        "the Vita's front screen or rear touch pad"));
++        [app_path](int value) { change(app_path, [value](Controls &c) { c.touchpad = static_cast<uint8_t>(value); }); }));
 +
 +    std::vector<std::string> action_labels;
 +    for (const ActionName &name : action_names())
 +        action_labels.push_back(name.label);
-+    list.push_back(section("Buttons (L3 + R3 together still opens this menu)"));
++    list.push_back(section("Buttons"));
 +    for (int b = 0; b < PadButtonCount; b++) {
 +        list.push_back(choice(PAD_NAMES[b], action_labels,
 +            [app_path, b] { return static_cast<int>(effective(app_path).button[b]); },
@@ -6047,11 +6260,10 @@ index 00000000..e8d5cffe
 +    }
 +    Item reset;
 +    reset.type = Item::kind::action;
-+    reset.name = "Back to HENkaku's layout";
++    reset.name = "Reset buttons";
 +    reset.run = [app_path] {
 +        change(app_path, [](Controls &c) { c = defaults(); });
 +    };
-+    list.push_back(section("Touch: a button held = a finger on that place"));
 +    list.push_back(reset);
 +    return list;
 +}
@@ -6398,10 +6610,10 @@ index 00000000..01fdf0f1
 +} // namespace ps4download
 diff --git a/vita3k/ps4/ps4_launcher.cpp b/vita3k/ps4/ps4_launcher.cpp
 new file mode 100644
-index 00000000..17f20193
+index 00000000..2d91803f
 --- /dev/null
 +++ b/vita3k/ps4/ps4_launcher.cpp
-@@ -0,0 +1,2944 @@
+@@ -0,0 +1,2956 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -7106,7 +7318,9 @@ index 00000000..17f20193
 +    return vitamin;
 +}
 +
-+// Decrypts it in place with its work.bin, as installing the dump would have, license and all
++// Decrypts it in place with its work.bin, as installing the dump would have, license and all: the
++// decrypted copy grows as the dump shrinks (decrypt_install_nonpdrm removes each encrypted file once
++// it's decrypted), so it needs room for one file more, not a second copy of the game
 +void decrypt_worker(EmuEnvState &emuenv, InstallJob &job, const fs::path &app_dir, const std::string &title) {
 +    {
 +        const std::lock_guard<std::mutex> lock(job.mutex);
@@ -7140,7 +7354,8 @@ index 00000000..17f20193
 +        job.installed = 1;
 +        job.done.push_back(title);
 +    } else {
-+        job.failures.push_back("Couldn't decrypt " + title + ": see /data/Vita3K/vita3k.log");
++        // (its files go as they're decrypted: what's left of it can't start)
++        job.failures.push_back("Couldn't decrypt " + title + ": copy it again (see /data/Vita3K/vita3k.log)");
 +    }
 +    job.finished = true;
 +}
@@ -8561,18 +8776,27 @@ index 00000000..17f20193
 +        c.fill_round_rect(MARGIN, y, W - 2 * MARGIN, h - 10, 18, sel ? rgb(0x2a6fd6, 120) : rgb(0xffffff, 14));
 +        if (sel)
 +            c.fill_round_rect(MARGIN, y + 16, 6, h - 42, 3, ACCENT);
-+        const int name_w = c.text(MARGIN + 38, y + 47, item.name, 32, TEXT, sel ? Weight::Bold : Weight::Regular, 900);
 +        const int right = W - MARGIN - 38;
++        // the value first: the name, then its note, get the room left of it (cut with "...")
++        std::string value_text;
++        int value_px = 30;
 +        if (item.type == SItem::kind::choice) {
-+            if (!item.note.empty())
-+                c.text(MARGIN + 38 + name_w + 18, y + 45, item.note, 24, MUTED);
 +            const int value = choice_value(item);
-+            const std::string text = value < 0 ? std::string() : item.set ? "<   " + item.values[value] + "   >" : item.values[value];
-+            c.text(right - c.text_width(text, 30, Weight::Bold), y + 46, text, 30, sel ? TEXT : ACCENT, Weight::Bold);
++            value_text = value < 0 ? std::string() : item.set ? "<   " + item.values[value] + "   >" : item.values[value];
 +        } else if (item.type == SItem::kind::page) {
-+            const std::string text = item.note.empty() ? std::string(">") : item.note + "     >";
-+            c.text(right - c.text_width(text, 28), y + 46, text, 28, MUTED);
++            value_text = ">";
++            value_px = 28;
 +        }
++        const int value_w = value_text.empty() ? 0 : std::min(c.text_width(value_text, value_px, Weight::Bold), (W - 2 * MARGIN) / 2);
++        const int name_room = right - (value_w ? value_w + 40 : 0) - (MARGIN + 38);
++        const int name_w = c.text(MARGIN + 38, y + 47, item.name, 32, TEXT, sel ? Weight::Bold : Weight::Regular, name_room);
++        const int note_x = MARGIN + 38 + name_w + 18, note_room = right - (value_w ? value_w + 40 : 0) - note_x;
++        if (item.type == SItem::kind::choice && !item.note.empty() && note_room > 120)
++            c.text(note_x, y + 45, item.note, 24, MUTED, Weight::Regular, note_room);
++        if (item.type == SItem::kind::choice)
++            c.text(right - value_w, y + 46, value_text, value_px, sel ? TEXT : ACCENT, Weight::Bold, value_w);
++        else if (item.type == SItem::kind::page)
++            c.text(right - value_w, y + 46, value_text, value_px, MUTED);
 +        y += h;
 +    }
 +    // more above or below
@@ -10861,10 +11085,10 @@ index 00000000..4291971e
 +} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_settings.cpp b/vita3k/ps4/ps4_settings.cpp
 new file mode 100644
-index 00000000..1246640b
+index 00000000..65bfd567
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.cpp
-@@ -0,0 +1,714 @@
+@@ -0,0 +1,712 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -11134,7 +11358,7 @@ index 00000000..1246640b
 +    Item item;
 +    item.type = Item::kind::choice;
 +    item.name = "Show FPS";
-+    item.values = { "Off", "FPS", "FPS + frame time", "FPS + min / avg / max", "FPS + graph" };
++    item.values = { "Off", "FPS", "FPS + ms", "Details", "Graph" };
 +    item.get = [&emuenv] {
 +        const std::lock_guard<std::mutex> lock(settings_mutex);
 +        return emuenv.cfg.performance_overlay ? std::clamp(emuenv.cfg.performance_overlay_detail + 1, 1, 4) : 0;
@@ -11151,7 +11375,7 @@ index 00000000..1246640b
 +}
 +
 +Item fsr_sharpness(EmuEnvState &emuenv) {
-+    return pref_choice("FSR 1 sharpness", { "Sharpest", "Sharp (default)", "Medium", "Soft", "Softest" },
++    return pref_choice("FSR sharpness", { "Sharpest", "Sharp", "Medium", "Soft", "Softest" },
 +        [](const Prefs &p) { return p.fsr_sharpness; },
 +        [&emuenv](Prefs &p, int value) {
 +            p.fsr_sharpness = value;
@@ -11175,24 +11399,24 @@ index 00000000..1246640b
 +        items.push_back(fsr_sharpness(emuenv));
 +        items.push_back(frame_generation_choice());
 +    }
-+    items.push_back(choice<int>(scope, "Texture filtering", { "Standard", "2x anisotropic", "4x anisotropic", "8x anisotropic", "16x anisotropic" }, { 1, 2, 4, 8, 16 }, &Config::CurrentConfig::anisotropic_filtering));
++    items.push_back(choice<int>(scope, "Texture filtering", { "Standard", "2x", "4x", "8x", "16x" }, { 1, 2, 4, 8, 16 }, &Config::CurrentConfig::anisotropic_filtering));
 +    return items;
 +}
 +
 +std::vector<Item> graphics_items(EmuEnvState &emuenv, const std::shared_ptr<Scope> &scope, bool global, const std::string &next_start) {
 +    std::vector<Item> items;
 +    items.push_back(section("Rendering"));
-+    items.push_back(choice<float>(scope, "Resolution", { "960x544 (1x)", "1440x816 (1.5x)", "1920x1088 (2x)" }, { 1.0f, 1.5f, 2.0f }, &Config::CurrentConfig::resolution_multiplier, next_start));
++    items.push_back(choice<float>(scope, "Resolution", { "1x", "1.5x", "2x" }, { 1.0f, 1.5f, 2.0f }, &Config::CurrentConfig::resolution_multiplier, next_start));
 +    items.push_back(choice<bool>(scope, "GPU accuracy", { "Standard", "High" }, { false, true }, &Config::CurrentConfig::high_accuracy, next_start));
 +    // Vita3K's "disable surface sync", the other way round
-+    items.push_back(choice<bool>(scope, "Frame read-back", { "Off (faster)", "On (for games that read their frames)" }, { true, false }, &Config::CurrentConfig::disable_surface_sync));
++    items.push_back(choice<bool>(scope, "Frame read-back", { "Off", "On" }, { true, false }, &Config::CurrentConfig::disable_surface_sync));
 +    items.push_back(section("Shaders and textures"));
-+    items.push_back(choice<bool>(scope, "Shader compiling", { "In the background", "Before drawing" }, { true, false }, &Config::CurrentConfig::async_pipeline_compilation));
++    items.push_back(choice<bool>(scope, "Shader compiling", { "Background", "Before drawing" }, { true, false }, &Config::CurrentConfig::async_pipeline_compilation));
 +    if (global)
-+        items.push_back(global_choice<bool>(emuenv, "Texture checks", { "Hash each use", "Watch writes" }, { false, true }, &Config::hashless_texture_cache, next_start));
++        items.push_back(global_choice<bool>(emuenv, "Texture checks", { "Hash", "Watch writes" }, { false, true }, &Config::hashless_texture_cache, next_start));
 +    items.push_back(section("Frame rate"));
 +    // a game that waits for two vblanks a frame (30 fps) waits for one
-+    items.push_back(choice<bool>(scope, "FPS hack (30 to 60)", { "Off", "On" }, { false, true }, &Config::CurrentConfig::fps_hack));
++    items.push_back(choice<bool>(scope, "FPS hack", { "Off", "On" }, { false, true }, &Config::CurrentConfig::fps_hack));
 +    return items;
 +}
 +
@@ -11205,7 +11429,7 @@ index 00000000..1246640b
 +    }
 +    std::vector<Item> items;
 +    items.push_back(choice<int>(scope, "Volume", labels, volumes, &Config::CurrentConfig::audio_volume));
-+    items.push_back(choice<bool>(scope, "NGS (the Vita's audio engine)", { "On", "Off" }, { true, false }, &Config::CurrentConfig::ngs_enable, next_start));
++    items.push_back(choice<bool>(scope, "NGS audio", { "On", "Off" }, { true, false }, &Config::CurrentConfig::ngs_enable, next_start));
 +    return items;
 +}
 +
@@ -11215,8 +11439,7 @@ index 00000000..1246640b
 +    constexpr uint32_t DARK = 0xFF000000, BRIGHT = 0xFFFFFFFF;
 +    Item item;
 +    item.type = Item::kind::choice;
-+    item.name = "Camera picture";
-+    item.note = "bright passes light puzzles";
++    item.name = "Camera";
 +    item.values = { "Dark", "Bright" };
 +    item.get = [&emuenv] {
 +        const std::lock_guard<std::mutex> lock(settings_mutex);
@@ -11236,13 +11459,13 @@ index 00000000..1246640b
 +}
 +
 +Item frame_generation_choice() {
-+    return pref_choice("Frame generation", { "Off", "On (games under 50 fps shown at 60)" },
++    return pref_choice("Frame generation", { "Off", "On" },
 +        [](const Prefs &p) { return p.frame_generation ? 1 : 0; },
-+        [](Prefs &p, int value) { p.frame_generation = value == 1; }, "in-between frames, a frame more of delay");
++        [](Prefs &p, int value) { p.frame_generation = value == 1; });
 +}
 +
 +Item frame_queue_choice() {
-+    return pref_choice("Frame queue", { "Vita3K's (waits for each frame)", "As on the Vita (smoother)" },
++    return pref_choice("Frame queue", { "Vita3K", "PS Vita" },
 +        [](const Prefs &p) { return p.frame_overlap ? 1 : 0; },
 +        [](Prefs &p, int value) { p.frame_overlap = value == 1; }, {});
 +}
@@ -11262,11 +11485,10 @@ index 00000000..1246640b
 +    items.push_back(section("HENkaku"));
 +    items.push_back(info("Made by", AUTHOR));
 +    items.push_back(info("GitHub", AUTHOR_GITHUB));
-+    items.push_back(info("What it is", "PS Vita games on the PS4"));
 +    items.push_back(section("Powered by"));
-+    items.push_back(info("Emulator", "Vita3K (GPL-2.0 or later)"));
-+    items.push_back(info("Graphics", "Mesa RADV on the PS4's GPU"));
-+    items.push_back(info("Logo", "HENkaku's, by team molecule"));
++    items.push_back(info("Emulator", "Vita3K"));
++    items.push_back(info("Graphics", "Mesa RADV"));
++    items.push_back(info("Logo", "team molecule"));
 +    return items;
 +}
 +
@@ -11280,9 +11502,9 @@ index 00000000..1246640b
 +        [](Prefs &p, int value) { p.theme = value; }));
 +    items.push_back(pref_choice("Moving wallpaper", { "Off", "On" },
 +        [](const Prefs &p) { return p.moving_wallpaper ? 1 : 0; },
-+        [](Prefs &p, int value) { p.moving_wallpaper = value == 1; }, "the wave"));
++        [](Prefs &p, int value) { p.moving_wallpaper = value == 1; }));
 +    std::vector<std::string> files = wallpaper_files();
-+    std::vector<std::string> labels{ "The theme's wave" };
++    std::vector<std::string> labels{ "Wave" };
 +    labels.insert(labels.end(), files.begin(), files.end());
 +    items.push_back(pref_choice("Wallpaper", labels,
 +        [files](const Prefs &p) {
@@ -11290,7 +11512,7 @@ index 00000000..1246640b
 +            return it == files.end() ? 0 : static_cast<int>(it - files.begin()) + 1;
 +        },
 +        [files](Prefs &p, int value) { p.wallpaper = value == 0 ? std::string() : files[value - 1]; }));
-+    items.push_back(section(files.empty() ? "Pictures: copy .png or .jpg files to " + wallpaper_dir() : "More pictures: " + wallpaper_dir()));
++    items.push_back(section("Pictures: " + wallpaper_dir()));
 +    return items;
 +}
 +
@@ -11298,31 +11520,31 @@ index 00000000..1246640b
 +// is wrong
 +std::vector<Item> diagnostics_items() {
 +    std::vector<Item> items;
-+    items.push_back(section("In /data/Vita3K/vita3k.log"));
-+    items.push_back(pref_choice("Game code profiler", { "Off", "On" },
++    items.push_back(section("Logged to vita3k.log"));
++    items.push_back(pref_choice("Game profiler", { "Off", "On" },
 +        [](const Prefs &p) { return p.profiler ? 1 : 0; },
-+        [](Prefs &p, int value) { p.profiler = value == 1; }, "the hottest game code every 10 s"));
++        [](Prefs &p, int value) { p.profiler = value == 1; }));
 +    items.push_back(pref_choice("Freeze log", { "Off", "On" },
 +        [](const Prefs &p) { return p.freeze_log ? 1 : 0; },
-+        [](Prefs &p, int value) { p.freeze_log = value == 1; }, "what a stuck game waits for"));
++        [](Prefs &p, int value) { p.freeze_log = value == 1; }));
 +    items.push_back(pref_choice("Format log", { "Off", "On" },
 +        [](const Prefs &p) { return p.format_log ? 1 : 0; },
-+        [](Prefs &p, int value) { p.format_log = value == 1; }, "the vertex and texture formats a game uses"));
++        [](Prefs &p, int value) { p.format_log = value == 1; }));
 +    items.push_back(pref_choice("Renderer profiler", { "Off", "On" },
 +        [](const Prefs &p) { return p.host_profiler ? 1 : 0; },
-+        [](Prefs &p, int value) { p.host_profiler = value == 1; }, "where HENkaku's render thread spends its time"));
++        [](Prefs &p, int value) { p.host_profiler = value == 1; }));
 +    return items;
 +}
 +
 +std::vector<Item> cpu_items(const std::shared_ptr<Scope> &scope, bool global, const std::string &next_start) {
 +    std::vector<Item> items;
-+    items.push_back(choice<bool>(scope, "CPU optimisations", { "On (fast)", "Off (accurate, slow)" }, { true, false }, &Config::CurrentConfig::cpu_opt, next_start));
++    items.push_back(choice<bool>(scope, "CPU optimisations", { "On", "Off" }, { true, false }, &Config::CurrentConfig::cpu_opt, next_start));
 +    if (global) {
-+        items.push_back(pref_choice("Game threads", { "On all cores", "On one cluster" },
++        items.push_back(pref_choice("Game threads", { "All cores", "One cluster" },
 +            [](const Prefs &p) { return p.cluster_threads ? 1 : 0; },
 +            [](Prefs &p, int value) { p.cluster_threads = value == 1; }, next_start));
 +        items.push_back(frame_queue_choice());
-+        items.push_back(pref_choice("Threads on one Vita core", { "Side by side", "One at a time (as on the Vita)" },
++        items.push_back(pref_choice("Vita core threads", { "Side by side", "One at a time" },
 +            [](const Prefs &p) { return p.vita_cores ? 1 : 0; },
 +            [](Prefs &p, int value) { p.vita_cores = value == 1; }, {}));
 +    }
@@ -11484,31 +11706,31 @@ index 00000000..1246640b
 +    const std::string next_start = "next start";
 +    std::vector<Item> pages;
 +    pages.push_back(section("All games"));
-+    pages.push_back(page("Display", display_items(emuenv, scope, true), "FPS, filters, FSR 1"));
-+    pages.push_back(page("Graphics", graphics_items(emuenv, scope, true, next_start), "resolution, accuracy"));
-+    pages.push_back(page("Audio", audio_items(scope, next_start), "volume"));
-+    pages.push_back(page("CPU", cpu_items(scope, true, next_start), "dynarmic, cores"));
++    pages.push_back(page("Display", display_items(emuenv, scope, true)));
++    pages.push_back(page("Graphics", graphics_items(emuenv, scope, true, next_start)));
++    pages.push_back(page("Audio", audio_items(scope, next_start)));
++    pages.push_back(page("CPU", cpu_items(scope, true, next_start)));
 +    {
 +        std::vector<Item> controls = ps4controls::items({});
 +        controls.push_back(section("Camera"));
 +        controls.push_back(camera_choice(emuenv));
-+        pages.push_back(page("Controls", std::move(controls), "buttons, touch, camera"));
++        pages.push_back(page("Controls", std::move(controls)));
 +    }
 +
 +    std::vector<Item> system;
 +    system.push_back(section("Home screen"));
-+    system.push_back(pref_choice("Style", { "PS Vita (bubbles)", "List" },
++    system.push_back(pref_choice("Style", { "Bubbles", "List" },
 +        [](const Prefs &p) { return p.bubbles ? 0 : 1; },
 +        [](Prefs &p, int value) { p.bubbles = value == 0; }));
 +    system.push_back(section("Buttons"));
-+    system.push_back(global_choice<int>(emuenv, "Enter button (games)", { "Cross", "Circle" },
++    system.push_back(global_choice<int>(emuenv, "Enter button", { "Cross", "Circle" },
 +        { static_cast<int>(SCE_SYSTEM_PARAM_ENTER_BUTTON_CROSS), static_cast<int>(SCE_SYSTEM_PARAM_ENTER_BUTTON_CIRCLE) },
 +        &Config::sys_button, next_start));
 +    pages.push_back(section("PS4"));
-+    pages.push_back(page("Look", look_items(), "theme, wallpaper"));
-+    pages.push_back(page("System", std::move(system), "home screen, buttons"));
-+    pages.push_back(page("Diagnostics", diagnostics_items(), "profilers and logs, each can be off"));
-+    pages.push_back(page("About", about_items(), AUTHOR));
++    pages.push_back(page("Look", look_items()));
++    pages.push_back(page("System", std::move(system)));
++    pages.push_back(page("Diagnostics", diagnostics_items()));
++    pages.push_back(page("About", about_items()));
 +    return pages;
 +}
 +
@@ -11517,13 +11739,13 @@ index 00000000..1246640b
 +    const std::string next_start = "next start";
 +    std::vector<Item> pages;
 +    pages.push_back(section("This game"));
-+    pages.push_back(page("Display", display_items(emuenv, scope, false), "filters"));
-+    pages.push_back(page("Graphics", graphics_items(emuenv, scope, false, next_start), "resolution, accuracy"));
-+    pages.push_back(page("Audio", audio_items(scope, next_start), "volume"));
-+    pages.push_back(page("CPU", cpu_items(scope, false, next_start), "dynarmic"));
-+    pages.push_back(page("Controls", ps4controls::items(app_path), "buttons, touch pad, rear touch"));
-+    pages.push_back(section("Saved in config/config_" + app_path + ".xml"));
-+    pages.push_back(action("Use the settings of all games", [scope] {
++    pages.push_back(page("Display", display_items(emuenv, scope, false)));
++    pages.push_back(page("Graphics", graphics_items(emuenv, scope, false, next_start)));
++    pages.push_back(page("Audio", audio_items(scope, next_start)));
++    pages.push_back(page("CPU", cpu_items(scope, false, next_start)));
++    pages.push_back(page("Controls", ps4controls::items(app_path)));
++    pages.push_back(section("Reset"));
++    pages.push_back(action("Use all games' settings", [scope] {
 +        const std::lock_guard<std::mutex> lock(settings_mutex);
 +        scope->use_global();
 +    }));
@@ -11543,7 +11765,7 @@ index 00000000..1246640b
 +    display.push_back(choice<std::string>(live, "Screen filter", FILTER_NAMES, FILTERS, &Config::CurrentConfig::screen_filter));
 +    display.push_back(fsr_sharpness(emuenv));
 +    display.push_back(frame_generation_choice());
-+    display.push_back(choice<int>(live, "Texture filtering", { "Standard", "2x anisotropic", "4x anisotropic", "8x anisotropic", "16x anisotropic" }, { 1, 2, 4, 8, 16 }, &Config::CurrentConfig::anisotropic_filtering));
++    display.push_back(choice<int>(live, "Texture filtering", { "Standard", "2x", "4x", "8x", "16x" }, { 1, 2, 4, 8, 16 }, &Config::CurrentConfig::anisotropic_filtering));
 +
 +    std::vector<Item> sound;
 +    std::vector<std::string> labels;
@@ -11555,26 +11777,26 @@ index 00000000..1246640b
 +    sound.push_back(choice<int>(live, "Volume", labels, volumes, &Config::CurrentConfig::audio_volume));
 +
 +    std::vector<Item> speed;
-+    speed.push_back(choice<bool>(live, "Shader compiling", { "In the background", "Before drawing" }, { true, false }, &Config::CurrentConfig::async_pipeline_compilation));
-+    speed.push_back(choice<bool>(live, "FPS hack (30 to 60)", { "Off", "On" }, { false, true }, &Config::CurrentConfig::fps_hack));
++    speed.push_back(choice<bool>(live, "Shader compiling", { "Background", "Before drawing" }, { true, false }, &Config::CurrentConfig::async_pipeline_compilation));
++    speed.push_back(choice<bool>(live, "FPS hack", { "Off", "On" }, { false, true }, &Config::CurrentConfig::fps_hack));
 +    speed.push_back(frame_queue_choice());
 +
 +    items.push_back(section("Now"));
-+    items.push_back(page("Display", std::move(display), "FPS, filters, FSR 1"));
-+    items.push_back(page("Audio", std::move(sound), "volume"));
-+    items.push_back(page("Speed", std::move(speed), "shaders, FPS hack"));
++    items.push_back(page("Display", std::move(display)));
++    items.push_back(page("Audio", std::move(sound)));
++    items.push_back(page("Speed", std::move(speed)));
 +    {
 +        std::vector<Item> controls = ps4controls::items(emuenv.io.app_path);
 +        controls.push_back(section("Camera"));
 +        controls.push_back(camera_choice(emuenv));
-+        items.push_back(page("Controls", std::move(controls), "buttons, touch, camera"));
++        items.push_back(page("Controls", std::move(controls)));
 +    }
-+    items.push_back(section("From the next start"));
++    items.push_back(section("Next start"));
 +    if (!emuenv.io.app_path.empty())
-+        items.push_back(page("This game", game_pages(emuenv, emuenv.io.app_path), "its own settings"));
++        items.push_back(page("This game", game_pages(emuenv, emuenv.io.app_path)));
 +    items.push_back(section("HENkaku"));
-+    items.push_back(page("Diagnostics", diagnostics_items(), "profilers and logs, each can be off"));
-+    items.push_back(page("About", about_items(), AUTHOR));
++    items.push_back(page("Diagnostics", diagnostics_items()));
++    items.push_back(page("About", about_items()));
 +    return items;
 +}
 +
@@ -12587,10 +12809,18 @@ index 00000000..ac02fed2
 +
 +} // namespace renderer::ps4stats
 diff --git a/vita3k/renderer/include/renderer/state.h b/vita3k/renderer/include/renderer/state.h
-index 65b81052..c999b5c1 100644
+index 65b81052..1c4506fd 100644
 --- a/vita3k/renderer/include/renderer/state.h
 +++ b/vita3k/renderer/include/renderer/state.h
-@@ -99,6 +99,8 @@ struct State {
+@@ -37,6 +37,7 @@
+ 
+ struct DialogState;
+ struct DisplayState;
++struct DisplayFrameInfo;
+ struct GxmState;
+ struct Config;
+ 
+@@ -99,6 +100,8 @@ struct State {
      Backend current_backend;
      FeatureState features;
      float res_multiplier;
@@ -12599,6 +12829,18 @@ index 65b81052..c999b5c1 100644
      bool disable_surface_sync;
      bool stretch_the_display_area;
      bool fullscreen_hd_res_pixel_perfect;
+@@ -124,6 +127,11 @@ struct State {
+     uint32_t programs_count_pre_compiled = 0;
+ 
+     bool should_display;
++    // frame generation (PS4): vblanks the screen should get an image for (the vblank thread counts
++    // them) and how many it got; the render loop stops for a present when they differ
++    std::atomic<uint64_t> present_ticks{ 0 };
++    uint64_t presented_ticks = 0;
++    bool tick_pending() const { return present_ticks.load(std::memory_order_relaxed) != presented_ticks; }
+ 
+     std::atomic<bool> async_flip_requested{ false };
+     std::atomic<int> pending_vsync{ -1 };
 diff --git a/vita3k/renderer/include/renderer/texture_cache.h b/vita3k/renderer/include/renderer/texture_cache.h
 index 3860cced..17284694 100644
 --- a/vita3k/renderer/include/renderer/texture_cache.h
@@ -12635,10 +12877,10 @@ index 3860cced..17284694 100644
      void refresh_available_textures();
 diff --git a/vita3k/renderer/include/renderer/vulkan/frame_generation.h b/vita3k/renderer/include/renderer/vulkan/frame_generation.h
 new file mode 100644
-index 00000000..3054d2aa
+index 00000000..9668d3fb
 --- /dev/null
 +++ b/vita3k/renderer/include/renderer/vulkan/frame_generation.h
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,129 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -12658,17 +12900,21 @@ index 00000000..3054d2aa
 +
 +#pragma once
 +
-+// Frame generation: for a game under about 50 fps (renderer.cpp: then held at 30), a frame in
-+// between the last two from the motion between them, shown a vblank before the new one, so the
-+// screen gets a frame every vblank. Three compute passes over the game's frame as Vita3K presents it
-+// (before the screen filter, which then scales the in-between frame like a real one):
++// Frame generation: the screen gets an image at every vblank, showing the game at that moment: one
++// of its frames, or a frame made between the two around that moment from the motion between them.
++// Motion is smooth whatever the game's frame rate (30, 45, 60), a few vblanks behind the game, and
++// the game isn't held back. The game's frames go into a history as they come (copied out of their
++// surface, with their luma and their motion from the frame before), on the frame generator's own
++// command buffers; each vblank's image is chosen (and made) in the screen's command buffer
++// (renderer.cpp, render_generated). Compute passes over the frames as Vita3K presents them (before
++// the screen filter, which then scales a made frame like a real one):
 +//   fg_copy    the frame copied out of its surface, and its luma at 1/scale of its size
-+//   fg_motion  per 8x8 luma block, a search for where it was in the previous frame: first on the
++//   fg_motion  per 8x8 luma block, a search for where it was in the frame before: first on the
 +//              luma at half size (camera pans), then on the luma from there; then a count of the
 +//              blocks that found no match or move unlike their neighbours (the judge)
-+//   fg_interp  each pixel along the best of the motions around it; the new frame's pixel where none
-+//              fits, and the whole new frame when the judge says the motion can't be trusted
-+// The frames alternate between two images; the in-between frame goes to a third.
++//   fg_interp  each pixel along the best of the motions around it, at the moment's place between the
++//              two frames; the nearer frame's pixel where none fits, and the whole nearer frame when
++//              the judge says the motion can't be trusted (a cut, a whip, a fade)
 +
 +#include <renderer/vulkan/state.h>
 +#include <vkutil/objects.h>
@@ -12682,12 +12928,19 @@ index 00000000..3054d2aa
 +    explicit FrameGenerator(VKState &state);
 +    ~FrameGenerator();
 +
-+    // Copies the frame (the view of its surface, the part the viewport says) into the history, in
-+    // cmd. With make_inbetween and a previous frame of the same size, also makes the in-between
-+    // frame: true then, and inbetween() and inbetween_viewport() are what to show first.
-+    bool record(vk::CommandBuffer cmd, uint32_t slot, vk::ImageView src, vk::ImageLayout src_layout, const Viewport &viewport, bool make_inbetween);
-+    vk::ImageView inbetween() const { return result.view; }
-+    Viewport inbetween_viewport() const;
++    // A frame of the game (the view of its surface, the part the viewport says), with its time in
++    // vblanks (when the game queued it) and the time now: into the history, with its motion from the
++    // frame before. Recorded and submitted at once.
++    void add_frame(vk::ImageView src, vk::ImageLayout src_layout, const Viewport &viewport, double time, double now);
++    // The time the game gave the newest frame (-1 without one): a frame with another is a new one
++    double newest_stamp() const { return newest_stamp_; }
++    // The image for the screen from vblank `vblank` on: the history's frame of that moment, or one
++    // made between two in cmd (for swapchain image `slot`). False without a frame.
++    bool image_for(vk::CommandBuffer cmd, uint32_t slot, double vblank, vk::ImageView &view, Viewport &viewport);
++    // Forgets the frames (frame generation was turned off)
++    void reset();
++    // False once its shaders or pipelines couldn't be made: the frames are shown as they come
++    bool usable() const { return !failed; }
 +
 +private:
 +    struct Constants {
@@ -12697,10 +12950,26 @@ index 00000000..3054d2aa
 +        uint32_t luma_w, luma_h;
 +        uint32_t blocks_w;
 +        uint32_t pass_index; // fg_motion: 0 the coarse pass, 1 the fine one, 2 the judge
++        float phase; // fg_interp: the moment between the two frames (0 the first, 1 the second)
 +    };
++    // a frame of the history: its picture, luma, motion from the frame before and the judge's counts
++    // for it, its time
++    struct Frame {
++        vkutil::Image image;
++        vkutil::Buffer luma;
++        vkutil::Buffer vectors;
++        vkutil::Buffer judge;
++        double time = 0.0;
++        bool valid = false;
++        // vectors from the frame before (not the first, nor after a long gap)
++        bool has_motion = false;
++    };
++    static constexpr int HISTORY = 5;
 +
 +    bool init();
 +    void resize(vk::CommandBuffer cmd, uint32_t width, uint32_t height);
++    void make_inbetween(vk::CommandBuffer cmd, uint32_t slot, int first, int second, float phase);
++    double latency_for_screen();
 +
 +    VKState &state;
 +    bool ready = false;
@@ -12712,20 +12981,32 @@ index 00000000..3054d2aa
 +    vk::PipelineLayout pipeline_layouts[3];
 +    vk::Pipeline pipelines[3];
 +    vk::DescriptorPool pool;
-+    // per swapchain slot: copy, motion, in-between
-+    std::vector<std::array<vk::DescriptorSet, 3>> sets;
++    // per history slot: copy, motion; per swapchain slot: in-between
++    std::array<vk::DescriptorSet, HISTORY> copy_sets{}, motion_sets{};
++    std::vector<vk::DescriptorSet> interp_sets;
++    // the command buffers adding frames (one per history slot) and their fences
++    vk::CommandPool command_pool;
++    std::array<vk::CommandBuffer, HISTORY> commands{};
++    std::array<vk::Fence, HISTORY> fences{};
 +
 +    uint32_t width = 0, height = 0, scale = 1, luma_w = 0, luma_h = 0, blocks_w = 0, blocks_h = 0;
-+    vkutil::Image frames[2];
-+    vkutil::Buffer luma[2];
-+    vkutil::Buffer vectors;
++    std::array<Frame, HISTORY> history;
++    int newest = -1;
++    double newest_stamp_ = -1.0;
++    // the coarse pass's vectors (the next one starts from them)
 +    vkutil::Buffer coarse;
-+    // fg_motion's counts: blocks without a match, blocks unlike their neighbours
-+    vkutil::Buffer judge;
 +    vkutil::Image result;
-+    // which of frames / luma the next frame goes to; whether the other one holds the last frame
-+    int next = 0;
-+    bool has_previous = false;
++
++    // the pacing (vblanks): how far apart frames come and how long they take to get here (averaged),
++    // where in a vblank they come (averaged on a circle), and how far behind the newest frame's time
++    // the screen is
++    double interval = 2.0;
++    double delay = 1.0;
++    double phase_x = 0.0, phase_y = 0.0;
++    // the frames come at the same point of each vblank (the game holds to its vblanks): their times
++    // are put on that point (the few ms they move around it are the game's work, not its motion)
++    bool steady = false;
++    double latency = 0.0;
 +};
 +
 +} // namespace renderer::vulkan
@@ -12901,26 +13182,10 @@ index 3efb94f7..96de53ee 100644
      bool create();
      // called after the logical device has been created
 diff --git a/vita3k/renderer/include/renderer/vulkan/state.h b/vita3k/renderer/include/renderer/vulkan/state.h
-index 1a5bc612..6ffca13e 100644
+index 1a5bc612..23edd187 100644
 --- a/vita3k/renderer/include/renderer/vulkan/state.h
 +++ b/vita3k/renderer/include/renderer/vulkan/state.h
-@@ -62,6 +62,15 @@ struct VKState : public renderer::State {
-     vk::Device device;
- 
-     ScreenRenderer screen_renderer;
-+    // frame generation's pacing (renderer.cpp render_frame): when the last frame came, how long this
-+    // thread waited for swapchain images since, the game's own time a frame (averaged), and whether
-+    // its frames get an in-between frame
-+    struct FramePacing {
-+        std::chrono::steady_clock::time_point last_frame{};
-+        double waited_ms = 0.0;
-+        double pace_ms = 0.0;
-+        bool doubling = false;
-+    } fg_pacing;
-     OverlayRenderer overlay_renderer;
- 
-     // Used for memory allocation and general query later.
-@@ -112,6 +121,8 @@ struct VKState : public renderer::State {
+@@ -112,6 +112,8 @@ struct VKState : public renderer::State {
      vkutil::Buffer default_buffer;
  
      bool support_fsr = false;
@@ -12929,6 +13194,18 @@ index 1a5bc612..6ffca13e 100644
      // support for the VK_KHR_uniform_buffer_standard_layout extension, needed for memory mapping and texture viewport
      bool support_standard_layout = false;
      bool support_rasterized_order_access = false;
+@@ -136,6 +138,11 @@ struct VKState : public renderer::State {
+ 
+     void render_frame(DisplayState &display, const GxmState &gxm, MemState &mem) override;
+     void swap_window() override;
++    // the screen's place in the window (and the touch screen's)
++    void update_viewport(DisplayState &display);
++    // frame generation (PS4): the frame into the frame generator, and the screen's image at a vblank;
++    // false for a frame it can't take (not drawn on the GPU)
++    bool render_generated(DisplayState &display, const DisplayFrameInfo &frame, double now, bool has_overlays, bool tick);
+     std::vector<uint32_t> dump_frame(DisplayState &display, uint32_t &width, uint32_t &height) override;
+ 
+     uint32_t get_features_mask() override;
 diff --git a/vita3k/renderer/include/renderer/vulkan/surface_cache.h b/vita3k/renderer/include/renderer/vulkan/surface_cache.h
 index 9da36e2e..3d4b37eb 100644
 --- a/vita3k/renderer/include/renderer/vulkan/surface_cache.h
@@ -13008,7 +13285,7 @@ index 4adf5464..2f68352b 100644
      vkutil::Image depthstencil;
      vkutil::Image mask;
 diff --git a/vita3k/renderer/src/batch.cpp b/vita3k/renderer/src/batch.cpp
-index 87e5a8e1..e084333a 100644
+index 87e5a8e1..bf180186 100644
 --- a/vita3k/renderer/src/batch.cpp
 +++ b/vita3k/renderer/src/batch.cpp
 @@ -32,6 +32,7 @@
@@ -13076,10 +13353,12 @@ index 87e5a8e1..e084333a 100644
              handler->second(state, mem, config, helper, features, command_list.context);
          }
  
-@@ -135,6 +172,12 @@ void process_batches(renderer::State &state, const FeatureState &features, MemSt
+@@ -134,7 +171,13 @@ static void process_batch(renderer::State &state, const FeatureState &features,
+ void process_batches(renderer::State &state, const FeatureState &features, MemState &mem, Config &config, int64_t max_wait_ms) {
      auto max_time = duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() + max_wait_ms;
  
-     while (!state.should_display) {
+-    while (!state.should_display) {
++    while (!state.should_display && !state.tick_pending()) {
 +#ifdef __PS4__
 +        ps4_thread_cpu_tick();
 +        ps4stats::enabled.store(ps4_host_profiler(), std::memory_order_relaxed);
@@ -13706,10 +13985,10 @@ index d89da55d..ebae243d 100644
          std::fill_n(vertex_stream_buffers, SCE_GXM_MAX_VERTEX_STREAMS, state.default_buffer.buffer);
 diff --git a/vita3k/renderer/src/vulkan/frame_generation.cpp b/vita3k/renderer/src/vulkan/frame_generation.cpp
 new file mode 100644
-index 00000000..e8916462
+index 00000000..3b7ab1fd
 --- /dev/null
 +++ b/vita3k/renderer/src/vulkan/frame_generation.cpp
-@@ -0,0 +1,336 @@
+@@ -0,0 +1,510 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -13732,12 +14011,19 @@ index 00000000..e8916462
 +#include <util/log.h>
 +#include <vkutil/vkutil.h>
 +
++#include <algorithm>
++#include <cmath>
++#include <limits>
++#include <numbers>
++
 +namespace renderer::vulkan {
 +
 +namespace {
 +
 +constexpr int BLOCK = 8; // luma pixels a side of a motion block
 +constexpr uint32_t GROUP = 8; // the shaders' work groups: 8x8
++// frames further apart than this (vblanks: loading, a pause) get no motion between them
++constexpr double LONG_GAP = 8.0;
 +
 +// Waits for what the last passes wrote (and the screen pass read) before the next ones
 +void compute_barrier(vk::CommandBuffer cmd) {
@@ -13747,6 +14033,26 @@ index 00000000..e8916462
 +    };
 +    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eFragmentShader,
 +        vk::PipelineStageFlagBits::eComputeShader, vk::DependencyFlags(), barrier, {}, {});
++}
++
++double fraction(double x) {
++    return x - std::floor(x);
++}
++
++vk::DescriptorBufferInfo whole(const vkutil::Buffer &buffer) {
++    return vk::DescriptorBufferInfo{ .buffer = buffer.buffer, .offset = 0, .range = VK_WHOLE_SIZE };
++}
++
++vk::WriteDescriptorSet write_image(vk::DescriptorSet dst, uint32_t binding, vk::DescriptorType type, const vk::DescriptorImageInfo &info) {
++    vk::WriteDescriptorSet write{ .dstSet = dst, .dstBinding = binding, .descriptorCount = 1, .descriptorType = type };
++    write.setImageInfo(info);
++    return write;
++}
++
++vk::WriteDescriptorSet write_buffer(vk::DescriptorSet dst, uint32_t binding, const vk::DescriptorBufferInfo &info) {
++    vk::WriteDescriptorSet write{ .dstSet = dst, .dstBinding = binding, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer };
++    write.setBufferInfo(info);
++    return write;
 +}
 +
 +} // namespace
@@ -13765,6 +14071,9 @@ index 00000000..e8916462
 +        device.destroy(set_layouts[i]);
 +        device.destroy(shaders[i]);
 +    }
++    for (vk::Fence fence : fences)
++        device.destroy(fence);
++    device.destroy(command_pool);
 +    device.destroy(pool);
 +    device.destroy(nearest);
 +    device.destroy(linear);
@@ -13806,16 +14115,16 @@ index 00000000..e8916462
 +            .pImmutableSamplers = sampler,
 +        };
 +    };
++    constexpr vk::DescriptorType BUFFER = vk::DescriptorType::eStorageBuffer;
 +    const std::vector<vk::DescriptorSetLayoutBinding> layouts[3] = {
-+        // copy: the game's frame, the history image, its luma
-+        { binding(0, vk::DescriptorType::eCombinedImageSampler, &nearest), binding(1, vk::DescriptorType::eStorageImage),
-+            binding(2, vk::DescriptorType::eStorageBuffer) },
-+        // motion: the two lumas, the vectors, the coarse vectors, the judge's counts
-+        { binding(0, vk::DescriptorType::eStorageBuffer), binding(1, vk::DescriptorType::eStorageBuffer), binding(2, vk::DescriptorType::eStorageBuffer),
-+            binding(3, vk::DescriptorType::eStorageBuffer), binding(4, vk::DescriptorType::eStorageBuffer) },
-+        // in-between: the two frames, the vectors, the result, the judge's counts
++        // copy: the game's frame, the history's image, its luma
++        { binding(0, vk::DescriptorType::eCombinedImageSampler, &nearest), binding(1, vk::DescriptorType::eStorageImage), binding(2, BUFFER) },
++        // motion: the frame before's luma, the luma, the vectors, the coarse vectors, the judge's
++        // counts, the frame before's vectors (where the search starts)
++        { binding(0, BUFFER), binding(1, BUFFER), binding(2, BUFFER), binding(3, BUFFER), binding(4, BUFFER), binding(5, BUFFER) },
++        // in-between: the two frames, the second's vectors, the result, the judge's counts
 +        { binding(0, vk::DescriptorType::eCombinedImageSampler, &linear), binding(1, vk::DescriptorType::eCombinedImageSampler, &linear),
-+            binding(2, vk::DescriptorType::eStorageBuffer), binding(3, vk::DescriptorType::eStorageImage), binding(4, vk::DescriptorType::eStorageBuffer) },
++            binding(2, BUFFER), binding(3, vk::DescriptorType::eStorageImage), binding(4, BUFFER) },
 +    };
 +    const vk::PushConstantRange push{
 +        .stageFlags = vk::ShaderStageFlagBits::eCompute,
@@ -13842,30 +14151,50 @@ index 00000000..e8916462
 +        pipelines[i] = created.value;
 +    }
 +
-+    // a set of the three per swapchain image (a slot's sets are free again once its fence passed)
-+    const uint32_t slots = std::max<uint32_t>(state.screen_renderer.swapchain_size, 1) + 1;
++    // the sets: copy and motion per history slot, in-between per swapchain image (its last use is
++    // done once the image's fence passed)
++    const uint32_t screen_slots = std::max<uint32_t>(state.screen_renderer.swapchain_size, 1) + 1;
 +    const std::array<vk::DescriptorPoolSize, 3> sizes = {
-+        vk::DescriptorPoolSize{ .type = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = slots * 3 },
-+        vk::DescriptorPoolSize{ .type = vk::DescriptorType::eStorageImage, .descriptorCount = slots * 2 },
-+        vk::DescriptorPoolSize{ .type = vk::DescriptorType::eStorageBuffer, .descriptorCount = slots * 8 },
++        vk::DescriptorPoolSize{ .type = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = HISTORY + screen_slots * 2 },
++        vk::DescriptorPoolSize{ .type = vk::DescriptorType::eStorageImage, .descriptorCount = HISTORY + screen_slots },
++        vk::DescriptorPoolSize{ .type = BUFFER, .descriptorCount = HISTORY * 7 + screen_slots * 2 },
 +    };
-+    vk::DescriptorPoolCreateInfo pool_info{ .maxSets = slots * 3 };
++    vk::DescriptorPoolCreateInfo pool_info{ .maxSets = HISTORY * 2 + screen_slots };
 +    pool_info.setPoolSizes(sizes);
 +    pool = device.createDescriptorPool(pool_info);
-+    sets.resize(slots);
-+    for (auto &slot : sets) {
++    const auto allocate = [&](vk::DescriptorSetLayout layout) {
 +        vk::DescriptorSetAllocateInfo alloc{ .descriptorPool = pool };
-+        alloc.setSetLayouts(set_layouts);
-+        const auto allocated = device.allocateDescriptorSets(alloc);
-+        std::copy_n(allocated.begin(), 3, slot.begin());
++        alloc.setSetLayouts(layout);
++        return device.allocateDescriptorSets(alloc).front();
++    };
++    for (int i = 0; i < HISTORY; i++) {
++        copy_sets[i] = allocate(set_layouts[0]);
++        motion_sets[i] = allocate(set_layouts[1]);
 +    }
-+    judge = vkutil::Buffer(4 * sizeof(uint32_t));
-+    judge.init_buffer(vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst);
++    for (uint32_t i = 0; i < screen_slots; i++)
++        interp_sets.push_back(allocate(set_layouts[2]));
++
++    // the command buffers adding frames, on the queue the game's frames are drawn on (in order after them)
++    command_pool = device.createCommandPool(vk::CommandPoolCreateInfo{
++        .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
++        .queueFamilyIndex = state.general_family_index,
++    });
++    const auto buffers = device.allocateCommandBuffers(vk::CommandBufferAllocateInfo{
++        .commandPool = command_pool,
++        .level = vk::CommandBufferLevel::ePrimary,
++        .commandBufferCount = HISTORY,
++    });
++    for (int i = 0; i < HISTORY; i++) {
++        commands[i] = buffers[i];
++        fences[i] = device.createFence(vk::FenceCreateInfo{ .flags = vk::FenceCreateFlagBits::eSignaled });
++    }
 +    LOG_INFO("Frame generation ready");
 +    return true;
 +}
 +
 +void FrameGenerator::resize(vk::CommandBuffer cmd, uint32_t new_width, uint32_t new_height) {
++    // what the screen and the other frames' passes still read goes away
++    state.general_queue.waitIdle();
 +    width = new_width;
 +    height = new_height;
 +    // the luma is about 480 wide whatever the resolution multiplier
@@ -13875,65 +14204,125 @@ index 00000000..e8916462
 +    blocks_w = (luma_w + BLOCK - 1) / BLOCK;
 +    blocks_h = (luma_h + BLOCK - 1) / BLOCK;
 +
-+    for (auto *image : { &frames[0], &frames[1], &result }) {
-+        image->destroy();
-+        *image = vkutil::Image(width, height, vk::Format::eR8G8B8A8Unorm);
-+        image->init_image(vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled);
-+        image->transition_to_discard(cmd, vkutil::ImageLayout::StorageImage);
-+    }
-+    for (auto &buffer : luma) {
++    const auto make_image = [&](vkutil::Image &image) {
++        image.destroy();
++        image = vkutil::Image(width, height, vk::Format::eR8G8B8A8Unorm);
++        image.init_image(vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled);
++        image.transition_to_discard(cmd, vkutil::ImageLayout::StorageImage);
++    };
++    const auto make_buffer = [&](vkutil::Buffer &buffer, vk::DeviceSize size) {
 +        buffer.destroy();
-+        buffer = vkutil::Buffer(static_cast<vk::DeviceSize>(luma_w) * luma_h * sizeof(float));
-+        buffer.init_buffer(vk::BufferUsageFlagBits::eStorageBuffer);
++        buffer = vkutil::Buffer(size);
++        buffer.init_buffer(vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst);
++        // (vectors start at no motion, counts at none)
++        cmd.fillBuffer(buffer.buffer, 0, VK_WHOLE_SIZE, 0);
++    };
++    for (Frame &frame : history) {
++        make_image(frame.image);
++        make_buffer(frame.luma, static_cast<vk::DeviceSize>(luma_w) * luma_h * sizeof(float));
++        make_buffer(frame.vectors, static_cast<vk::DeviceSize>(blocks_w) * blocks_h * 2 * sizeof(int32_t));
++        make_buffer(frame.judge, 4 * sizeof(uint32_t));
++        frame.valid = false;
++        frame.has_motion = false;
 +    }
-+    vectors.destroy();
-+    vectors = vkutil::Buffer(static_cast<vk::DeviceSize>(blocks_w) * blocks_h * 2 * sizeof(int32_t));
-+    vectors.init_buffer(vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst);
++    make_image(result);
 +    // the coarse pass's blocks: on the luma at half size
 +    const uint32_t coarse_w = ((luma_w + 1) / 2 + BLOCK - 1) / BLOCK, coarse_h = ((luma_h + 1) / 2 + BLOCK - 1) / BLOCK;
-+    coarse.destroy();
-+    coarse = vkutil::Buffer(static_cast<vk::DeviceSize>(coarse_w) * coarse_h * 2 * sizeof(int32_t));
-+    coarse.init_buffer(vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst);
-+    // the motion search starts from the last vectors: none yet
-+    cmd.fillBuffer(vectors.buffer, 0, VK_WHOLE_SIZE, 0);
-+    cmd.fillBuffer(coarse.buffer, 0, VK_WHOLE_SIZE, 0);
++    make_buffer(coarse, static_cast<vk::DeviceSize>(coarse_w) * coarse_h * 2 * sizeof(int32_t));
 +    const vk::MemoryBarrier filled{
 +        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
 +        .dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
 +    };
 +    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eComputeShader, vk::DependencyFlags(), filled, {}, {});
-+    has_previous = false;
-+    next = 0;
++    newest = -1;
 +}
 +
-+Viewport FrameGenerator::inbetween_viewport() const {
-+    return Viewport{
-+        .offset_x = 0,
-+        .offset_y = 0,
-+        .width = width,
-+        .height = height,
-+        .texture_width = width,
-+        .texture_height = height,
-+    };
++void FrameGenerator::reset() {
++    for (Frame &frame : history)
++        frame.valid = false;
++    newest = -1;
++    newest_stamp_ = -1.0;
++    latency = 0.0;
 +}
 +
-+bool FrameGenerator::record(vk::CommandBuffer cmd, uint32_t slot, vk::ImageView src, vk::ImageLayout src_layout, const Viewport &viewport, bool make_inbetween) {
-+    if (failed || !cmd || !src || viewport.width == 0 || viewport.height == 0)
-+        return false;
++void FrameGenerator::add_frame(vk::ImageView src, vk::ImageLayout src_layout, const Viewport &viewport, double stamp, double now) {
++    if (failed || !src || viewport.width == 0 || viewport.height == 0)
++        return;
++    newest_stamp_ = stamp;
++    // where in a vblank the game queues its frames (averaged on a circle); held to its vblanks, the
++    // frames' times go on that point
++    const double angle = 2.0 * std::numbers::pi * fraction(stamp);
++    phase_x = phase_x * 0.9 + std::cos(angle) * 0.1;
++    phase_y = phase_y * 0.9 + std::sin(angle) * 0.1;
++    const double steadiness = std::sqrt(phase_x * phase_x + phase_y * phase_y);
++    steady = steadiness > (steady ? 0.6 : 0.8);
++    double time = stamp;
++    if (steady) {
++        const double phase = fraction(std::atan2(phase_y, phase_x) / (2.0 * std::numbers::pi));
++        time = phase + std::round(stamp - phase);
++    }
 +    if (!ready) {
 +        if (!init()) {
 +            failed = true;
-+            return false;
++            return;
 +        }
 +        ready = true;
 +    }
++    vk::Device device = state.device;
++    const int slot = (newest + 1) % HISTORY;
++    // this slot's command buffer and sets are free once its last frame was added
++    if (device.waitForFences(fences[slot], VK_TRUE, std::numeric_limits<uint64_t>::max()) != vk::Result::eSuccess) {
++        LOG_ERROR("Frame generation: waiting for a frame's passes failed");
++        return;
++    }
++    device.resetFences(fences[slot]);
++    vk::CommandBuffer cmd = commands[slot];
++    cmd.reset();
++    cmd.begin(vk::CommandBufferBeginInfo{ .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
 +    if (viewport.width != width || viewport.height != height)
 +        resize(cmd, viewport.width, viewport.height);
-+    slot %= sets.size();
-+    auto &set = sets[slot];
-+    vk::Device device = state.device;
 +
-+    const int cur = next, prev = next ^ 1;
++    const int before = newest;
++    Frame &frame = history[slot];
++    const bool motion = before >= 0 && history[before].valid && time > history[before].time && time - history[before].time < LONG_GAP;
++
++    const vk::DescriptorImageInfo src_info{ .imageView = src, .imageLayout = src_layout };
++    const vk::DescriptorImageInfo storage{ .imageView = frame.image.view, .imageLayout = vk::ImageLayout::eGeneral };
++    const vk::DescriptorBufferInfo luma_info = whole(frame.luma);
++    std::vector<vk::WriteDescriptorSet> writes = {
++        write_image(copy_sets[slot], 0, vk::DescriptorType::eCombinedImageSampler, src_info),
++        write_image(copy_sets[slot], 1, vk::DescriptorType::eStorageImage, storage),
++        write_buffer(copy_sets[slot], 2, luma_info),
++    };
++    vk::DescriptorBufferInfo before_luma, vectors_info, coarse_info, judge_info, last_info;
++    if (motion) {
++        before_luma = whole(history[before].luma);
++        vectors_info = whole(frame.vectors);
++        coarse_info = whole(coarse);
++        judge_info = whole(frame.judge);
++        last_info = whole(history[before].vectors);
++        writes.push_back(write_buffer(motion_sets[slot], 0, before_luma));
++        writes.push_back(write_buffer(motion_sets[slot], 1, luma_info));
++        writes.push_back(write_buffer(motion_sets[slot], 2, vectors_info));
++        writes.push_back(write_buffer(motion_sets[slot], 3, coarse_info));
++        writes.push_back(write_buffer(motion_sets[slot], 4, judge_info));
++        writes.push_back(write_buffer(motion_sets[slot], 5, last_info));
++    }
++    device.updateDescriptorSets(writes, {});
++
++    // the judge counts this pair's blocks from zero, once what read its counts before is done
++    if (motion) {
++        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags(), {}, {}, {});
++        cmd.fillBuffer(frame.judge.buffer, 0, VK_WHOLE_SIZE, 0);
++    }
++    // the game's frame (drawn before), and what the screen passes read from this slot before
++    const vk::MemoryBarrier drawn{
++        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite | vk::AccessFlagBits::eShaderRead,
++        .dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
++    };
++    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput | vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eFragmentShader | vk::PipelineStageFlagBits::eTransfer,
++        vk::PipelineStageFlagBits::eComputeShader, vk::DependencyFlags(), drawn, {}, {});
++
 +    Constants constants{
 +        .src_x = static_cast<int32_t>(viewport.offset_x),
 +        .src_y = static_cast<int32_t>(viewport.offset_y),
@@ -13944,105 +14333,169 @@ index 00000000..e8916462
 +        .luma_h = luma_h,
 +        .blocks_w = blocks_w,
 +        .pass_index = 0,
++        .phase = 0.0f,
 +    };
-+    const bool inbetween = make_inbetween && has_previous;
-+
-+    // the descriptors of this slot (its last use finished: the swapchain image's fence)
-+    const vk::DescriptorImageInfo src_info{ .imageView = src, .imageLayout = src_layout };
-+    const vk::DescriptorImageInfo cur_storage{ .imageView = frames[cur].view, .imageLayout = vk::ImageLayout::eGeneral };
-+    const vk::DescriptorImageInfo prev_sampled{ .imageView = frames[prev].view, .imageLayout = vk::ImageLayout::eGeneral };
-+    const vk::DescriptorImageInfo cur_sampled{ .imageView = frames[cur].view, .imageLayout = vk::ImageLayout::eGeneral };
-+    const vk::DescriptorImageInfo result_storage{ .imageView = result.view, .imageLayout = vk::ImageLayout::eGeneral };
-+    const vk::DescriptorBufferInfo luma_cur{ .buffer = luma[cur].buffer, .offset = 0, .range = VK_WHOLE_SIZE };
-+    const vk::DescriptorBufferInfo luma_prev{ .buffer = luma[prev].buffer, .offset = 0, .range = VK_WHOLE_SIZE };
-+    const vk::DescriptorBufferInfo vector_info{ .buffer = vectors.buffer, .offset = 0, .range = VK_WHOLE_SIZE };
-+    const vk::DescriptorBufferInfo coarse_info{ .buffer = coarse.buffer, .offset = 0, .range = VK_WHOLE_SIZE };
-+    const vk::DescriptorBufferInfo judge_info{ .buffer = judge.buffer, .offset = 0, .range = VK_WHOLE_SIZE };
-+    const auto write_image = [](vk::DescriptorSet dst, uint32_t binding, vk::DescriptorType type, const vk::DescriptorImageInfo &info) {
-+        vk::WriteDescriptorSet write{ .dstSet = dst, .dstBinding = binding, .descriptorCount = 1, .descriptorType = type };
-+        write.setImageInfo(info);
-+        return write;
-+    };
-+    const auto write_buffer = [](vk::DescriptorSet dst, uint32_t binding, const vk::DescriptorBufferInfo &info) {
-+        vk::WriteDescriptorSet write{ .dstSet = dst, .dstBinding = binding, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer };
-+        write.setBufferInfo(info);
-+        return write;
-+    };
-+    std::vector<vk::WriteDescriptorSet> writes = {
-+        write_image(set[0], 0, vk::DescriptorType::eCombinedImageSampler, src_info),
-+        write_image(set[0], 1, vk::DescriptorType::eStorageImage, cur_storage),
-+        write_buffer(set[0], 2, luma_cur),
-+    };
-+    if (inbetween) {
-+        writes.push_back(write_buffer(set[1], 0, luma_prev));
-+        writes.push_back(write_buffer(set[1], 1, luma_cur));
-+        writes.push_back(write_buffer(set[1], 2, vector_info));
-+        writes.push_back(write_buffer(set[1], 3, coarse_info));
-+        writes.push_back(write_buffer(set[1], 4, judge_info));
-+        writes.push_back(write_image(set[2], 0, vk::DescriptorType::eCombinedImageSampler, prev_sampled));
-+        writes.push_back(write_image(set[2], 1, vk::DescriptorType::eCombinedImageSampler, cur_sampled));
-+        writes.push_back(write_buffer(set[2], 2, vector_info));
-+        writes.push_back(write_image(set[2], 3, vk::DescriptorType::eStorageImage, result_storage));
-+        writes.push_back(write_buffer(set[2], 4, judge_info));
-+    }
-+    device.updateDescriptorSets(writes, {});
-+
-+    // the judge counts this pair's blocks from zero: once the last pair's passes have read the counts,
-+    // and before this pair's (the barrier below)
-+    if (inbetween) {
-+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags(), {}, {}, {});
-+        cmd.fillBuffer(judge.buffer, 0, VK_WHOLE_SIZE, 0);
-+    }
-+
-+    // the game's frame (drawn to before; the last frame's passes and screen pass read ours)
-+    const vk::MemoryBarrier before{
-+        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite | vk::AccessFlagBits::eShaderRead,
-+        .dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
-+    };
-+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput | vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eFragmentShader | vk::PipelineStageFlagBits::eTransfer,
-+        vk::PipelineStageFlagBits::eComputeShader, vk::DependencyFlags(), before, {}, {});
-+
 +    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipelines[0]);
-+    cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layouts[0], 0, set[0], {});
++    cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layouts[0], 0, copy_sets[slot], {});
 +    cmd.pushConstants(pipeline_layouts[0], vk::ShaderStageFlagBits::eCompute, 0, sizeof(Constants), &constants);
 +    cmd.dispatch((luma_w + GROUP - 1) / GROUP, (luma_h + GROUP - 1) / GROUP, 1);
 +
-+    if (inbetween) {
-+        // the motion: the coarse pass, then the fine one from it
++    if (motion) {
++        // the motion: the coarse pass, the fine one from it, the judge
 +        compute_barrier(cmd);
 +        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipelines[1]);
-+        cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layouts[1], 0, set[1], {});
++        cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layouts[1], 0, motion_sets[slot], {});
 +        const uint32_t coarse_w = ((luma_w + 1) / 2 + BLOCK - 1) / BLOCK, coarse_h = ((luma_h + 1) / 2 + BLOCK - 1) / BLOCK;
 +        cmd.pushConstants(pipeline_layouts[1], vk::ShaderStageFlagBits::eCompute, 0, sizeof(Constants), &constants);
 +        cmd.dispatch((coarse_w + GROUP - 1) / GROUP, (coarse_h + GROUP - 1) / GROUP, 1);
-+        compute_barrier(cmd);
-+        constants.pass_index = 1;
-+        cmd.pushConstants(pipeline_layouts[1], vk::ShaderStageFlagBits::eCompute, 0, sizeof(Constants), &constants);
-+        cmd.dispatch((blocks_w + GROUP - 1) / GROUP, (blocks_h + GROUP - 1) / GROUP, 1);
-+        // the judge: blocks moving unlike all their neighbours
-+        compute_barrier(cmd);
-+        constants.pass_index = 2;
-+        cmd.pushConstants(pipeline_layouts[1], vk::ShaderStageFlagBits::eCompute, 0, sizeof(Constants), &constants);
-+        cmd.dispatch((blocks_w + GROUP - 1) / GROUP, (blocks_h + GROUP - 1) / GROUP, 1);
++        for (uint32_t pass = 1; pass <= 2; pass++) {
++            compute_barrier(cmd);
++            constants.pass_index = pass;
++            cmd.pushConstants(pipeline_layouts[1], vk::ShaderStageFlagBits::eCompute, 0, sizeof(Constants), &constants);
++            cmd.dispatch((blocks_w + GROUP - 1) / GROUP, (blocks_h + GROUP - 1) / GROUP, 1);
++        }
++    }
++    // (the screen passes, in later command buffers, wait for these with their own barrier)
++    cmd.end();
++    vk::SubmitInfo submit{};
++    submit.setCommandBuffers(cmd);
++    state.general_queue.submit(submit, fences[slot]);
 +
-+        compute_barrier(cmd);
-+        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipelines[2]);
-+        cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layouts[2], 0, set[2], {});
-+        cmd.pushConstants(pipeline_layouts[2], vk::ShaderStageFlagBits::eCompute, 0, sizeof(Constants), &constants);
-+        cmd.dispatch((width + GROUP - 1) / GROUP, (height + GROUP - 1) / GROUP, 1);
++    // the pacing: how far apart the frames come, how long after the game queued them they get here
++    if (motion)
++        interval = interval * 0.9 + std::clamp(time - history[before].time, 0.5, 6.0) * 0.1;
++    delay = delay * 0.9 + std::clamp(now - stamp, 0.0, 4.0) * 0.1;
++
++    frame.time = time;
++    frame.valid = true;
++    frame.has_motion = motion;
++    newest = slot;
++}
++
++// How far behind its newest frame's time the screen shows the game, in vblanks: enough for the frame
++// after the moment shown to be here (a vblank to the screen, the frames' way here, a frame's time).
++// A game that queues its frames at the same point of every vblank (held to its vblanks) gets its
++// moments on that point: the screen then shows its frames themselves, and in-between ones half way;
++// as a moment then falls on a frame once a frame's time, it needs half a vblank less.
++double FrameGenerator::latency_for_screen() {
++    const double needed = (steady ? 0.5 : 1.0) + delay + interval + 0.1;
++    double target = needed;
++    if (steady) {
++        const double phase = fraction(std::atan2(phase_y, phase_x) / (2.0 * std::numbers::pi));
++        const double base = fraction(1.0 - phase);
++        target = base + std::ceil(needed - base);
++    }
++    // later at once (frames came later), earlier slowly (the screen hurries by 1%)
++    if (latency == 0.0 || target > latency + 0.05)
++        latency = target;
++    else if (target < latency)
++        latency = std::max(target, latency - 0.01);
++    return latency;
++}
++
++bool FrameGenerator::image_for(vk::CommandBuffer cmd, uint32_t slot, double vblank, vk::ImageView &view, Viewport &viewport) {
++    if (!cmd || newest < 0 || !history[newest].valid)
++        return false;
++    // the history's frames, oldest first
++    int order[HISTORY];
++    int count = 0;
++    for (int k = HISTORY - 1; k >= 0; k--) {
++        const int i = (newest - k + HISTORY) % HISTORY;
++        if (history[i].valid)
++            order[count++] = i;
 +    }
 +
-+    // the screen pass (and its filter's compute passes) read the in-between frame
-+    const vk::MemoryBarrier after{
++    // the moment shown: the frame of that moment, or one made between the two around it
++    const double moment = vblank - latency_for_screen();
++    int show = order[count - 1]; // past the newest (the next frame is late): the newest
++    int first = -1, second = -1;
++    double phase = 0.0;
++    if (moment <= history[order[0]].time) {
++        show = order[0];
++    } else {
++        for (int k = 0; k + 1 < count; k++) {
++            const Frame &a = history[order[k]], &b = history[order[k + 1]];
++            if (moment < a.time || moment >= b.time)
++                continue;
++            show = order[k];
++            if (b.has_motion && b.time > a.time) {
++                phase = (moment - a.time) / (b.time - a.time);
++                if (phase > 0.97)
++                    show = order[k + 1];
++                else if (phase >= 0.03) {
++                    first = order[k];
++                    second = order[k + 1];
++                }
++            }
++            break;
++        }
++    }
++
++    // what the frames' passes wrote (other command buffers, before), and the screen pass's reads of
++    // the in-between frame before it's made again
++    const vk::MemoryBarrier written{
++        .srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eShaderRead,
++        .dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
++    };
++    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eFragmentShader,
++        vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eFragmentShader, vk::DependencyFlags(), written, {}, {});
++    if (first >= 0) {
++        make_inbetween(cmd, slot, first, second, static_cast<float>(phase));
++        view = result.view;
++    } else {
++        view = history[show].image.view;
++    }
++    viewport = Viewport{
++        .offset_x = 0,
++        .offset_y = 0,
++        .width = width,
++        .height = height,
++        .texture_width = width,
++        .texture_height = height,
++    };
++    return true;
++}
++
++void FrameGenerator::make_inbetween(vk::CommandBuffer cmd, uint32_t slot, int first, int second, float phase) {
++    const vk::DescriptorSet set = interp_sets[slot % interp_sets.size()];
++    const vk::DescriptorImageInfo first_info{ .imageView = history[first].image.view, .imageLayout = vk::ImageLayout::eGeneral };
++    const vk::DescriptorImageInfo second_info{ .imageView = history[second].image.view, .imageLayout = vk::ImageLayout::eGeneral };
++    const vk::DescriptorImageInfo result_info{ .imageView = result.view, .imageLayout = vk::ImageLayout::eGeneral };
++    const vk::DescriptorBufferInfo vectors_info = whole(history[second].vectors);
++    const vk::DescriptorBufferInfo judge_info = whole(history[second].judge);
++    const std::array<vk::WriteDescriptorSet, 5> writes = {
++        write_image(set, 0, vk::DescriptorType::eCombinedImageSampler, first_info),
++        write_image(set, 1, vk::DescriptorType::eCombinedImageSampler, second_info),
++        write_buffer(set, 2, vectors_info),
++        write_image(set, 3, vk::DescriptorType::eStorageImage, result_info),
++        write_buffer(set, 4, judge_info),
++    };
++    state.device.updateDescriptorSets(writes, {});
++
++    const Constants constants{
++        .src_x = 0,
++        .src_y = 0,
++        .frame_w = width,
++        .frame_h = height,
++        .scale = scale,
++        .luma_w = luma_w,
++        .luma_h = luma_h,
++        .blocks_w = blocks_w,
++        .pass_index = 0,
++        .phase = phase,
++    };
++    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipelines[2]);
++    cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layouts[2], 0, set, {});
++    cmd.pushConstants(pipeline_layouts[2], vk::ShaderStageFlagBits::eCompute, 0, sizeof(Constants), &constants);
++    cmd.dispatch((width + GROUP - 1) / GROUP, (height + GROUP - 1) / GROUP, 1);
++
++    // the screen pass (and its filter's compute passes) read it
++    const vk::MemoryBarrier made{
 +        .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
 +        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
 +    };
 +    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eFragmentShader,
-+        vk::DependencyFlags(), after, {}, {});
-+
-+    next ^= 1;
-+    has_previous = true;
-+    return inbetween;
++        vk::DependencyFlags(), made, {}, {});
 +}
 +
 +} // namespace renderer::vulkan
@@ -14163,7 +14616,7 @@ index ff6d0c5b..ab744977 100644
  
          if (request == nullptr)
 diff --git a/vita3k/renderer/src/vulkan/renderer.cpp b/vita3k/renderer/src/vulkan/renderer.cpp
-index ed8c71ad..4cf9db15 100644
+index ed8c71ad..f3cc1cd3 100644
 --- a/vita3k/renderer/src/vulkan/renderer.cpp
 +++ b/vita3k/renderer/src/vulkan/renderer.cpp
 @@ -22,6 +22,7 @@
@@ -14251,81 +14704,160 @@ index ed8c71ad..4cf9db15 100644
      support_fsr &= static_cast<bool>(screen_renderer.surface_capabilities.supportedUsageFlags & vk::ImageUsageFlagBits::eStorage);
      // The FSR storage shaders write rgba8; BGRA8 swapchain views are not format-compatible.
      support_fsr &= screen_renderer.surface_format.format == vk::Format::eR8G8B8A8Unorm;
-@@ -1143,8 +1179,17 @@ void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState
+@@ -1125,11 +1161,16 @@ void VKState::cleanup() {
+ void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState &mem) {
+     // we are displaying this frame, wait for a new one
+     should_display = false;
++    // (frame generation: the vblanks to give an image for, all at once)
++    const bool tick = tick_pending();
++    presented_ticks = present_ticks.load(std::memory_order_relaxed);
+ 
+     DisplayFrameInfo frame;
++    double now = 0.0;
+     {
+         std::lock_guard<std::mutex> guard(display.display_info_mutex);
+         frame = display.next_rendered_frame;
++        now = display.vblank_time();
+     }
+ 
+     update_overlays();
+@@ -1143,39 +1184,21 @@ void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState
      if (!frame.base && !has_overlays)
          return;
  
 +#ifdef __PS4__
-+    // (frame generation: the time waited here for the screen is not the game's)
-+    const auto acquire_start = std::chrono::steady_clock::now();
-+    const bool acquired = screen_renderer.acquire_swapchain_image();
-+    fg_pacing.waited_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - acquire_start).count();
-+    if (!acquired)
-+        return;
-+#else
++    if (ps4_frame_generation() && frame.base) {
++        if (render_generated(display, frame, now, has_overlays, tick))
++            return;
++    } else if (screen_renderer.frame_generator) {
++        // (turned off: its frames are old when it's back)
++        screen_renderer.frame_generator->reset();
++        ps4_set_frame_doubling(false);
++    }
++#endif
++
      if (!screen_renderer.acquire_swapchain_image())
          return;
-+#endif
  
-     // store viewport for touch
-     {
-@@ -1234,6 +1279,55 @@ void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState
-             layout = vk::ImageLayout::eShaderReadOnlyOptimal;
-         }
+-    // store viewport for touch
+-    {
+-        const float fb_w = static_cast<float>(screen_renderer.extent.width);
+-        const float fb_h = static_cast<float>(screen_renderer.extent.height);
+-        display.viewport_drawable_w = static_cast<int>(fb_w);
+-        display.viewport_drawable_h = static_cast<int>(fb_h);
+-        if (fb_h > 0.0f) {
+-            const float window_aspect = fb_w / fb_h;
+-            constexpr float vita_aspect = static_cast<float>(DEFAULT_RES_WIDTH) / DEFAULT_RES_HEIGHT;
+-            const bool pixel_perfect = fullscreen_hd_res_pixel_perfect && fullscreen
+-                && !(screen_renderer.extent.width % DEFAULT_RES_WIDTH)
+-                && !(screen_renderer.extent.height % (DEFAULT_RES_HEIGHT - 4));
+-            if (stretch_the_display_area && !pixel_perfect) {
+-                display.viewport_x = 0.0f;
+-                display.viewport_y = 0.0f;
+-                display.viewport_w = fb_w;
+-                display.viewport_h = fb_h;
+-            } else if ((window_aspect > vita_aspect) && !pixel_perfect) {
+-                display.viewport_w = fb_h * vita_aspect;
+-                display.viewport_h = fb_h;
+-                display.viewport_x = (fb_w - display.viewport_w) / 2.0f;
+-                display.viewport_y = 0.0f;
+-            } else {
+-                display.viewport_w = fb_w;
+-                display.viewport_h = fb_w / vita_aspect;
+-                display.viewport_x = 0.0f;
+-                display.viewport_y = (fb_h - display.viewport_h) / 2.0f;
+-            }
+-        }
+-    }
++    update_viewport(display);
  
-+#ifdef __PS4__
-+        // frame generation: while the game makes under about 50 frames a second on its own (the time
-+        // between its frames, less what this thread waited for the screen, is over 20 ms; back to
-+        // plain frames under 17.8 ms), every frame gets an in-between frame from the motion between
-+        // it and the last, presented first: the vsynced flips show it a vblank before the real one.
-+        // Two flips a frame hold the game at 30 (its next frame waits for a swapchain image), so the
-+        // screen gets a frame every vblank, evenly. A frame after a long gap (loading) gets none.
-+        if (ps4_frame_generation()) {
-+            const auto now = std::chrono::steady_clock::now();
-+            const double gap_ms = fg_pacing.last_frame == std::chrono::steady_clock::time_point{} ? 0.0
-+                                                                                                  : std::chrono::duration<double, std::milli>(now - fg_pacing.last_frame).count();
-+            fg_pacing.last_frame = now;
-+            const bool steady = gap_ms > 0.0 && gap_ms < 100.0;
-+            if (steady) {
-+                const double own_ms = std::max(gap_ms - fg_pacing.waited_ms, 1.0);
-+                fg_pacing.pace_ms = fg_pacing.pace_ms == 0.0 ? own_ms : fg_pacing.pace_ms * 0.9 + own_ms * 0.1;
-+                const bool doubling = fg_pacing.doubling ? fg_pacing.pace_ms > 17.8 : fg_pacing.pace_ms > 20.0;
-+                if (doubling != fg_pacing.doubling) {
-+                    fg_pacing.doubling = doubling;
-+                    ps4_set_frame_doubling(doubling);
-+                    LOG_INFO("Frame generation: {} (the game makes {:.0f} frames a second)", doubling ? "in-between frames, held at 30" : "plain frames", 1000.0 / fg_pacing.pace_ms);
-+                }
-+            }
-+            fg_pacing.waited_ms = 0.0;
-+            if (!screen_renderer.frame_generator)
-+                screen_renderer.frame_generator = std::make_unique<FrameGenerator>(*this);
-+            if (screen_renderer.frame_generator->record(screen_renderer.current_cmd_buffer, screen_renderer.swapchain_image_idx, surface_handle, layout, viewport, steady && fg_pacing.doubling)) {
-+                screen_renderer.render(screen_renderer.frame_generator->inbetween(), vk::ImageLayout::eGeneral, screen_renderer.frame_generator->inbetween_viewport());
-+                if (has_overlays && screen_renderer.current_cmd_buffer) {
-+                    overlay_renderer.render(screen_renderer.current_cmd_buffer, screen_renderer.default_render_pass, screen_renderer.extent,
-+                        display.viewport_x, display.viewport_y, display.viewport_w, display.viewport_h);
-+                }
-+                screen_renderer.swap_window();
-+                // the real frame on the next swapchain image
-+                const auto second_start = std::chrono::steady_clock::now();
-+                const bool second = screen_renderer.acquire_swapchain_image();
-+                fg_pacing.waited_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - second_start).count();
-+                if (!second)
-+                    return;
-+                if (has_overlays && screen_renderer.current_cmd_buffer) {
-+                    overlay_renderer.prepare(screen_renderer.current_cmd_buffer, *overlay_manager, display.viewport_w, display.viewport_h,
-+                        screen_renderer.swapchain_image_idx);
-+                }
-+            }
-+        } else if (fg_pacing.last_frame != std::chrono::steady_clock::time_point{}) {
-+            fg_pacing = {};
-+            ps4_set_frame_doubling(false);
+     if (has_overlays && screen_renderer.current_cmd_buffer) {
+         overlay_renderer.prepare(screen_renderer.current_cmd_buffer,
+@@ -1248,6 +1271,83 @@ void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState
+     }
+ }
+ 
++// The screen's place in the window, for touch
++void VKState::update_viewport(DisplayState &display) {
++    const float fb_w = static_cast<float>(screen_renderer.extent.width);
++    const float fb_h = static_cast<float>(screen_renderer.extent.height);
++    display.viewport_drawable_w = static_cast<int>(fb_w);
++    display.viewport_drawable_h = static_cast<int>(fb_h);
++    if (fb_h > 0.0f) {
++        const float window_aspect = fb_w / fb_h;
++        constexpr float vita_aspect = static_cast<float>(DEFAULT_RES_WIDTH) / DEFAULT_RES_HEIGHT;
++        const bool pixel_perfect = fullscreen_hd_res_pixel_perfect && fullscreen
++            && !(screen_renderer.extent.width % DEFAULT_RES_WIDTH)
++            && !(screen_renderer.extent.height % (DEFAULT_RES_HEIGHT - 4));
++        if (stretch_the_display_area && !pixel_perfect) {
++            display.viewport_x = 0.0f;
++            display.viewport_y = 0.0f;
++            display.viewport_w = fb_w;
++            display.viewport_h = fb_h;
++        } else if ((window_aspect > vita_aspect) && !pixel_perfect) {
++            display.viewport_w = fb_h * vita_aspect;
++            display.viewport_h = fb_h;
++            display.viewport_x = (fb_w - display.viewport_w) / 2.0f;
++            display.viewport_y = 0.0f;
++        } else {
++            display.viewport_w = fb_w;
++            display.viewport_h = fb_w / vita_aspect;
++            display.viewport_x = 0.0f;
++            display.viewport_y = (fb_h - display.viewport_h) / 2.0f;
 +        }
++    }
++}
++
++#ifdef __PS4__
++// Frame generation: each frame of the game into the frame generator's history as it comes (with the
++// time the game queued it), and at each vblank the screen's image: the frame of that moment, or one
++// made between the two around it (renderer/vulkan/frame_generation.h)
++bool VKState::render_generated(DisplayState &display, const DisplayFrameInfo &frame, double now, bool has_overlays, bool tick) {
++    if (frame.vblank_time <= 0.0)
++        return false;
++    if (!screen_renderer.frame_generator)
++        screen_renderer.frame_generator = std::make_unique<FrameGenerator>(*this);
++    FrameGenerator &generator = *screen_renderer.frame_generator;
++    if (!generator.usable())
++        return false;
++    if (frame.vblank_time != generator.newest_stamp()) {
++        Viewport viewport;
++        viewport.width = static_cast<uint32_t>(frame.image_size.x * res_multiplier);
++        viewport.height = static_cast<uint32_t>(frame.image_size.y * res_multiplier);
++        const vk::ImageView surface = surface_cache.sourcing_color_surface_for_presentation(frame.base, frame.pitch, viewport);
++        // (a frame in the game's memory only: shown as it comes)
++        if (!surface)
++            return false;
++        generator.add_frame(surface, vk::ImageLayout::eGeneral, viewport, frame.vblank_time, now);
++    }
++    if (!tick)
++        return true;
++
++    if (!screen_renderer.acquire_swapchain_image())
++        return true;
++    update_viewport(display);
++    if (has_overlays && screen_renderer.current_cmd_buffer)
++        overlay_renderer.prepare(screen_renderer.current_cmd_buffer, *overlay_manager, display.viewport_w, display.viewport_h, screen_renderer.swapchain_image_idx);
++    // the image shows from the next vblank
++    vk::ImageView view;
++    Viewport viewport;
++    if (generator.image_for(screen_renderer.current_cmd_buffer, screen_renderer.swapchain_image_idx, static_cast<double>(display.vblank_count.load()) + 1.0, view, viewport))
++        screen_renderer.render(view, vk::ImageLayout::eGeneral, viewport);
++    else
++        screen_renderer.begin_default_render_pass();
++    if (has_overlays && screen_renderer.current_cmd_buffer) {
++        overlay_renderer.render(screen_renderer.current_cmd_buffer, screen_renderer.default_render_pass, screen_renderer.extent,
++            display.viewport_x, display.viewport_y, display.viewport_w, display.viewport_h);
++    }
++    ps4_set_frame_doubling(true);
++    return true;
++}
 +#endif
-         screen_renderer.render(surface_handle, layout, viewport);
-     } else if (has_overlays) {
-         screen_renderer.begin_default_render_pass();
-@@ -1724,6 +1818,8 @@ renderer::VulkanDeviceInfo renderer::enumerate_vulkan_devices(const std::string
++
+ void VKState::swap_window() {
+     screen_renderer.swap_window();
+ 
+@@ -1724,6 +1824,8 @@ renderer::VulkanDeviceInfo renderer::enumerate_vulkan_devices(const std::string
              return info;
  
          dispatch.init(vk_get_instance_proc_addr);
@@ -14951,10 +15483,10 @@ index 8ae6b391..7385a3ef 100644
      } else {
 diff --git a/vita3k/shaders-builtin/vulkan/fg_copy.comp b/vita3k/shaders-builtin/vulkan/fg_copy.comp
 new file mode 100644
-index 00000000..2637d120
+index 00000000..75898c64
 --- /dev/null
 +++ b/vita3k/shaders-builtin/vulkan/fg_copy.comp
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,60 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -14987,6 +15519,7 @@ index 00000000..2637d120
 +    uint luma_h;
 +    uint blocks_w;
 +    uint pass_index;
++    float phase;
 +} c;
 +
 +layout(set = 0, binding = 0) uniform sampler2D src;
@@ -15016,51 +15549,51 @@ index 00000000..2637d120
 +}
 diff --git a/vita3k/shaders-builtin/vulkan/fg_copy.comp.spv b/vita3k/shaders-builtin/vulkan/fg_copy.comp.spv
 new file mode 100644
-index 0000000000000000000000000000000000000000..c7d4efb3fda946cb4e47218a4a11958873baacd1
+index 0000000000000000000000000000000000000000..edf9dde7e7a10dd648c69e7fb9de305a4905a8f8
 GIT binary patch
-literal 4196
-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
+literal 4240
+zcmZvd2XmEG5Qe{yB8UnI1OdSiz=qNUL@^X80gck^E!^BB5V*;W+=M1-Pz3A+ELae+
+zfao~>2LFRU!XIFramMGlIZM9Dcrx$o?z?+-_w4!3P3@SuS7ljEHa;7h{g4f>N!b{f
+z46dOnTibTFEvyW5E?l;Ju@Tp0wbejlCJ<APtOLD;o<1GdfQj&Olfc*n<7@dFgZu@f
+zo{0RudVJ&Xl|Vha%(J`H-dZYm6iQqA4wQ?9fu3^TmJL;ZeKrlbzT8(CDD(|f&>Q%Z
+zb5-^i+sobEm9Bvi-um793%y<Km7XJA^20gor&27GpssM9ur%0PXg@f@*=v>CGm_J@
+zca+M-eH9}|_y+X;LZ#B))7RN`Xe0;2&ieNhD%SG6(~-rbFGN-bd#iJC(8cm#AMID;
+zmLT^g{XS$*(l;UdlirCukaSvf2Gv}H=+$#qeRbLU$TrS~sGe8b<=K?>by|hh$_;rB
+z<H3zpyS6%GXSSKhnD<<4S8&c+&btrJJ#rIsTy5f}<T&SS+zmO-Im_8Y<a5SyO*zi_
+z%FP4z?i}U-SJ=(NCU$M+Y`g<~>c-l8*dwuZ*?aKTv_JPcw_30nCT3_Z`wQD%T*f=o
+zsHJW#XJRewe67pa&fNIPL>V`S9M)5x${u@Z0<LM;o?T9V6SlLL6Z)@4>Nkge^Vb0R
+zRmt|Q<))Bj0&)Sod%QE3`z9fymVJ14O~8HDnTnLNk4CCBBAdW$D*3(WkNxJ(V>q_1
+zdiVYo7;kTW3(i8$p3FZ3#93x0pShyvW^{Xs`1$DGooBccX%E)ZuUrIN5x)}MGlabZ
+zJ<iyH?w-h3L^q%Obh`9?>o-2X!k$Uz-8hW1pWP`)&hu*f?Yg4A@84zoKBTj7me#8v
+z|F53?M~?&OE@Q2s?Kki8-VP(p;Y?#DN71uvXieC!Vx4R}yE^RS*cUc7Uh%(%{p+FM
+zTJGRh&36L0$2fhn$nHC`&TMqwiMD6@0BOH+_NVQ;kkfxL>F%|@cl|x^JGY+S@#VzH
+zH-i<t#h3wR^=yB^)T3L&z0T3Q)AqaYcQ|an^~Iy?C8KPAk0aiEn{u|_MQ6@7|G8wh
+zP|u#P1-`qjWHHZmiIaELfYo$vpZeC(y?tE|<b0dvavqa`yfMBBe=mJEzLkiXmH3~C
+z@r}<0?vuYn9=V%<{GZgFgLM6aPreDrIY;&AXD+(^IQOVE4_!X`xf$Jl=7Wg21zkS+
+zxfR`g@_$n!YAJtbLiTqXus`q7_$FYl3y>~*HRg68XRqr2GEH?kXX;)1?$y0#XQ}QT
+zt6P65(ml#Q$h!==9JutaK<Zb<neIk6N1Xc}bkFT?O2piYF8_17hgInAled5EyMXn~
+zuWoOCZ_!&z@+s|Y4RS4T+1om#dzDf5espt0Z|l)V_qG8}K6=}T?ml^Y(_Rg%XMT0_
+z`~9{8zk|rX8GUsAEpYPNIJ<iu0CM7Z;vPgdm%iw|4c*?uehA$;N1lh#jgcQpdA6dP
+zOP}-eeahLN?`Rv4bEc7Zd*aves(eQ~foIqO@^OzOUwpfdV!Ky9-qK^}@_wIBAYIN-
+z{&67Z4ArBjC(-RG|CXM@mXDsEMvtEIanHc(i=LiEcdxwPMATEpdwLGt9=%87?Ztj~
+zAzk)sOgq>G>{s1<Ym>bT>HNBpJzx*;Jo}I(V6S_DF;kJfKwjH#pbvQFqsd=RocCya
+zKX8wHCox^f=Yh4_$<Tq^pEzU30PA_@ok)Gwsvr-5!DL(eAjsD~lsMzfdjyzcEB`SL
+zBVS0IysHLSZ#%s<B3}f?xPp5LUC!9xUQV2Qx1}=-p}XIB{YOEOKJ3}PhCuXn3_ai1
+zE7)?vWi4}`NqwC}H|7K|hrONx{tg~XF|Q}iSZAkC&iDr88(=Z;UbNp#oNvQ;eRBD4
+zV=Z><e+%6=9Q)r!my7-S<lNta^jlk#?B&T;M!t8@mw?FkF1lRg(<f)XrAYJnn;LKJ
+z4Ei|G3?k=;=<>$QM1BPPerJG)`8e_ZUO9(PfcxYl_gQpvPXw{=Q*`<0_cL_&%16xS
+z=+5y+a!){h0p!f%yF8C{`7ZT+3BCoMP2D`+?N`A2i@X=m&D)>+U!%*NqK@(30Qbmy
+tm**1a?9QW`-#X!2gr4^q6ScoXcfY?^7m=61Y2cgm%;u0Y&i~6R!G8?&M%@4a
 
 literal 0
 HcmV?d00001
 
 diff --git a/vita3k/shaders-builtin/vulkan/fg_interp.comp b/vita3k/shaders-builtin/vulkan/fg_interp.comp
 new file mode 100644
-index 00000000..bc388e50
+index 00000000..479e7a7d
 --- /dev/null
 +++ b/vita3k/shaders-builtin/vulkan/fg_interp.comp
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,135 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -15079,15 +15612,16 @@ index 00000000..bc388e50
 +// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 +
 +#version 450
-+// Frame generation, 3 of 3: the in-between frame. Each pixel tries a few motions d: none, the
-+// blocks' vectors around it blended (smooth motion), and each of those 4 blocks' own (an edge between
-+// two motions); a try samples both frames halfway along d (the previous one at p + d/2, the new one
-+// at p - d/2) at 5 points around the pixel, and the closest match wins (no motion and the blend win
-+// near ties). The pixel is the two samples' average. Where nothing matches (something appears, or is
-+// uncovered, or changes), and in the whole frame when fg_motion counted too many blocks without a
-+// match or unlike their neighbours (a cut, a whip, a fade), it is the new frame's pixel: the screen
-+// then shows the new frame a vblank early, as without frame generation, instead of a smeared one.
-+// What stays put (the HUD over a moving scene) is the average of both frames.
++// Frame generation, 3 of 3: the frame at a moment between two (the phase t: 0 the first frame, 1 the
++// second). Each pixel tries a few motions d (a point of the second frame at q was at q + d in the
++// first): none, the blocks' vectors around it blended (smooth motion), and each of those 4 blocks'
++// own (an edge between two motions); a try samples both frames where the point was and will be (the
++// first at p + d t, the second at p - d (1 - t)) at 5 points around the pixel, and the closest match
++// wins (no motion and the blend win near ties). The pixel is the two samples mixed by t. Where
++// nothing matches (something appears, or is uncovered, or changes), and in the whole frame when
++// fg_motion counted too many blocks without a match or unlike their neighbours (a cut, a whip, a
++// fade), it is the nearer frame's pixel, as without frame generation, instead of a smeared one. What
++// stays put (the HUD over a moving scene) is the two frames mixed.
 +
 +layout(local_size_x = 8, local_size_y = 8) in;
 +
@@ -15099,6 +15633,7 @@ index 00000000..bc388e50
 +    uint luma_h;
 +    uint blocks_w;
 +    uint pass_index;
++    float phase;
 +} c;
 +
 +layout(set = 0, binding = 0) uniform sampler2D previous;
@@ -15133,8 +15668,8 @@ index 00000000..bc388e50
 +    const float weight[5] = float[](2.0, 1.0, 1.0, 1.0, 1.0);
 +    float sum = 0.0;
 +    for (int i = 0; i < 5; i++) {
-+        const vec3 was = textureLod(previous, (p + at[i] + d * 0.5) / size, 0.0).rgb;
-+        const vec3 is = textureLod(current, (p + at[i] - d * 0.5) / size, 0.0).rgb;
++        const vec3 was = textureLod(previous, (p + at[i] + d * c.phase) / size, 0.0).rgb;
++        const vec3 is = textureLod(current, (p + at[i] - d * (1.0 - c.phase)) / size, 0.0).rgb;
 +        sum += weight[i] * difference(was, is);
 +    }
 +    return sum / 6.0;
@@ -15144,16 +15679,17 @@ index 00000000..bc388e50
 +    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
 +    if (pixel.x >= int(c.frame_size.x) || pixel.y >= int(c.frame_size.y))
 +        return;
++    const vec3 was = texelFetch(previous, pixel, 0).rgb;
 +    const vec3 is = texelFetch(current, pixel, 0).rgb;
-+    // the frame's motion can't be trusted: the new frame
++    const vec3 nearer = c.phase < 0.5 ? was : is;
++    // the frame's motion can't be trusted: the nearer frame
 +    const uint blocks = c.blocks_w * uint((int(c.luma_h) + BS - 1) / BS);
 +    if (judge.no_match * 4u > blocks || judge.incoherent * 20u > blocks * 7u) {
-+        imageStore(result, pixel, vec4(is, 1.0));
++        imageStore(result, pixel, vec4(nearer, 1.0));
 +        return;
 +    }
-+    const vec3 was = texelFetch(previous, pixel, 0).rgb;
 +    if (difference(was, is) < 0.03) {
-+        imageStore(result, pixel, vec4(mix(was, is, 0.5), 1.0));
++        imageStore(result, pixel, vec4(mix(was, is, c.phase), 1.0));
 +        return;
 +    }
 +
@@ -15186,115 +15722,118 @@ index 00000000..bc388e50
 +        }
 +    }
 +    if (best_mismatch >= GOOD) {
-+        imageStore(result, pixel, vec4(is, 1.0));
++        imageStore(result, pixel, vec4(nearer, 1.0));
 +        return;
 +    }
-+    const vec3 before = textureLod(previous, (p + d * 0.5) / size, 0.0).rgb;
-+    const vec3 after = textureLod(current, (p - d * 0.5) / size, 0.0).rgb;
-+    imageStore(result, pixel, vec4(mix(before, after, 0.5), 1.0));
++    const vec3 before = textureLod(previous, (p + d * c.phase) / size, 0.0).rgb;
++    const vec3 after = textureLod(current, (p - d * (1.0 - c.phase)) / size, 0.0).rgb;
++    imageStore(result, pixel, vec4(mix(before, after, c.phase), 1.0));
 +}
 diff --git a/vita3k/shaders-builtin/vulkan/fg_interp.comp.spv b/vita3k/shaders-builtin/vulkan/fg_interp.comp.spv
 new file mode 100644
-index 0000000000000000000000000000000000000000..979c12c769f03446c357c2579e0ba6072d2355d4
+index 0000000000000000000000000000000000000000..805021ca2f4301acac60ee47ec3de5986be58ff5
 GIT binary patch
-literal 11864
-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
-MZbE#oY5QLL51Oxl=>Px#
+literal 12392
+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
 
 literal 0
 HcmV?d00001
 
 diff --git a/vita3k/shaders-builtin/vulkan/fg_motion.comp b/vita3k/shaders-builtin/vulkan/fg_motion.comp
 new file mode 100644
-index 00000000..2a500e26
+index 00000000..17a16625
 --- /dev/null
 +++ b/vita3k/shaders-builtin/vulkan/fg_motion.comp
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,169 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -15316,9 +15855,10 @@ index 00000000..2a500e26
 +// Frame generation, 2 of 3: per 8x8 block of the new frame's luma, where it was in the previous
 +// frame's (the vector d: new(p) = previous(p + d)), by the sum of absolute differences plus a small
 +// cost per pixel of motion, so flat areas keep still. Coarse to fine, so camera pans are found:
-+//   pass 0  on the luma at half size (2x2 means): from no motion or the block's last vector, steps
-+//           of 8, 4, 2 and 1, up to 24 (48 luma pixels)
-+//   pass 1  on the luma: from the best of no motion, the block's last vector and twice the coarse
++//   pass 0  on the luma at half size (2x2 means): from no motion or the block's last coarse vector,
++//           steps of 8, 4, 2 and 1, up to 24 (48 luma pixels)
++//   pass 1  on the luma: from the best of no motion, the block's vector in the frame before (its
++//           motion from the one before that) and twice the coarse
 +//           vectors around it, steps of 2 and 1; a block whose best still differs by more than 0.07
 +//           a pixel is counted (it found no match)
 +//   pass 2  per block: counted when its vector is unlike all four neighbours' (by more than 4 luma
@@ -15335,6 +15875,7 @@ index 00000000..2a500e26
 +    uint luma_h;
 +    uint blocks_w;
 +    uint pass_index;
++    float phase;
 +} c;
 +
 +layout(set = 0, binding = 0) readonly buffer Previous {
@@ -15353,6 +15894,9 @@ index 00000000..2a500e26
 +    uint no_match;
 +    uint incoherent;
 +} judge;
++layout(set = 0, binding = 5) readonly buffer Last {
++    ivec2 last_vectors[];
++};
 +
 +const int BS = 8;
 +
@@ -15406,7 +15950,7 @@ index 00000000..2a500e26
 +
 +    ivec2 d = ivec2(0);
 +    float best = sad(block, d);
-+    const ivec2 last = c.pass_index == 0 ? coarse[index] : vectors[index];
++    const ivec2 last = c.pass_index == 0 ? coarse[index] : last_vectors[index];
 +    if (last != ivec2(0)) {
 +        const float s = sad(block, last);
 +        if (s < best) {
@@ -15461,123 +16005,125 @@ index 00000000..2a500e26
 +}
 diff --git a/vita3k/shaders-builtin/vulkan/fg_motion.comp.spv b/vita3k/shaders-builtin/vulkan/fg_motion.comp.spv
 new file mode 100644
-index 0000000000000000000000000000000000000000..8cb380bea3bcb1496f8f7e404cd7e679b3795baf
+index 0000000000000000000000000000000000000000..0747409ed3aa29d391539e8b4eb3ff808a006aa9
 GIT binary patch
-literal 16412
-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
-T`{Yyqb-~U-op+$Jci{g49xqYD
+literal 16676
+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
+N>=?9p2C91o{vR#KZN2~i
 
 literal 0
 HcmV?d00001

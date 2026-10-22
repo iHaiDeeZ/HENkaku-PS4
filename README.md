@@ -4,7 +4,7 @@
 in WSL Ubuntu with the M33 / Resonance / DolphinPS4 / Crema PS4 toolchain (clang 21 + libc++ 21 on
 OpenOrbis).
 
-Status: **v00.37**. On the console the launcher works (text, firmware download, installing a VPK),
+Status: **v00.38**. On the console the launcher works (text, firmware download, installing a VPK),
 PKGj runs (renderer on RADV, audio, dynarmic, the network), and Mortal Kombat (PCSE00023) plays:
 v00.12 fixed the GPU hang at the start of a fight by turning Vita3K's memory mapping off (see
 "Graphics" below). Its fights ran at 30 fps where the game wants 60 (slow motion); v00.13 (fast
