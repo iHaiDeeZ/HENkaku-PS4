@@ -1130,6 +1130,37 @@ index 040421ec..989f2107 100644
  	add_executable(
  		module-tests
  		tests/arg_layout_tests.cpp
+diff --git a/vita3k/modules/SceDisplay/SceDisplay.cpp b/vita3k/modules/SceDisplay/SceDisplay.cpp
+index 5ce4c807..59ac584a 100644
+--- a/vita3k/modules/SceDisplay/SceDisplay.cpp
++++ b/vita3k/modules/SceDisplay/SceDisplay.cpp
+@@ -38,6 +38,15 @@ static int display_wait(EmuEnvState &emuenv, SceUID thread_id, int vcount, const
+         // thus doing this can allow some games to run at 60fps
+         vcount = 1;
+ 
++#ifdef __PS4__
++    // Others (Mortal Kombat) wait twice for each frame they show, sceDisplayWaitSetFrameBuf then
++    // sceDisplayWaitVblankStart: with the FPS hack, the second wait of a frame returns at once.
++    static std::atomic<uint64_t> waited_frame{ ~0ull };
++    const uint64_t frame = emuenv.display.last_setframe_vblank_count.load();
++    if (emuenv.display.fps_hack && !is_since_setbuf && waited_frame.exchange(~0ull) == frame && emuenv.display.vblank_count.load() > frame)
++        return SCE_DISPLAY_ERROR_OK;
++#endif
++
+     uint64_t target_vcount;
+     if (is_since_setbuf) {
+         target_vcount = emuenv.display.last_setframe_vblank_count + vcount;
+@@ -49,6 +58,10 @@ static int display_wait(EmuEnvState &emuenv, SceUID thread_id, int vcount, const
+     }
+ 
+     wait_vblank(emuenv.display, thread, target_vcount, is_cb);
++#ifdef __PS4__
++    if (is_since_setbuf)
++        waited_frame = frame;
++#endif
+ 
+     if (emuenv.display.abort.load())
+         return SCE_DISPLAY_ERROR_NO_PIXEL_DATA;
 diff --git a/vita3k/modules/SceGxm/SceGxm.cpp b/vita3k/modules/SceGxm/SceGxm.cpp
 index 4c864368..a1c051e8 100644
 --- a/vita3k/modules/SceGxm/SceGxm.cpp
@@ -1211,7 +1242,7 @@ index 4c864368..a1c051e8 100644
      const ThreadStatePtr main_thread = emuenv.kernel.get_thread(thread_id);
      const ThreadStatePtr display_queue_thread = emuenv.kernel.create_thread(emuenv.mem, "SceGxmDisplayQueue", Ptr<void>(0), SCE_KERNEL_HIGHEST_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_DEFAULT, 0, nullptr);
 diff --git a/vita3k/overlay/include/overlay/pause_overlay.h b/vita3k/overlay/include/overlay/pause_overlay.h
-index 6c5147b7..e91a910c 100644
+index 6c5147b7..a87f7cbd 100644
 --- a/vita3k/overlay/include/overlay/pause_overlay.h
 +++ b/vita3k/overlay/include/overlay/pause_overlay.h
 @@ -23,21 +23,50 @@
@@ -1272,7 +1303,7 @@ index 6c5147b7..e91a910c 100644
  struct pause_overlay : public user_interface {
      explicit pause_overlay(app::AppSessionController &session_controller);
  
-@@ -47,36 +76,85 @@ struct pause_overlay : public user_interface {
+@@ -47,36 +76,95 @@ struct pause_overlay : public user_interface {
      void on_touch_pressed(float vx, float vy) override;
  
  private:
@@ -1311,7 +1342,15 @@ index 6c5147b7..e91a910c 100644
 -    std::vector<pause_overlay_button> m_buttons;
 -    std::atomic<pause_overlay_button_value> m_selected_button = PAUSE_BUTTON_RESUME;
 +    label m_subtitle;
-+    label m_hint;
++    // the footer: what the buttons do, each as its symbol and a word
++    struct hint {
++        std::unique_ptr<image_info> image;
++        image_view icon;
++        label text;
++    };
++    std::vector<std::unique_ptr<hint>> m_hints;
++    int m_hints_sys_button = -1;
++    bool m_hints_inner = false;
 +    std::vector<row> m_rows;
 +    std::vector<page_state> m_pages;
 +    // the rows change on the input thread (a page opens) while the render thread draws them
@@ -1320,6 +1359,7 @@ index 6c5147b7..e91a910c 100644
      float m_focus_pulse_time = 0.f;
  
 +    void build_rows();
++    void build_hints();
      void layout();
 +    void move(int step);
 +    void change(int step);
@@ -1354,7 +1394,8 @@ index 6c5147b7..e91a910c 100644
 +    static constexpr uint16_t k_row_radius = 7;
 +    static constexpr uint16_t k_font_size = 15;
 +    static constexpr uint16_t k_section_font_size = 13;
-+    static constexpr uint16_t k_hint_font_size = 12;
++    static constexpr uint16_t k_hint_font_size = 13;
++    static constexpr uint16_t k_hint_icon = 18;
 +    static constexpr uint16_t k_text_inset = 14;
 +    static constexpr uint16_t k_rows_max_h = 360;
      static constexpr int16_t k_text_voffset = -3;
@@ -1412,7 +1453,7 @@ index 117569cf2..4c8552a5 100644
          result.font_names.emplace_back("NotoSansKR-Regular.otf");
          result.font_names.emplace_back("NotoSansCJK-Regular.ttc");
 diff --git a/vita3k/overlay/src/pause_overlay.cpp b/vita3k/overlay/src/pause_overlay.cpp
-index 3e2404bb..140dfbfc 100644
+index 3e2404bb..253472cd 100644
 --- a/vita3k/overlay/src/pause_overlay.cpp
 +++ b/vita3k/overlay/src/pause_overlay.cpp
 @@ -19,21 +19,36 @@
@@ -1452,7 +1493,7 @@ index 3e2404bb..140dfbfc 100644
  
      m_bg_dimmer.set_pos(0, 0);
      m_bg_dimmer.set_size(virtual_width, virtual_height);
-@@ -42,73 +57,179 @@ pause_overlay::pause_overlay(app::AppSessionController &session_controller)
+@@ -42,72 +57,230 @@ pause_overlay::pause_overlay(app::AppSessionController &session_controller)
  
      m_card.back_color = k_color_card_bg;
      m_card.border_radius = k_card_radius;
@@ -1499,11 +1540,6 @@ index 3e2404bb..140dfbfc 100644
 +    m_subtitle.fore_color = k_color_muted;
 +    m_subtitle.back_color = k_transparent;
 +
-+    m_hint.set_font(k_pause_overlay_font, k_hint_font_size, false);
-+    m_hint.align_text(overlay_element::center);
-+    m_hint.fore_color = k_color_muted;
-+    m_hint.back_color = k_transparent;
-+
 +    if (!m_menu.icon_path.empty() && fs::exists(fs_utils::utf8_to_path(m_menu.icon_path))) {
 +        m_icon = std::make_unique<image_info>(m_menu.icon_path);
 +        if (m_icon->get_data())
@@ -1528,11 +1564,6 @@ index 3e2404bb..140dfbfc 100644
 -    m_title.set_pos(static_cast<int16_t>(0),
 -        static_cast<int16_t>(card_y - k_title_font_size - 15));
 -    m_title.set_size(virtual_width, k_title_font_size + 4);
--
--    const int16_t button_x = static_cast<int16_t>(card_x + (k_card_w - k_button_w) / 2);
--    const uint16_t total_buttons_h = static_cast<uint16_t>(m_buttons.size() * k_button_h
--        + (m_buttons.size() > 1 ? (m_buttons.size() - 1) * k_button_gap : 0));
--    int16_t button_y = static_cast<int16_t>(card_y + (k_card_h - total_buttons_h) / 2);
 +// The open page's lines: the first page has Resume and Exit around the frontend's
 +void pause_overlay::build_rows() {
 +    m_rows.clear();
@@ -1587,9 +1618,10 @@ index 3e2404bb..140dfbfc 100644
 +            add_item(item);
 +    }
  
--    for (auto &button : m_buttons) {
--        button.bg.set_pos(button_x, button_y);
--        button.bg.set_size(k_button_w, k_button_h);
+-    const int16_t button_x = static_cast<int16_t>(card_x + (k_card_w - k_button_w) / 2);
+-    const uint16_t total_buttons_h = static_cast<uint16_t>(m_buttons.size() * k_button_h
+-        + (m_buttons.size() > 1 ? (m_buttons.size() - 1) * k_button_gap : 0));
+-    int16_t button_y = static_cast<int16_t>(card_y + (k_card_h - total_buttons_h) / 2);
 +    // the heading: the menu's name, then the pages open ("HENkaku > Settings > Display")
 +    std::string title = m_menu.title.empty() ? std::string("HENkaku") : m_menu.title;
 +    for (const page_state &open : m_pages) {
@@ -1597,14 +1629,51 @@ index 3e2404bb..140dfbfc 100644
 +            title += "  >  " + open.page->name;
 +    }
 +    m_title.set_text(title);
-+    m_hint.set_text(m_pages.size() > 1 ? "Cross: select     Left / Right: change     Circle: back"
-+                                       : "Cross: select     Left / Right: change     Circle: back to the game");
++    build_hints();
 +
 +    // on a line that can be picked
 +    page_state &current = m_pages.back();
 +    current.selected = std::clamp(current.selected, 0, std::max(0, static_cast<int>(m_rows.size()) - 1));
 +    if (!selectable(current.selected))
 +        move(1);
++}
+ 
+-    for (auto &button : m_buttons) {
+-        button.bg.set_pos(button_x, button_y);
+-        button.bg.set_size(k_button_w, k_button_h);
++// The footer's symbols: the system's enter button selects, the other goes back
++void pause_overlay::build_hints() {
++    const int sys_button = m_sys_button.load();
++    const bool inner = m_pages.size() > 1;
++    if (!m_hints.empty() && sys_button == m_hints_sys_button && inner == m_hints_inner)
++        return;
++    m_hints_sys_button = sys_button;
++    m_hints_inner = inner;
++    const bool circle_enters = sys_button == SCE_SYSTEM_PARAM_ENTER_BUTTON_CIRCLE;
++    const std::pair<const char *, const char *> hints[] = {
++        { circle_enters ? "circle.png" : "cross.png", "Select" },
++        { "left_right.png", "Change" },
++        { circle_enters ? "cross.png" : "circle.png", inner ? "Back" : "Resume" },
++    };
++    m_hints.clear();
++    for (const auto &[file, word] : hints) {
++        auto h = std::make_unique<hint>();
++        const std::string path = resource_config::get_icons_dir() + "buttons/" + file;
++        if (fs::exists(fs_utils::utf8_to_path(path))) {
++            h->image = std::make_unique<image_info>(path);
++            if (h->image->get_data())
++                h->icon.set_raw_image(h->image.get());
++            else
++                h->image.reset();
++        }
++        h->text.set_font(k_pause_overlay_font, k_hint_font_size, false);
++        h->text.align_text(overlay_element::left);
++        h->text.fore_color = k_color_muted;
++        h->text.back_color = k_transparent;
++        // (without the symbol, the button's name)
++        h->text.set_text(h->image ? word : std::string(file).substr(0, std::string(file).find('.')) + ": " + word);
++        m_hints.push_back(std::move(h));
++    }
 +}
  
 -        button.text.set_pos(button_x,
@@ -1681,13 +1750,34 @@ index 3e2404bb..140dfbfc 100644
 -    if (!m_buttons.empty()) {
 -        m_selected_button = (pause_overlay_button_value)std::clamp(static_cast<int>(m_selected_button), 0,
 -            static_cast<int>(m_buttons.size()) - 1);
--    }
-+    m_hint.set_pos(card_x, static_cast<int16_t>(card_y + card_h - k_footer_h + (k_footer_h - k_hint_font_size) / 2 + k_text_voffset));
-+    m_hint.set_size(k_card_w, k_hint_font_size + 4);
++    // the footer's hints, centered: symbol, word, a gap
++    build_hints();
++    constexpr int gap = 22, after_icon = 6;
++    std::vector<uint16_t> widths;
++    int total = 0;
++    for (auto &h : m_hints) {
++        uint16_t tw = 0, th = 0;
++        h->text.measure_text(tw, th, true);
++        widths.push_back(tw);
++        total += (h->image ? k_hint_icon + after_icon : 0) + tw + gap;
++    }
++    total -= gap;
++    int x = card_x + (k_card_w - total) / 2;
++    const int footer_y = card_y + card_h - k_footer_h;
++    for (size_t i = 0; i < m_hints.size(); i++) {
++        hint &h = *m_hints[i];
++        if (h.image) {
++            h.icon.set_pos(static_cast<int16_t>(x), static_cast<int16_t>(footer_y + (k_footer_h - k_hint_icon) / 2));
++            h.icon.set_size(k_hint_icon, k_hint_icon);
++            x += k_hint_icon + after_icon;
++        }
++        h.text.set_pos(static_cast<int16_t>(x), static_cast<int16_t>(footer_y + (k_footer_h - k_hint_font_size) / 2 + k_text_voffset));
++        h.text.set_size(static_cast<uint16_t>(widths[i] + 4), k_hint_font_size + 4);
++        x += widths[i] + gap;
+     }
  }
  
- bool pause_overlay::poll_dialog(DialogState &dialog, int date_format, int sys_button) {
-@@ -124,61 +245,128 @@ bool pause_overlay::poll_dialog(DialogState &dialog, int date_format, int sys_bu
+@@ -124,61 +297,128 @@ bool pause_overlay::poll_dialog(DialogState &dialog, int date_format, int sys_bu
      return true;
  }
  
@@ -1855,7 +1945,7 @@ index 3e2404bb..140dfbfc 100644
              return;
          }
      }
-@@ -190,19 +378,43 @@ compiled_resource pause_overlay::get_compiled() {
+@@ -190,19 +430,47 @@ compiled_resource pause_overlay::get_compiled() {
      if (!visible)
          return result;
  
@@ -1903,11 +1993,15 @@ index 3e2404bb..140dfbfc 100644
 -    draw_focus_ring(result);
 +    if (selectable(selected) && m_rows[selected].visible)
 +        draw_focus_ring(result, m_rows[selected]);
-+    result.add(m_hint.get_compiled());
++    for (auto &h : m_hints) {
++        if (h->image)
++            result.add(h->icon.get_compiled());
++        result.add(h->text.get_compiled());
++    }
  
      return result;
  }
-@@ -219,13 +431,7 @@ bool pause_overlay::is_cancel_button(pad_button button) const {
+@@ -219,13 +487,7 @@ bool pause_overlay::is_cancel_button(pad_button button) const {
      return button == pad_button::circle;
  }
  
@@ -1922,7 +2016,7 @@ index 3e2404bb..140dfbfc 100644
      const float pulse = 0.5f + 0.5f * std::sin(m_focus_pulse_time * 3.0f);
      const float a = 0.85f + 0.15f * pulse;
  
-@@ -235,7 +441,7 @@ void pause_overlay::draw_focus_ring(compiled_resource &res) const {
+@@ -235,7 +497,7 @@ void pause_overlay::draw_focus_ring(compiled_resource &res) const {
      ring.back_color = { k_color_focus_ring.r, k_color_focus_ring.g, k_color_focus_ring.b, 0.15f * a };
      ring.border_size = k_focus_ring_thickness;
      ring.border_color = { k_color_focus_ring.r, k_color_focus_ring.g, k_color_focus_ring.b, a };
@@ -1978,10 +2072,10 @@ index 00000000..14dfe225
 +ps4_add_eboot(vita3k)
 diff --git a/vita3k/ps4/ps4_canvas.cpp b/vita3k/ps4/ps4_canvas.cpp
 new file mode 100644
-index 00000000..75d4a6e8
+index 00000000..c41357fc
 --- /dev/null
 +++ b/vita3k/ps4/ps4_canvas.cpp
-@@ -0,0 +1,486 @@
+@@ -0,0 +1,705 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -2016,6 +2110,7 @@ index 00000000..75d4a6e8
 +#include <algorithm>
 +#include <cmath>
 +#include <cstdio>
++#include <cstring>
 +#include <memory>
 +#include <mutex>
 +#include <unordered_map>
@@ -2234,10 +2329,198 @@ index 00000000..75d4a6e8
 +    return out;
 +}
 +
++void premultiply(Image &image) {
++    for (uint32_t &p : image.pixels) {
++        const uint32_t a = p >> 24;
++        if (a == 255)
++            continue;
++        const uint32_t r = ((p & 0xFF) * a + 127) / 255;
++        const uint32_t g = (((p >> 8) & 0xFF) * a + 127) / 255;
++        const uint32_t b = (((p >> 16) & 0xFF) * a + 127) / 255;
++        p = r | (g << 8) | (b << 16) | (a << 24);
++    }
++}
++
++Image shrink_image(const Image &image, int width, int height) {
++    Image out;
++    if (image.empty() || width <= 0 || height <= 0)
++        return out;
++    out.width = width;
++    out.height = height;
++    out.pixels.resize(static_cast<size_t>(width) * height);
++    for (int y = 0; y < height; y++) {
++        const int y0 = y * image.height / height;
++        const int y1 = std::max(y0 + 1, (y + 1) * image.height / height);
++        for (int x = 0; x < width; x++) {
++            const int x0 = x * image.width / width;
++            const int x1 = std::max(x0 + 1, (x + 1) * image.width / width);
++            uint32_t sum[4] = {};
++            for (int sy = y0; sy < y1; sy++) {
++                for (int sx = x0; sx < x1; sx++) {
++                    const uint32_t p = image.pixels[static_cast<size_t>(sy) * image.width + sx];
++                    for (int c = 0; c < 4; c++)
++                        sum[c] += (p >> (c * 8)) & 0xFF;
++                }
++            }
++            const uint32_t n = static_cast<uint32_t>((y1 - y0) * (x1 - x0));
++            uint32_t p = 0;
++            for (int c = 0; c < 4; c++)
++                p |= ((sum[c] + n / 2) / n) << (c * 8);
++            out.pixels[static_cast<size_t>(y) * width + x] = p;
++        }
++    }
++    return out;
++}
++
++TextSprite render_text(std::string_view utf8, int px, Color c, Weight weight, int max_width, uint8_t shadow) {
++    // white on black: the red channel is then the text's coverage
++    const int pad = shadow ? 4 : 1;
++    Canvas scratch(1, 1);
++    int width = scratch.text_width(utf8, px, weight);
++    if (max_width > 0)
++        width = std::min(width, max_width);
++    TextSprite out;
++    out.baseline = pad + px;
++    const int sw = width + 2 * pad + 2, sh = px + px / 2 + 2 * pad;
++    Canvas mask(sw, sh);
++    mask.text(pad, out.baseline, utf8, px, rgb(0xffffff), weight, max_width);
++    const uint32_t *cov = mask.data();
++    out.image.width = sw;
++    out.image.height = sh;
++    out.image.pixels.resize(static_cast<size_t>(sw) * sh);
++    for (int y = 0; y < sh; y++) {
++        for (int x = 0; x < sw; x++) {
++            const uint32_t a = cov[static_cast<size_t>(y) * sw + x] & 0xFF;
++            uint32_t s = 0;
++            if (shadow) {
++                // the text's coverage 1 px right, 2 px down, softened over 3x3
++                uint32_t sum = 0;
++                for (int dy = -1; dy <= 1; dy++)
++                    for (int dx = -1; dx <= 1; dx++) {
++                        const int sx = x - 1 + dx, sy = y - 2 + dy;
++                        if (sx >= 0 && sy >= 0 && sx < sw && sy < sh)
++                            sum += cov[static_cast<size_t>(sy) * sw + sx] & 0xFF;
++                    }
++                s = sum / 9 * shadow / 255;
++            }
++            const uint32_t ta = a * c.a / 255;
++            const uint32_t oa = ta + s * (255 - ta) / 255;
++            out.image.pixels[static_cast<size_t>(y) * sw + x] = (c.r * ta / 255) | ((c.g * ta / 255) << 8) | ((c.b * ta / 255) << 16) | (oa << 24);
++        }
++    }
++    return out;
++}
++
 +Canvas::Canvas(int width, int height)
 +    : w(width)
 +    , h(height)
 +    , pixels(static_cast<size_t>(width) * height) {}
++
++Image Canvas::snapshot() const {
++    Image out;
++    out.width = w;
++    out.height = h;
++    out.pixels = pixels;
++    return out;
++}
++
++void Canvas::copy_from(const Canvas &src, int dx, int dy) {
++    if (src.w != w || src.h != h)
++        return;
++    const int x0 = std::max(0, dx), x1 = std::min(w, w + dx);
++    if (x1 <= x0)
++        return;
++    for (int y = std::max(0, dy); y < std::min(h, h + dy); y++)
++        std::memcpy(&pixels[static_cast<size_t>(y) * w + x0], &src.pixels[static_cast<size_t>(y - dy) * w + (x0 - dx)], static_cast<size_t>(x1 - x0) * 4);
++}
++
++namespace {
++// dst = src + dst * (1 - src alpha), src premultiplied, the result opaque
++inline uint32_t over(uint32_t dst, uint32_t src) {
++    const uint32_t a = src >> 24;
++    if (a == 255)
++        return src;
++    const uint32_t ia = 255 - a;
++    // two channels at a time
++    const uint32_t rb = (((dst & 0x00FF00FFu) * ia + 0x00800080u) >> 8) & 0x00FF00FFu;
++    const uint32_t g = (((dst & 0x0000FF00u) * ia + 0x00008000u) >> 8) & 0x0000FF00u;
++    return ((src & 0x00FFFFFFu) + rb + g) | 0xFF000000u;
++}
++
++inline uint32_t fade(uint32_t p, uint32_t alpha) {
++    const uint32_t rb = (((p & 0x00FF00FFu) * alpha + 0x00800080u) >> 8) & 0x00FF00FFu;
++    const uint32_t ag = ((((p >> 8) & 0x00FF00FFu) * alpha + 0x00800080u) >> 8) & 0x00FF00FFu;
++    return rb | (ag << 8);
++}
++} // namespace
++
++void Canvas::blit(const Image &sprite, int x, int y, uint8_t alpha) {
++    const int x0 = std::max(0, x), x1 = std::min(w, x + sprite.width);
++    const int y0 = std::max(0, y), y1 = std::min(h, y + sprite.height);
++    for (int yy = y0; yy < y1; yy++) {
++        const uint32_t *src = &sprite.pixels[static_cast<size_t>(yy - y) * sprite.width + (x0 - x)];
++        uint32_t *dst = &pixels[static_cast<size_t>(yy) * w + x0];
++        for (int xx = x0; xx < x1; xx++, src++, dst++) {
++            uint32_t p = *src;
++            if (alpha != 255)
++                p = fade(p, alpha + 1u);
++            if ((p >> 24) == 0)
++                continue;
++            *dst = over(*dst, p);
++        }
++    }
++}
++
++void Canvas::blit_scaled(const Image &sprite, float cx, float cy, float scale, uint8_t alpha) {
++    if (sprite.empty() || scale <= 0.01f)
++        return;
++    if (std::fabs(scale - 1.f) < 0.004f) {
++        blit(sprite, static_cast<int>(std::lround(cx - sprite.width / 2.f)), static_cast<int>(std::lround(cy - sprite.height / 2.f)), alpha);
++        return;
++    }
++    const float half_w = sprite.width * scale / 2, half_h = sprite.height * scale / 2;
++    const int x0 = std::max(0, static_cast<int>(cx - half_w)), x1 = std::min(w, static_cast<int>(cx + half_w) + 1);
++    const int y0 = std::max(0, static_cast<int>(cy - half_h)), y1 = std::min(h, static_cast<int>(cy + half_h) + 1);
++    const float inv = 1.f / scale;
++    // 16.16 fixed point source coordinates, bilinear
++    const int32_t step = static_cast<int32_t>(inv * 65536.f);
++    const int sw = sprite.width, sh = sprite.height;
++    for (int yy = y0; yy < y1; yy++) {
++        const float sy = (yy + 0.5f - cy) * inv + sh / 2.f - 0.5f;
++        if (sy < -1.f || sy >= sh)
++            continue;
++        const int iy = static_cast<int>(std::floor(sy));
++        const uint32_t fy = static_cast<uint32_t>((sy - iy) * 256.f);
++        const bool top_in = iy >= 0, bottom_in = iy + 1 < sh;
++        int32_t sx = static_cast<int32_t>(((x0 + 0.5f - cx) * inv + sw / 2.f - 0.5f) * 65536.f);
++        uint32_t *dst = &pixels[static_cast<size_t>(yy) * w];
++        for (int xx = x0; xx < x1; xx++, sx += step) {
++            const int ix = sx >> 16;
++            if (ix < -1 || ix >= sw)
++                continue;
++            const uint32_t fx = (static_cast<uint32_t>(sx) >> 8) & 0xFF;
++            const auto at = [&](int px, int py, bool row_in) -> uint32_t {
++                return row_in && px >= 0 && px < sw ? sprite.pixels[static_cast<size_t>(py) * sw + px] : 0u;
++            };
++            const uint32_t p00 = at(ix, iy, top_in), p10 = at(ix + 1, iy, top_in);
++            const uint32_t p01 = at(ix, iy + 1, bottom_in), p11 = at(ix + 1, iy + 1, bottom_in);
++            if ((p00 | p10 | p01 | p11) == 0)
++                continue;
++            const auto lerp = [](uint32_t a, uint32_t b, uint32_t f) {
++                // per channel, f in 0..256
++                const uint32_t rb = ((((a & 0x00FF00FFu) * (256 - f)) + ((b & 0x00FF00FFu) * f)) >> 8) & 0x00FF00FFu;
++                const uint32_t ag = (((((a >> 8) & 0x00FF00FFu) * (256 - f)) + (((b >> 8) & 0x00FF00FFu) * f)) >> 8) & 0x00FF00FFu;
++                return rb | (ag << 8);
++            };
++            uint32_t p = lerp(lerp(p00, p10, fx), lerp(p01, p11, fx), fy);
++            if (alpha != 255)
++                p = fade(p, alpha + 1u);
++            if ((p >> 24) == 0)
++                continue;
++            dst[xx] = over(dst[xx], p);
++        }
++    }
++}
 +
 +void Canvas::blend(int x, int y, Color c, uint8_t cov) {
 +    if (x < 0 || y < 0 || x >= w || y >= h || cov == 0)
@@ -2271,9 +2554,15 @@ index 00000000..75d4a6e8
 +void Canvas::fill_rect(int x, int y, int width, int height, Color c) {
 +    const int x0 = std::max(x, 0), x1 = std::min(x + width, w);
 +    const int y0 = std::max(y, 0), y1 = std::min(y + height, h);
-+    for (int yy = y0; yy < y1; yy++)
++    if (c.a == 0)
++        return;
++    const uint32_t a = c.a;
++    const uint32_t src = a == 255 ? pack(c) : ((c.r * a / 255) | ((c.g * a / 255) << 8) | ((c.b * a / 255) << 16) | (a << 24));
++    for (int yy = y0; yy < y1; yy++) {
++        uint32_t *row = &pixels[static_cast<size_t>(yy) * w];
 +        for (int xx = x0; xx < x1; xx++)
-+            blend(xx, yy, c, 255);
++            row[xx] = over(row[xx], src);
++    }
 +}
 +
 +void Canvas::fill_round_rect(int x, int y, int width, int height, int radius, Color c) {
@@ -2291,9 +2580,33 @@ index 00000000..75d4a6e8
 +}
 +
 +void Canvas::fill_circle(float cx, float cy, float radius, Color c) {
-+    for (int yy = static_cast<int>(cy - radius - 1); yy <= static_cast<int>(cy + radius + 1); yy++)
-+        for (int xx = static_cast<int>(cx - radius - 1); xx <= static_cast<int>(cx + radius + 1); xx++)
-+            blend(xx, yy, c, coverage(radius - std::hypot(xx + 0.5f - cx, yy + 0.5f - cy) + 0.5f));
++    // per row: the run inside the circle in one go, only its two edges anti-aliased
++    if (c.a == 0)
++        return;
++    const uint32_t a = c.a;
++    const uint32_t src = a == 255 ? pack(c) : ((c.r * a / 255) | ((c.g * a / 255) << 8) | ((c.b * a / 255) << 16) | (a << 24));
++    for (int yy = std::max(0, static_cast<int>(cy - radius - 1)); yy <= std::min(h - 1, static_cast<int>(cy + radius + 1)); yy++) {
++        const float dy = yy + 0.5f - cy;
++        const float outer2 = (radius + 1) * (radius + 1) - dy * dy;
++        if (outer2 <= 0)
++            continue;
++        const float inner2 = (radius - 1) * (radius - 1) - dy * dy;
++        const float inner = inner2 > 0 ? std::sqrt(inner2) : -1.f;
++        const int in0 = inner > 0 ? std::max(0, static_cast<int>(std::ceil(cx - inner + 0.5f))) : 1;
++        const int in1 = inner > 0 ? std::min(w, static_cast<int>(std::floor(cx + inner - 0.5f))) : 0;
++        const float outer = std::sqrt(outer2);
++        const int e0 = std::max(0, static_cast<int>(cx - outer - 1)), e1 = std::min(w - 1, static_cast<int>(cx + outer + 1));
++        uint32_t *row = &pixels[static_cast<size_t>(yy) * w];
++        for (int xx = e0; xx <= e1; xx++) {
++            if (xx >= in0 && xx < in1) {
++                for (; xx < in1; xx++)
++                    row[xx] = over(row[xx], src);
++                xx--;
++                continue;
++            }
++            blend(xx, yy, c, coverage(radius - std::hypot(xx + 0.5f - cx, dy) + 0.5f));
++        }
++    }
 +}
 +
 +void Canvas::ring(float cx, float cy, float radius, float thickness, Color c) {
@@ -2470,10 +2783,10 @@ index 00000000..75d4a6e8
 +} // namespace ps4ui
 diff --git a/vita3k/ps4/ps4_canvas.h b/vita3k/ps4/ps4_canvas.h
 new file mode 100644
-index 00000000..9c33893b
+index 00000000..3c973064
 --- /dev/null
 +++ b/vita3k/ps4/ps4_canvas.h
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,124 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -2521,11 +2834,23 @@ index 00000000..9c33893b
 +
 +// Loads a PNG/JPEG, scaled to fit width x height (0 = as it is)
 +Image load_image(const std::string &path, int width = 0, int height = 0);
++// Its colours multiplied by its alpha: what Canvas::blit and blit_scaled take (a sprite)
++void premultiply(Image &image);
++// Scaled to width x height, each pixel the average of the pixels it covers (for shrinking)
++Image shrink_image(const Image &image, int width, int height);
 +
 +enum class Weight {
 +    Regular,
 +    Bold,
 +};
++
++// Text as a sprite (premultiplied), with a soft shadow under it when shadow > 0: its baseline
++// at `baseline` from its top, which the result's height leaves room under
++struct TextSprite {
++    Image image;
++    int baseline = 0;
++};
++TextSprite render_text(std::string_view utf8, int px, Color c, Weight weight, int max_width, uint8_t shadow);
 +
 +class Canvas {
 +public:
@@ -2534,6 +2859,15 @@ index 00000000..9c33893b
 +    int width() const { return w; }
 +    int height() const { return h; }
 +    const uint32_t *data() const { return pixels.data(); }
++    uint32_t *data() { return pixels.data(); }
++    // What it shows, as a picture (to draw again later)
++    Image snapshot() const;
++
++    // The same size: all of `src`, moved by dx, dy (what it doesn't cover stays as it was)
++    void copy_from(const Canvas &src, int dx = 0, int dy = 0);
++    // Premultiplied sprites: at (x, y), or centered on (cx, cy) at `scale`, faded by alpha
++    void blit(const Image &sprite, int x, int y, uint8_t alpha = 255);
++    void blit_scaled(const Image &sprite, float cx, float cy, float scale, uint8_t alpha = 255);
 +
 +    void clear_gradient(Color top, Color bottom);
 +    void fill_rect(int x, int y, int width, int height, Color c);
@@ -2803,10 +3137,10 @@ index 00000000..01fdf0f1
 +} // namespace ps4download
 diff --git a/vita3k/ps4/ps4_launcher.cpp b/vita3k/ps4/ps4_launcher.cpp
 new file mode 100644
-index 00000000..96c65f1e
+index 00000000..6c45d7ad
 --- /dev/null
 +++ b/vita3k/ps4/ps4_launcher.cpp
-@@ -0,0 +1,1985 @@
+@@ -0,0 +1,2525 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -2937,6 +3271,9 @@ index 00000000..96c65f1e
 +bool registered = false;
 +bool splash_hidden = false;
 +int current = 0;
++// the launcher's flips carry their number (above the swapchains' own), to know when one is shown
++int64_t flips = 0;
++constexpr int64_t FLIP_ARG_BASE = 0x4c000000;
 +
 +// (in boot-trace.log as well: whether the launcher ever reached the screen)
 +void screen_trace(const std::string &line) {
@@ -2981,12 +3318,26 @@ index 00000000..96c65f1e
 +    return true;
 +}
 +
++// Until the last flip is on screen (so the buffer about to be written isn't): this paces the
++// launcher's animations to the TV's refresh
++void wait_flipped() {
++    if (flips == 0)
++        return;
++    for (int i = 0; i < 60; i++) {
++        OrbisVideoOutFlipStatus status{};
++        if (sceVideoOutGetFlipStatus(ps4wsi_video_handle(), &status) < 0 || status.flipArg >= FLIP_ARG_BASE + flips)
++            return;
++        std::this_thread::sleep_for(std::chrono::microseconds(500));
++    }
++}
++
 +void present(const Canvas &canvas) {
 +    if (!setup_buffers())
 +        return;
++    wait_flipped();
 +    std::memcpy(buffers[current], canvas.data(), static_cast<size_t>(W) * H * 4);
 +    __atomic_thread_fence(__ATOMIC_SEQ_CST); // write-combined stores out before the flip
-+    const int flip = sceVideoOutSubmitFlip(ps4wsi_video_handle(), ps4wsi::LAUNCHER_FIRST_BUFFER + current, ORBIS_VIDEO_OUT_FLIP_VSYNC, 0);
++    const int flip = sceVideoOutSubmitFlip(ps4wsi_video_handle(), ps4wsi::LAUNCHER_FIRST_BUFFER + current, ORBIS_VIDEO_OUT_FLIP_VSYNC, FLIP_ARG_BASE + ++flips);
 +    if (!splash_hidden) {
 +        screen_trace(fmt::format("first frame (flip {:08X})", static_cast<uint32_t>(flip)));
 +        // the system shows the app's splash picture until the app has one of its own
@@ -2997,11 +3348,17 @@ index 00000000..96c65f1e
 +}
 +
 +void background(Canvas &c) {
-+    c.clear_gradient(rgb(0x0d2347), rgb(0x04070f));
-+    // the Vita's bubbles, faintly
-+    c.fill_circle(1660, 210, 420, rgb(0x2a6fd6, 18));
-+    c.fill_circle(1500, 900, 300, rgb(0x5fc4ff, 12));
-+    c.fill_circle(240, 1040, 260, rgb(0x2a6fd6, 14));
++    // (made once: the big soft circles took the CPU a long time for each frame)
++    static const Canvas made = [] {
++        Canvas c(W, H);
++        c.clear_gradient(rgb(0x0d2347), rgb(0x04070f));
++        // the Vita's bubbles, faintly
++        c.fill_circle(1660, 210, 420, rgb(0x2a6fd6, 18));
++        c.fill_circle(1500, 900, 300, rgb(0x5fc4ff, 12));
++        c.fill_circle(240, 1040, 260, rgb(0x2a6fd6, 14));
++        return c;
++    }();
++    c.copy_from(made);
 +}
 +
 +void header(Canvas &c, const app::FirmwareState &fw) {
@@ -3032,6 +3389,8 @@ index 00000000..96c65f1e
 +    Triangle,
 +    Options,
 +    DPad,
++    L1,
++    R1,
 +};
 +
 +struct Hint {
@@ -3039,38 +3398,56 @@ index 00000000..96c65f1e
 +    std::string label;
 +};
 +
-+// What the buttons do on this screen, left to right
-+void footer(Canvas &c, const std::vector<Hint> &hints) {
-+    int x = MARGIN;
-+    const int y = 1024;
++// What the buttons do on this screen, left to right from x (centered on the screen when x < 0),
++// at `scale` of their full size
++void footer(Canvas &c, const std::vector<Hint> &hints, int y = 1024, float scale = 1.f, int x = MARGIN) {
++    const float r = 20.f * scale;
++    const int px = static_cast<int>(30 * scale), pill = static_cast<int>(22 * scale);
++    const auto pill_label = [](Pad button) -> const char * {
++        switch (button) {
++        case Pad::Options:
++            return "OPTIONS";
++        case Pad::DPad:
++            return "LEFT / RIGHT";
++        case Pad::L1:
++            return "L1";
++        case Pad::R1:
++            return "R1";
++        default:
++            return nullptr;
++        }
++    };
++    const auto glyph_width = [&](Pad button) {
++        const char *label = pill_label(button);
++        return label ? c.text_width(label, pill, Weight::Bold) + static_cast<int>(40 * scale) : static_cast<int>(50 * scale);
++    };
++    if (x < 0) {
++        int total = 0;
++        for (const Hint &hint : hints)
++            total += glyph_width(hint.button) + c.text_width(hint.label, px) + static_cast<int>(48 * scale);
++        x = (W - total + static_cast<int>(48 * scale)) / 2;
++    }
++    const float gy = y - 10.f * scale;
 +    for (const Hint &hint : hints) {
 +        switch (hint.button) {
 +        case Pad::Cross:
-+            c.cross_button(x + 20.f, y - 10.f, 20.f);
-+            x += 50;
++            c.cross_button(x + r, gy, r);
 +            break;
 +        case Pad::Circle:
-+            c.circle_button(x + 20.f, y - 10.f, 20.f);
-+            x += 50;
++            c.circle_button(x + r, gy, r);
 +            break;
 +        case Pad::Square:
-+            c.square_button(x + 20.f, y - 10.f, 20.f);
-+            x += 50;
++            c.square_button(x + r, gy, r);
 +            break;
 +        case Pad::Triangle:
-+            c.triangle_button(x + 20.f, y - 10.f, 20.f);
-+            x += 50;
++            c.triangle_button(x + r, gy, r);
 +            break;
-+        case Pad::Options:
-+            c.pill_button(x, y - 10, "OPTIONS", 22);
-+            x += c.text_width("OPTIONS", 22, Weight::Bold) + 40;
-+            break;
-+        case Pad::DPad:
-+            c.pill_button(x, y - 10, "LEFT / RIGHT", 22);
-+            x += c.text_width("LEFT / RIGHT", 22, Weight::Bold) + 40;
++        default:
++            c.pill_button(x, static_cast<int>(gy), pill_label(hint.button), pill);
 +            break;
 +        }
-+        x += c.text(x, y, hint.label, 30, TEXT) + 48;
++        x += glyph_width(hint.button);
++        x += c.text(x, y, hint.label, px, TEXT) + static_cast<int>(48 * scale);
 +    }
 +}
 +
@@ -3081,7 +3458,7 @@ index 00000000..96c65f1e
 +    bool icons_loaded = false;
 +    ps4ui::Image small;
 +    ps4ui::Image large;
-+    // the home screen's bubble (at the selected bubble's size)
++    // the home screen's bubble's icon
 +    ps4ui::Image bubble;
 +    // its LiveArea: the background and the start gate's picture (sce_sys/livearea/contents)
 +    bool livearea_loaded = false;
@@ -3110,7 +3487,7 @@ index 00000000..96c65f1e
 +        return;
 +    item.small = ps4ui::load_image(item.entry.icon_path, ICON, ICON);
 +    item.large = ps4ui::load_image(item.entry.icon_path, BIG_ICON, BIG_ICON);
-+    item.bubble = ps4ui::load_image(item.entry.icon_path, 224, 224);
++    item.bubble = ps4ui::load_image(item.entry.icon_path, 236, 236); // (the home screen's ICON_SIZE)
 +}
 +
 +void icon_placeholder(Canvas &c, int x, int y, int size) {
@@ -3892,28 +4269,39 @@ index 00000000..96c65f1e
 +}
 +
 +// --- the PS Vita's home screen: bubbles ---
++//
++// As on the Vita (960x544, here twice its size): pages of 10 bubbles in rows of 3, 4 and 3, the
++// rows across the whole screen, pages one under another with their dots down the right edge. A
++// game's bubble opens its LiveArea as a card to the right of the home screen; open cards stay
++// (their bubbles in the status bar) until peeled away from their top right corner. Drawn by the
++// CPU, so everything that moves is a sprite made once (bubble, label, focus glow) over a wallpaper
++// made once, and only what an animation needs is drawn again for each frame.
 +
 +constexpr int PER_PAGE = 10;
-+constexpr float BUBBLE_R = 100.f;
-+constexpr float BUBBLE_SEL_R = 112.f;
-+constexpr float HOME_CX = 920.f;
++constexpr float BUBBLE_R = 118.f;
++constexpr int SPRITE_PAD = 20; // room for the shadow and the focus glow
++constexpr int SPRITE = 2 * static_cast<int>(BUBBLE_R) + 2 * SPRITE_PAD;
++constexpr int ICON_SIZE = 2 * static_cast<int>(BUBBLE_R);
++constexpr float COLUMN = 462.f;
++constexpr int STATUS_H = 60;
++constexpr int MAX_CARDS = 5;
 +
 +struct Slot {
 +    float x, y;
 +    int row;
 +};
-+// rows of 3, 4 and 3 bubbles, staggered as on the PS Vita's home screen; pages one under another
++const float ROW_Y[3] = { 232.f, 524.f, 816.f };
 +const Slot SLOTS[PER_PAGE] = {
-+    { HOME_CX - 300, 300, 0 },
-+    { HOME_CX, 300, 0 },
-+    { HOME_CX + 300, 300, 0 },
-+    { HOME_CX - 450, 545, 1 },
-+    { HOME_CX - 150, 545, 1 },
-+    { HOME_CX + 150, 545, 1 },
-+    { HOME_CX + 450, 545, 1 },
-+    { HOME_CX - 300, 790, 2 },
-+    { HOME_CX, 790, 2 },
-+    { HOME_CX + 300, 790, 2 },
++    { W / 2 - COLUMN, ROW_Y[0], 0 },
++    { W / 2.f, ROW_Y[0], 0 },
++    { W / 2 + COLUMN, ROW_Y[0], 0 },
++    { W / 2 - 1.5f * COLUMN, ROW_Y[1], 1 },
++    { W / 2 - 0.5f * COLUMN, ROW_Y[1], 1 },
++    { W / 2 + 0.5f * COLUMN, ROW_Y[1], 1 },
++    { W / 2 + 1.5f * COLUMN, ROW_Y[1], 1 },
++    { W / 2 - COLUMN, ROW_Y[2], 2 },
++    { W / 2.f, ROW_Y[2], 2 },
++    { W / 2 + COLUMN, ROW_Y[2], 2 },
 +};
 +
 +// what a bubble opens: the HENkaku settings, the install browser, or a game (its LiveArea)
@@ -3988,13 +4376,40 @@ index 00000000..96c65f1e
 +    return {};
 +}
 +
-+// The PS Vita's own blue, lighter at the top, with soft light
-+void vita_background(Canvas &c) {
-+    c.clear_gradient(rgb(0x2463b4), rgb(0x07173a));
-+    c.fill_circle(1560, -260, 980, rgb(0x8cc8ff, 30));
-+    c.fill_circle(150, 1180, 760, rgb(0x2f7ae0, 34));
-+    c.fill_circle(1780, 1020, 400, rgb(0xb4dcff, 18));
-+    c.fill_circle(520, 140, 260, rgb(0xffffff, 10));
++float smoothstep(float e0, float e1, float x) {
++    const float t = std::clamp((x - e0) / (e1 - e0), 0.f, 1.f);
++    return t * t * (3 - 2 * t);
++}
++
++// The Vita's wallpaper: deep blue, a band of light waving across it (made once)
++const Canvas &vita_wallpaper() {
++    static Canvas c = [] {
++        Canvas c(W, H);
++        uint32_t *p = c.data();
++        for (int x = 0; x < W; x++) {
++            const float fx = static_cast<float>(x) / W;
++            // the wave's middle, and a thinner one riding on it
++            const float wave = H * 0.60f + 70.f * std::sin(fx * 5.2f + 0.7f) - 150.f * fx;
++            const float thin = wave - 46.f + 30.f * std::sin(fx * 8.1f + 2.1f);
++            for (int y = 0; y < H; y++) {
++                const float fy = static_cast<float>(y) / H;
++                float r = 18 + 20 * fy, g = 58 + 40 * fy, b = 176 + 50 * fy;
++                // darker at the top corners
++                const float vignette = 1.f - 0.28f * (1.f - fy) * (std::fabs(fx - 0.5f) * 2.f);
++                r *= vignette;
++                g *= vignette;
++                b *= vignette;
++                const float d1 = (y - wave) / 120.f, d2 = (y - thin) / 22.f;
++                const float light = 0.62f * std::exp(-d1 * d1) + 0.30f * std::exp(-d2 * d2);
++                r += (255 - r) * light;
++                g += (255 - g) * light;
++                b += (255 - b) * light;
++                p[static_cast<size_t>(y) * W + x] = static_cast<uint32_t>(r) | (static_cast<uint32_t>(g) << 8) | (static_cast<uint32_t>(b) << 16) | 0xFF000000u;
++            }
++        }
++        return c;
++    }();
++    return c;
 +}
 +
 +// Text centered on cx, cut to max_width
@@ -4018,28 +4433,6 @@ index 00000000..96c65f1e
 +    return text;
 +}
 +
-+// The status bar: HENkaku at the left, the firmware's state and the time at the right
-+void status_bar(Canvas &c, const app::FirmwareState &fw, const ps4ui::Image &henkaku) {
-+    c.fill_rect(0, 0, W, 66, rgb(0x000000, 64));
-+    int x = 30;
-+    if (!henkaku.empty()) {
-+        c.draw_image(henkaku, x, 33 - henkaku.height / 2);
-+        x += henkaku.width + 14;
-+    }
-+    x += c.text(x, 46, "HENkaku", 30, TEXT, Weight::Bold) + 16;
-+    c.text(x, 46, version_text(), 24, rgb(0xc8d6ee));
-+    int right = W - 36;
-+    const std::string time = clock_text();
-+    right -= c.text_width(time, 32, Weight::Bold);
-+    c.text(right, 47, time, 32, TEXT, Weight::Bold);
-+    if (!fw.main_firmware || !fw.font_package) {
-+        const std::string missing = !fw.main_firmware ? "No PS Vita firmware" : "No font package";
-+        right -= c.text_width(missing, 24, Weight::Bold) + 40;
-+        c.fill_circle(right - 16.f, 38.f, 7.f, WARN);
-+        c.text(right, 46, missing, 24, WARN, Weight::Bold);
-+    }
-+}
-+
 +// A tray with an arrow into it: the install bubble
 +void install_glyph(Canvas &c, float x, float y, float r) {
 +    const Color white = rgb(0xffffff);
@@ -4052,62 +4445,277 @@ index 00000000..96c65f1e
 +    c.line(x - 54 * s, y + 52 * s, x + 54 * s, y + 52 * s, 13 * s, white);
 +}
 +
-+void draw_bubble(Canvas &c, const Tile &tile, std::vector<Item> &items, float x, float y, float r, const ps4ui::Image &henkaku) {
-+    switch (tile.kind) {
-+    case TileKind::Game: {
-+        Item &item = items[tile.item];
-+        ensure_icons(item);
-+        if (!item.bubble.empty()) {
-+            c.fill_circle(x, y, r, rgb(0x0d1830));
-+            c.draw_image_circle(item.bubble, x, y, r);
-+        } else {
-+            c.fill_circle(x, y, r, rgb(0x1b2a44));
-+            c.text_centered(static_cast<int>(x), static_cast<int>(y + r / 4), "?", static_cast<int>(r * 0.7f), MUTED, Weight::Bold);
++// The home screen's glyph in the status bar: a small house
++void home_glyph(Canvas &c, float x, float y, Color color) {
++    c.line(x - 15, y - 1, x, y - 15, 4.5f, color);
++    c.line(x + 15, y - 1, x, y - 15, 4.5f, color);
++    c.fill_rect(static_cast<int>(x) - 10, static_cast<int>(y) - 2, 20, 15, color);
++}
++
++// A bubble: the icon in a glass sphere (a highlight over its top, its edge shaded, a white rim)
++// with a soft shadow under it, premultiplied
++ps4ui::Image make_bubble(const ps4ui::Image &icon, Color fill) {
++    ps4ui::Image out;
++    out.width = out.height = SPRITE;
++    out.pixels.resize(static_cast<size_t>(SPRITE) * SPRITE);
++    const float c = SPRITE / 2.f, R = BUBBLE_R;
++    const int ix0 = (ICON_SIZE - icon.width) / 2 + SPRITE_PAD, iy0 = (ICON_SIZE - icon.height) / 2 + SPRITE_PAD;
++    for (int y = 0; y < SPRITE; y++) {
++        for (int x = 0; x < SPRITE; x++) {
++            const float px = x + 0.5f - c, py = y + 0.5f - c;
++            const float d = std::sqrt(px * px + py * py);
++            const float sd = std::sqrt(px * px + (py - 8) * (py - 8));
++            const float shadow = std::clamp((R + 7 - sd) / 14.f, 0.f, 1.f) * 0.42f;
++            const float cov = std::clamp(R - d + 0.5f, 0.f, 1.f);
++            float r = fill.r, g = fill.g, b = fill.b;
++            if (cov > 0) {
++                const int sx = x - ix0, sy = y - iy0;
++                if (!icon.empty() && sx >= 0 && sy >= 0 && sx < icon.width && sy < icon.height) {
++                    const uint32_t p = icon.pixels[static_cast<size_t>(sy) * icon.width + sx];
++                    const float a = (p >> 24) / 255.f;
++                    r = r * (1 - a) + (p & 0xFF) * a;
++                    g = g * (1 - a) + ((p >> 8) & 0xFF) * a;
++                    b = b * (1 - a) + ((p >> 16) & 0xFF) * a;
++                }
++                // the glass: light over the top, darker toward the edge
++                const float ex = px / (R * 0.80f), ey = (py + R * 0.50f) / (R * 0.44f);
++                const float e = ex * ex + ey * ey;
++                const float gloss = e < 1.f ? 0.42f * std::sqrt(1.f - e) : 0.f;
++                const float shade = 0.24f * smoothstep(R * 0.70f, R, d);
++                r = (r + (255 - r) * gloss) * (1 - shade);
++                g = (g + (255 - g) * gloss) * (1 - shade);
++                b = (b + (255 - b) * gloss) * (1 - shade);
++                const float rim = std::clamp(2.0f - std::fabs(d - (R - 2.2f)), 0.f, 1.f) * 0.9f;
++                r += (255 - r) * rim;
++                g += (255 - g) * rim;
++                b += (255 - b) * rim;
++            }
++            const float a = cov + shadow * (1 - cov);
++            out.pixels[static_cast<size_t>(y) * SPRITE + x] = static_cast<uint32_t>(r * cov + 0.5f) | (static_cast<uint32_t>(g * cov + 0.5f) << 8)
++                | (static_cast<uint32_t>(b * cov + 0.5f) << 16) | (static_cast<uint32_t>(a * 255 + 0.5f) << 24);
 +        }
-+        break;
 +    }
-+    case TileKind::Henkaku:
-+        c.fill_circle(x, y, r, rgb(0x0a0f1a));
-+        if (!henkaku.empty())
-+            c.draw_image(henkaku, static_cast<int>(x) - henkaku.width / 2, static_cast<int>(y) - henkaku.height / 2);
-+        break;
-+    case TileKind::Install:
-+        c.fill_circle(x, y, r, rgb(0x1f7fe6));
-+        c.fill_circle(x - r * 0.25f, y - r * 0.3f, r * 0.62f, rgb(0xffffff, 26));
-+        install_glyph(c, x, y, r);
-+        break;
++    return out;
++}
++
++// The focus: a soft light-blue glow around a bubble, premultiplied
++const ps4ui::Image &focus_glow() {
++    static ps4ui::Image out = [] {
++        ps4ui::Image img;
++        img.width = img.height = SPRITE;
++        img.pixels.resize(static_cast<size_t>(SPRITE) * SPRITE);
++        const float c = SPRITE / 2.f;
++        for (int y = 0; y < SPRITE; y++) {
++            for (int x = 0; x < SPRITE; x++) {
++                const float d = std::hypot(x + 0.5f - c, y + 0.5f - c);
++                const float k = (d - (BUBBLE_R + 5)) / 7.f;
++                const float a = d < BUBBLE_R - 1 ? 0.f : std::exp(-k * k) * 0.95f;
++                const uint32_t A = static_cast<uint32_t>(a * 255);
++                img.pixels[static_cast<size_t>(y) * SPRITE + x] = (0x9f * A / 255) | ((0xe0 * A / 255) << 8) | ((0xff * A / 255) << 16) | (A << 24);
++            }
++        }
++        return img;
++    }();
++    return out;
++}
++
++// What a tile draws with, made the first time it's on screen
++struct TileArt {
++    ps4ui::Image bubble;
++    ps4ui::Image mini; // in the status bar, while its LiveArea is open
++    ps4ui::TextSprite label;
++};
++
++// An animated value pulled toward a target (underdamped: it overshoots a little and settles)
++struct Spring {
++    float pos = 0;
++    float vel = 0;
++    void step(float target, float dt, float stiffness, float damping) {
++        const float c = 2.f * damping * std::sqrt(stiffness);
++        const int n = std::max(1, static_cast<int>(std::ceil(dt / 0.004f)));
++        const float h = dt / n;
++        for (int i = 0; i < n; i++) {
++            vel += (stiffness * (target - pos) - c * vel) * h;
++            pos += vel * h;
++        }
++        if (std::fabs(target - pos) < 0.0005f && std::fabs(vel) < 0.002f) {
++            pos = target;
++            vel = 0;
++        }
++    }
++    bool moving(float target) const { return pos != target || vel != 0; }
++};
++
++float ms_since(Clock::time_point t, Clock::time_point now) {
++    return std::chrono::duration<float, std::milli>(now - t).count();
++}
++
++// A pressed bubble: it gives (to 0.88) and springs back past its size
++float press_scale(float ms) {
++    if (ms < 0)
++        return 1.f;
++    if (ms < 90.f)
++        return 1.f - 0.12f * ms / 90.f;
++    const float t = ms - 90.f;
++    return 1.f - 0.12f * std::exp(-t / 90.f) * std::cos(t / 52.f);
++}
++
++// The bubbles coming in, one after another, from nothing to a little more than their size
++float appear_scale(float ms) {
++    if (ms <= 0)
++        return 0.f;
++    return std::max(0.f, 1.f - std::exp(-ms / 75.f) * std::cos(ms / 60.f));
++}
++
++// The home screen's animated state
++struct HomeView {
++    int page = 0;
++    Spring rows[3]; // the page each row is at: they follow one another, the jelly of a page turn
++    Clock::time_point row_go[3]{};
++    float row_target[3] = {};
++    std::vector<float> focus; // per tile, 0..1
++    int pressed = -1;
++    Clock::time_point press_at{};
++    Clock::time_point appear_at{};
++    bool appearing = false;
++};
++
++void home_go_to_page(HomeView &v, int page, Clock::time_point now) {
++    if (page == v.page)
++        return;
++    const int dir = page > v.page ? 1 : -1;
++    v.page = page;
++    // the row on the side it moves to goes first
++    for (int r = 0; r < 3; r++) {
++        const int order = dir > 0 ? r : 2 - r;
++        v.row_go[r] = now + std::chrono::milliseconds(40 * order);
++        v.row_target[r] = static_cast<float>(page);
 +    }
 +}
 +
-+void draw_bubbles(Canvas &c, std::vector<Item> &items, const std::vector<Tile> &tiles, int selected, const ps4ui::Image &henkaku) {
++// Steps the home screen's animations; whether anything still moves
++bool home_animate(HomeView &v, int tile_count, int focused, float dt, Clock::time_point now) {
++    bool moving = false;
++    for (int r = 0; r < 3; r++) {
++        const float target = now >= v.row_go[r] ? v.row_target[r] : v.rows[r].pos;
++        v.rows[r].step(target, dt, 150.f, 0.62f);
++        moving |= v.rows[r].moving(v.row_target[r]);
++    }
++    v.focus.resize(static_cast<size_t>(tile_count), 0.f);
++    const float k = 1.f - std::exp(-dt * 16.f);
++    for (int i = 0; i < tile_count; i++) {
++        const float target = i == focused ? 1.f : 0.f;
++        float &f = v.focus[i];
++        f += (target - f) * k;
++        if (std::fabs(target - f) < 0.01f)
++            f = target;
++        else
++            moving = true;
++    }
++    if (v.pressed >= 0) {
++        if (ms_since(v.press_at, now) > 700.f)
++            v.pressed = -1;
++        else
++            moving = true;
++    }
++    if (v.appearing) {
++        if (ms_since(v.appear_at, now) > 30.f * PER_PAGE + 700.f)
++            v.appearing = false;
++        else
++            moving = true;
++    }
++    return moving;
++}
++
++// The home screen, its left edge at ox
++void draw_home(Canvas &c, HomeView &v, const std::vector<Tile> &tiles, const std::function<TileArt &(int)> &art, int ox, Clock::time_point now) {
++    c.copy_from(vita_wallpaper(), ox);
 +    const int count = static_cast<int>(tiles.size());
-+    const int page = selected / PER_PAGE;
 +    const int pages = std::max(1, (count + PER_PAGE - 1) / PER_PAGE);
-+    // the selected one last, over its neighbours
++    const ps4ui::Image &glow = focus_glow();
++    // the focused bubble last, over its neighbours
 +    for (int pass = 0; pass < 2; pass++) {
 +        for (int slot = 0; slot < PER_PAGE; slot++) {
-+            const int index = page * PER_PAGE + slot;
-+            if (index >= count)
-+                break;
-+            const bool sel = index == selected;
-+            if (sel != (pass == 1))
-+                continue;
 +            const Slot &s = SLOTS[slot];
-+            const float r = sel ? BUBBLE_SEL_R : BUBBLE_R;
-+            c.fill_circle(s.x + 3.f, s.y + 11.f, r + 3.f, rgb(0x000000, 70));
-+            draw_bubble(c, tiles[index], items, s.x, s.y, r, henkaku);
-+            c.ring(s.x, s.y, r - 1.5f, 3.f, rgb(0xffffff, sel ? 245 : 140));
-+            if (sel)
-+                c.ring(s.x, s.y, r + 9.f, 5.f, rgb(0x9adcff, 235));
-+            centered_text(c, s.x, static_cast<int>(s.y + r + (sel ? 46.f : 40.f)), tile_title(tiles[index], items),
-+                sel ? 30 : 26, sel ? TEXT : rgb(0xe6ecf6), sel ? Weight::Bold : Weight::Regular, sel ? 330 : 270);
++            const float pos = v.rows[s.row].pos;
++            for (int page = static_cast<int>(std::floor(pos)); page <= static_cast<int>(std::floor(pos)) + 1; page++) {
++                const int index = page * PER_PAGE + slot;
++                if (page < 0 || index >= count)
++                    continue;
++                const float focus = index < static_cast<int>(v.focus.size()) ? v.focus[index] : 0.f;
++                if ((focus > 0.5f) != (pass == 1))
++                    continue;
++                const float y = s.y + (page - pos) * H;
++                if (y < -SPRITE || y > H + SPRITE)
++                    continue;
++                const float x = s.x + ox;
++                float scale = 1.f + 0.08f * focus;
++                if (v.pressed == index)
++                    scale *= press_scale(ms_since(v.press_at, now));
++                uint8_t alpha = 255;
++                if (v.appearing) {
++                    const float a = appear_scale(ms_since(v.appear_at, now) - 30.f * slot);
++                    scale *= a;
++                    alpha = static_cast<uint8_t>(std::clamp(a * 2.f, 0.f, 1.f) * 255);
++                }
++                if (scale < 0.02f)
++                    continue;
++                TileArt &t = art(index);
++                if (focus > 0.01f)
++                    c.blit_scaled(glow, x, y, scale, static_cast<uint8_t>(focus * alpha));
++                c.blit_scaled(t.bubble, x, y, scale, alpha);
++                const ps4ui::Image &label = t.label.image;
++                c.blit(label, static_cast<int>(x) - label.width / 2, static_cast<int>(y + BUBBLE_R * scale + 36) - t.label.baseline, alpha);
++            }
 +        }
 +    }
 +    // the pages, as dots down the right edge
-+    const float dots_x = W - 58.f;
-+    const float y0 = H / 2.f - (pages - 1) * 21.f;
-+    for (int p = 0; p < pages; p++)
-+        c.fill_circle(dots_x, y0 + p * 42.f, p == page ? 11.f : 6.f, rgb(0xffffff, p == page ? 245 : 110));
++    if (pages > 1) {
++        const float dots_x = ox + W - 40.f;
++        const float y0 = H / 2.f - (pages - 1) * 19.f;
++        const float at = v.rows[1].pos;
++        for (int p = 0; p < pages; p++) {
++            const float near = std::clamp(1.f - std::fabs(at - p), 0.f, 1.f);
++            c.fill_circle(dots_x, y0 + p * 38.f, 6.f + 4.f * near, rgb(0xffffff, static_cast<uint8_t>(110 + 140 * near)));
++        }
++    }
++}
++
++// The status bar: HENkaku at the left; in the middle the home screen and the open LiveAreas (the
++// one on screen bright); the firmware's state and the time at the right
++void status_bar(Canvas &c, const app::FirmwareState &fw, const ps4ui::Image &henkaku, const std::vector<const ps4ui::Image *> &cards, float card_pos) {
++    c.fill_rect(0, 0, W, STATUS_H, rgb(0x000000, 90));
++    int x = 26;
++    if (!henkaku.empty()) {
++        c.draw_image(henkaku, x, STATUS_H / 2 - henkaku.height / 2);
++        x += henkaku.width + 12;
++    }
++    x += c.text(x, 42, "HENkaku", 28, TEXT, Weight::Bold) + 14;
++    c.text(x, 42, version_text(), 22, rgb(0xc8d6ee));
++    // home, then the cards, 56 px apart
++    const int n = static_cast<int>(cards.size()) + 1;
++    const float x0 = W / 2.f - (n - 1) * 28.f;
++    for (int i = 0; i < n; i++) {
++        const float near = std::clamp(1.f - std::fabs(card_pos - i), 0.f, 1.f);
++        const uint8_t a = static_cast<uint8_t>(120 + 135 * near);
++        const float cx = x0 + i * 56.f;
++        if (i == 0)
++            home_glyph(c, cx, STATUS_H / 2.f, rgb(0xffffff, a));
++        else if (!cards[i - 1]->empty())
++            c.blit(*cards[i - 1], static_cast<int>(cx) - cards[i - 1]->width / 2, STATUS_H / 2 - cards[i - 1]->height / 2, a);
++        if (near > 0.5f)
++            c.fill_round_rect(static_cast<int>(cx) - 12, STATUS_H - 7, 24, 4, 2, rgb(0x9fe0ff, static_cast<uint8_t>(255 * near)));
++    }
++    int right = W - 34;
++    const std::string time = clock_text();
++    right -= c.text_width(time, 30, Weight::Bold);
++    c.text(right, 43, time, 30, TEXT, Weight::Bold);
++    if (!fw.main_firmware || !fw.font_package) {
++        const std::string missing = !fw.main_firmware ? "No PS Vita firmware" : "No font package";
++        right -= c.text_width(missing, 22, Weight::Bold) + 40;
++        c.fill_circle(right - 16.f, 35.f, 7.f, WARN);
++        c.text(right, 42, missing, 22, WARN, Weight::Bold);
++    }
 +}
 +
 +// --- a game's LiveArea ---
@@ -4130,35 +4738,69 @@ index 00000000..96c65f1e
 +        item.livearea_gate = ps4ui::load_image(fs_utils::path_to_utf8(gate), 560, 316);
 +}
 +
++// Where the gate (the start picture) is
++constexpr int GATE_W = 620, GATE_H = 350, GATE_X = (W - GATE_W) / 2, GATE_Y = 400;
++
 +void draw_livearea(Canvas &c, Item &item) {
 +    if (!item.livearea_bg.empty()) {
 +        c.clear_gradient(rgb(0x05080f), rgb(0x05080f));
 +        c.draw_image(item.livearea_bg, (W - item.livearea_bg.width) / 2, (H - item.livearea_bg.height) / 2);
 +        c.fill_rect(0, 0, W, H, rgb(0x000000, 70));
 +    } else {
-+        vita_background(c);
++        c.copy_from(vita_wallpaper());
 +    }
 +    // the game: its bubble and name at the top left
 +    ensure_icons(item);
-+    const float bx = 200.f, by = 200.f, br = 104.f;
++    const float bx = 200.f, by = 210.f, br = 104.f;
 +    c.fill_circle(bx + 3.f, by + 10.f, br + 3.f, rgb(0x000000, 80));
 +    if (!item.bubble.empty())
 +        c.draw_image_circle(item.bubble, bx, by, br);
 +    else
 +        c.fill_circle(bx, by, br, rgb(0x1b2a44));
 +    c.ring(bx, by, br - 1.5f, 3.f, rgb(0xffffff, 240));
-+    c.fill_round_rect(340, 120, W - 340 - 120, 170, 26, rgb(0x000000, 90));
-+    c.text(380, 196, item.entry.title, 56, TEXT, Weight::Bold, W - 380 - 160);
-+    c.text(380, 252, item.entry.title_id + (item.entry.app_ver.empty() ? "" : "   v" + item.entry.app_ver), 30, rgb(0xc8d6ee));
++    c.fill_round_rect(340, 130, W - 340 - 120, 170, 26, rgb(0x000000, 90));
++    c.text(380, 206, item.entry.title, 56, TEXT, Weight::Bold, W - 380 - 160);
++    c.text(380, 262, item.entry.title_id + (item.entry.app_ver.empty() ? "" : "   v" + item.entry.app_ver), 30, rgb(0xc8d6ee));
 +    // the gate: the game's start picture, with Start under it
-+    const int gw = 620, gh = 350, gx = (W - gw) / 2, gy = 400;
-+    c.fill_round_rect(gx - 14, gy - 14, gw + 28, gh + 120, 30, rgb(0x000000, 70));
-+    c.fill_round_rect(gx - 12, gy - 12, gw + 24, gh + 112, 28, rgb(0xf4f7fb));
-+    c.fill_round_rect(gx, gy, gw, gh, 18, rgb(0x0d1830));
++    c.fill_round_rect(GATE_X - 14, GATE_Y - 14, GATE_W + 28, GATE_H + 120, 30, rgb(0x000000, 70));
++    c.fill_round_rect(GATE_X - 12, GATE_Y - 12, GATE_W + 24, GATE_H + 112, 28, rgb(0xf4f7fb));
++    c.fill_round_rect(GATE_X, GATE_Y, GATE_W, GATE_H, 18, rgb(0x0d1830));
 +    const ps4ui::Image &picture = !item.livearea_gate.empty() ? item.livearea_gate : item.large;
 +    if (!picture.empty())
-+        c.draw_image(picture, gx + (gw - picture.width) / 2, gy + (gh - picture.height) / 2);
-+    c.text_centered(W / 2, gy + gh + 72, "Start", 44, rgb(0x14284a), Weight::Bold);
++        c.draw_image(picture, GATE_X + (GATE_W - picture.width) / 2, GATE_Y + (GATE_H - picture.height) / 2);
++    c.text_centered(W / 2, GATE_Y + GATE_H + 72, "Start", 44, rgb(0x14284a), Weight::Bold);
++}
++
++// A card peeled away from its top right corner, `d` px along the diagonal (0 to W + H): over
++// what `frame` already has under it. The fold runs at 45 degrees; the peeled corner lies folded
++// back over the card, its white back shaded toward the fold.
++void peel(Canvas &frame, const Canvas &card, float d) {
++    uint32_t *dst = frame.data();
++    const uint32_t *src = card.data();
++    const auto darken = [](uint32_t p, uint32_t keep) {
++        const uint32_t rb = (((p & 0x00FF00FFu) * keep) >> 8) & 0x00FF00FFu;
++        const uint32_t g = (((p & 0x0000FF00u) * keep) >> 8) & 0x0000FF00u;
++        return rb | g | 0xFF000000u;
++    };
++    for (int y = 0; y < H; y++) {
++        uint32_t *row = dst + static_cast<size_t>(y) * W;
++        const uint32_t *from = src + static_cast<size_t>(y) * W;
++        // right of the fold: what's under the card
++        const int fold = std::clamp(static_cast<int>(W + y - d), 0, W);
++        const int flap = y <= d ? std::clamp(static_cast<int>(std::max(W + y - 2 * d, W - d)), 0, fold) : fold;
++        std::memcpy(row, from, static_cast<size_t>(flap) * 4);
++        // the flap's shadow on the card
++        for (int x = std::max(0, flap - 22); x < flap; x++)
++            row[x] = darken(row[x], 150 + (flap - x) * 105 / 22);
++        for (int x = flap; x < fold; x++) {
++            const float t = std::clamp((fold - x) / std::max(1.f, d), 0.f, 1.f);
++            const uint32_t v = static_cast<uint32_t>(246 - 70 * t);
++            row[x] = v | (v << 8) | (std::min(255u, v + 8) << 16) | 0xFF000000u;
++        }
++        // the fold's shadow on what's under
++        for (int x = fold; x < std::min(W, fold + 26); x++)
++            row[x] = darken(row[x], 140 + (x - fold) * 115 / 26);
++    }
 +}
 +
 +// --- the HENkaku settings, in the launcher ---
@@ -4229,8 +4871,13 @@ index 00000000..96c65f1e
 +}
 +
 +void draw_settings(Canvas &c, SettingsView &view, const ps4ui::Image &henkaku) {
-+    c.clear_gradient(rgb(0x10203c), rgb(0x03060d));
-+    c.fill_circle(1700, -120, 620, rgb(0x2a6fd6, 22));
++    static const Canvas made = [] {
++        Canvas c(W, H);
++        c.clear_gradient(rgb(0x10203c), rgb(0x03060d));
++        c.fill_circle(1700, -120, 620, rgb(0x2a6fd6, 22));
++        return c;
++    }();
++    c.copy_from(made);
 +    // the heading: the ensō, HENkaku, whose settings and which page
 +    int tx = MARGIN;
 +    if (!henkaku.empty()) {
@@ -4340,9 +4987,61 @@ index 00000000..96c65f1e
 +    const ps4settings::Prefs &prefs = ps4settings::prefs();
 +    // the HENkaku ensō, at the status bar's, the bubble's and the settings heading's sizes
 +    const std::string henkaku_path = ps4settings::icon_path();
-+    const ps4ui::Image henkaku_bar = ps4ui::load_image(henkaku_path, 46, 46);
-+    const ps4ui::Image henkaku_bubble = ps4ui::load_image(henkaku_path, 150, 150);
++    const ps4ui::Image henkaku_bar = ps4ui::load_image(henkaku_path, 42, 42);
++    const ps4ui::Image henkaku_icon = ps4ui::load_image(henkaku_path, ICON_SIZE * 7 / 10, ICON_SIZE * 7 / 10);
 +    const ps4ui::Image henkaku_heading = ps4ui::load_image(henkaku_path, 124, 124);
++
++    // the bubbles' sprites, by tile, made when first needed (or ahead, while nothing moves)
++    std::map<int, TileArt> art;
++    const auto tile_art = [&](int index) -> TileArt & {
++        auto it = art.find(index);
++        if (it != art.end())
++            return it->second;
++        const Tile &tl = tiles[index];
++        ps4ui::Image icon;
++        Canvas ic(ICON_SIZE, ICON_SIZE);
++        switch (tl.kind) {
++        case TileKind::Henkaku:
++            ic.clear_gradient(rgb(0x30353f), rgb(0x040506));
++            if (!henkaku_icon.empty())
++                ic.draw_image(henkaku_icon, (ICON_SIZE - henkaku_icon.width) / 2, (ICON_SIZE - henkaku_icon.height) / 2);
++            icon = ic.snapshot();
++            break;
++        case TileKind::Install:
++            ic.clear_gradient(rgb(0x45a8ff), rgb(0x0b56c4));
++            install_glyph(ic, ICON_SIZE / 2.f, ICON_SIZE / 2.f, ICON_SIZE * 0.42f);
++            icon = ic.snapshot();
++            break;
++        case TileKind::Game:
++            ensure_icons(items[tl.item]);
++            icon = items[tl.item].bubble;
++            if (icon.empty()) {
++                ic.clear_gradient(rgb(0x2b3c5c), rgb(0x16223a));
++                ic.text_centered(ICON_SIZE / 2, ICON_SIZE / 2 + 34, "?", 100, MUTED, Weight::Bold);
++                icon = ic.snapshot();
++            }
++            break;
++        }
++        TileArt t;
++        t.bubble = make_bubble(icon, rgb(0x1b2a44));
++        t.mini = ps4ui::shrink_image(t.bubble, 46, 46);
++        t.label = ps4ui::render_text(tile_title(tl, items), 26, rgb(0xffffff), Weight::Regular, 300, 170);
++        return art.emplace(index, std::move(t)).first->second;
++    };
++    const std::function<TileArt &(int)> tile_art_fn = tile_art;
++
++    HomeView home;
++    // the open LiveAreas, as cards right of the home screen (they stay open between games)
++    static std::vector<std::string> cards;
++    std::map<std::string, std::unique_ptr<Canvas>> card_pictures;
++    int card = 0; // the card on screen: 0 the home screen, k the LiveArea of cards[k - 1]
++    Spring card_pos;
++    bool peeling = false;
++    Clock::time_point peel_at{};
++    bool launching = false;
++    Clock::time_point launch_at{};
++    int pending_open = -1; // a pressed bubble opens when its press has shown
++    Clock::time_point pending_at{};
 +
 +    enum class Mode {
 +        Home, // the bubbles or the list (HENkaku > System > Style)
@@ -4355,7 +5054,7 @@ index 00000000..96c65f1e
 +    int selected = 0; // the list's
 +    int top = 0;
 +    int tile = 0; // the bubbles'
-+    int live = -1; // the game whose LiveArea is open
++    int live = -1; // the game whose LiveArea is on screen
 +    SettingsView settings;
 +    bool quit_requested = false;
 +    bool firmware_requested = false;
@@ -4371,6 +5070,57 @@ index 00000000..96c65f1e
 +        }
 +    };
 +    select_app(last_app_path, {});
++    const auto find_item = [&](const std::string &path) {
++        for (size_t i = 0; i < items.size(); i++)
++            if (items[i].entry.path == path)
++                return static_cast<int>(i);
++        return -1;
++    };
++    // cards of games no longer installed go
++    cards.erase(std::remove_if(cards.begin(), cards.end(), [&](const std::string &path) { return find_item(path) < 0; }), cards.end());
++    const auto card_picture = [&](int k) -> Canvas & {
++        const std::string &path = cards[k - 1];
++        auto &picture = card_pictures[path];
++        if (!picture) {
++            picture = std::make_unique<Canvas>(W, H);
++            Item &item = items[find_item(path)];
++            ensure_livearea(item, emuenv.vita_fs_path / "ux0" / "app" / item.entry.path);
++            draw_livearea(*picture, item);
++        }
++        return *picture;
++    };
++    const auto show_card = [&](int k) {
++        card = std::clamp(k, 0, static_cast<int>(cards.size()));
++        if (card == 0) {
++            mode = Mode::Home;
++        } else {
++            mode = Mode::LiveArea;
++            live = find_item(cards[card - 1]);
++        }
++    };
++    // a game's LiveArea: its card (opened, or moved to)
++    const auto open_livearea = [&](int item) {
++        const std::string &path = items[item].entry.path;
++        auto it = std::find(cards.begin(), cards.end(), path);
++        if (it == cards.end()) {
++            if (static_cast<int>(cards.size()) >= MAX_CARDS) {
++                card_pictures.erase(cards.front());
++                cards.erase(cards.begin());
++                card_pos.pos = std::max(0.f, card_pos.pos - 1);
++            }
++            cards.push_back(path);
++            it = cards.end() - 1;
++        }
++        show_card(static_cast<int>(it - cards.begin()) + 1);
++    };
++    home.page = tile / PER_PAGE;
++    for (int r = 0; r < 3; r++)
++        home.rows[r].pos = home.row_target[r] = static_cast<float>(home.page);
++    // the first page's bubbles made before they come in
++    for (int i = home.page * PER_PAGE; i < std::min(static_cast<int>(tiles.size()), (home.page + 1) * PER_PAGE); i++)
++        tile_art(i);
++    home.appearing = true;
++    home.appear_at = Clock::now();
 +    std::string notice = notice_text;
 +    auto notice_until = Clock::now() + std::chrono::seconds(notice.empty() ? 0 : 12);
 +    InstallJob job;
@@ -4453,6 +5203,8 @@ index 00000000..96c65f1e
 +    int repeat_key = 0;
 +    bool dirty = true;
 +    auto last_progress = Clock::now();
++    auto last_frame = Clock::now();
++    std::string shown_clock = clock_text();
 +
 +    while (true) {
 +        const ps4pad::Snapshot pad = ps4pad::read();
@@ -4490,6 +5242,11 @@ index 00000000..96c65f1e
 +                }
 +                items = load_items(emuenv);
 +                tiles = make_tiles(items);
++                art.clear();
++                card_pictures.clear();
++                cards.erase(std::remove_if(cards.begin(), cards.end(), [&](const std::string &path) { return find_item(path) < 0; }), cards.end());
++                show_card(0);
++                card_pos = {};
 +                const bool had_font_package = fw.font_package;
 +                fw = app::get_firmware_state(emuenv);
 +                // the text in the PS Vita's fonts, now that they're there
@@ -4497,6 +5254,7 @@ index 00000000..96c65f1e
 +                    ps4ui::set_vita_font_dir(fs_utils::path_to_utf8(emuenv.vita_fs_path / "sa0" / "data" / "font" / "pvf") + "/");
 +                selected = std::min(selected, std::max(0, static_cast<int>(items.size()) - 1));
 +                tile = std::min(tile, static_cast<int>(tiles.size()) - 1);
++                home_go_to_page(home, tile / PER_PAGE, now);
 +                if (!job.firmware) {
 +                    // back home, on the game just installed
 +                    mode = Mode::Home;
@@ -4506,6 +5264,7 @@ index 00000000..96c65f1e
 +                        title_id = job.title_id;
 +                    }
 +                    select_app({}, title_id);
++                    home_go_to_page(home, tile / PER_PAGE, now);
 +                }
 +                notice = summary(job);
 +                notice_until = now + std::chrono::seconds(20);
@@ -4545,26 +5304,28 @@ index 00000000..96c65f1e
 +            case Mode::Home:
 +                if (prefs.bubbles) {
 +                    const int count = static_cast<int>(tiles.size());
-+                    if (dx != 0 || dy != 0) {
-+                        tile = bubble_step(tile, count, dx, dy);
-+                        dirty = true;
-+                    }
-+                    // L1 / R1: a page up / down
-+                    if (pressed & (ORBIS_PAD_BUTTON_L1 | ORBIS_PAD_BUTTON_R1)) {
-+                        tile = std::clamp(tile + ((pressed & ORBIS_PAD_BUTTON_L1) ? -PER_PAGE : PER_PAGE), 0, count - 1);
-+                        dirty = true;
++                    if (pending_open >= 0 || peeling || launching) {
++                        // a bubble opening, or a card going: the buttons wait
++                    } else {
++                        if (dx != 0 || dy != 0) {
++                            tile = bubble_step(tile, count, dx, dy);
++                            home_go_to_page(home, tile / PER_PAGE, now);
++                            dirty = true;
++                        }
++                        // L1 / R1: the open LiveAreas, as a swipe would on the Vita
++                        if ((pressed & ORBIS_PAD_BUTTON_R1) && !cards.empty()) {
++                            show_card(1);
++                            dirty = true;
++                        }
 +                    }
 +                    const Tile &t = tiles[tile];
-+                    if (pressed & ORBIS_PAD_BUTTON_CROSS) {
-+                        if (t.kind == TileKind::Henkaku) {
-+                            open_settings(-1);
-+                        } else if (t.kind == TileKind::Install) {
-+                            open_browser();
-+                        } else {
-+                            live = t.item;
-+                            ensure_livearea(items[live], emuenv.vita_fs_path / "ux0" / "app" / items[live].entry.path);
-+                            mode = Mode::LiveArea;
-+                        }
++                    if (pending_open >= 0 || peeling || launching) {
++                    } else if (pressed & ORBIS_PAD_BUTTON_CROSS) {
++                        // the bubble gives, springs back, and then opens
++                        home.pressed = tile;
++                        home.press_at = now;
++                        pending_open = tile;
++                        pending_at = now + std::chrono::milliseconds(200);
 +                        dirty = true;
 +                    } else if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && t.kind == TileKind::Game) {
 +                        open_settings(t.item);
@@ -4590,7 +5351,8 @@ index 00000000..96c65f1e
 +                        dirty = true;
 +                    }
 +                }
-+                if (pressed & ORBIS_PAD_BUTTON_TRIANGLE) {
++                if (pending_open >= 0 || peeling || launching) {
++                } else if (pressed & ORBIS_PAD_BUTTON_TRIANGLE) {
 +                    open_browser();
 +                    dirty = true;
 +                } else if (pressed & ORBIS_PAD_BUTTON_OPTIONS) {
@@ -4600,17 +5362,25 @@ index 00000000..96c65f1e
 +                break;
 +
 +            case Mode::LiveArea:
-+                if (pressed & ORBIS_PAD_BUTTON_CROSS) {
-+                    if (auto choice = start_game(live))
-+                        return *choice;
-+                    dirty = true;
++                if (peeling || launching) {
++                } else if (pressed & ORBIS_PAD_BUTTON_CROSS) {
++                    // the gate opens: its picture grows into the game
++                    launching = true;
++                    launch_at = now;
 +                } else if (pressed & ORBIS_PAD_BUTTON_SQUARE) {
 +                    open_settings(live);
-+                    dirty = true;
 +                } else if (pressed & ORBIS_PAD_BUTTON_CIRCLE) {
-+                    mode = Mode::Home;
-+                    dirty = true;
++                    show_card(0);
++                } else if (pressed & ORBIS_PAD_BUTTON_TRIANGLE) {
++                    // closed as on the Vita: peeled away from its top right corner
++                    peeling = true;
++                    peel_at = now;
++                } else if ((pressed & ORBIS_PAD_BUTTON_L1) || dx < 0) {
++                    show_card(card - 1);
++                } else if ((pressed & ORBIS_PAD_BUTTON_R1) || dx > 0) {
++                    show_card(card + 1);
 +                }
++                dirty = true;
 +                break;
 +
 +            case Mode::Settings: {
@@ -4629,6 +5399,9 @@ index 00000000..96c65f1e
 +                        mode = settings_return;
 +                        // the home screen's style may have changed
 +                        tiles = make_tiles(items);
++                        art.clear();
++                        if (mode == Mode::LiveArea)
++                            card_pictures.clear();
 +                    }
 +                };
 +                if (dy != 0) {
@@ -4712,21 +5485,128 @@ index 00000000..96c65f1e
 +            notice.clear();
 +            dirty = true;
 +        }
++        if (const std::string time = clock_text(); time != shown_clock) {
++            shown_clock = time;
++            dirty = true;
++        }
 +
-+        if (dirty) {
++        // a pressed bubble opens
++        if (pending_open >= 0 && now >= pending_at) {
++            const Tile t = tiles[pending_open];
++            pending_open = -1;
++            if (t.kind == TileKind::Henkaku)
++                open_settings(-1);
++            else if (t.kind == TileKind::Install)
++                open_browser();
++            else
++                open_livearea(t.item);
++            dirty = true;
++        }
++
++        // the animations, a step for the time since the last frame
++        const float dt = std::min(0.05f, std::chrono::duration<float>(now - last_frame).count());
++        last_frame = now;
++        const bool vita_home = prefs.bubbles && (mode == Mode::Home || mode == Mode::LiveArea);
++        bool animating = false;
++        if (vita_home) {
++            animating |= home_animate(home, static_cast<int>(tiles.size()), mode == Mode::Home ? tile : -1, dt, now);
++            card_pos.step(static_cast<float>(card), dt, 210.f, 0.86f);
++            animating |= card_pos.moving(static_cast<float>(card)) || peeling || launching || pending_open >= 0;
++        }
++
++        if (dirty || animating) {
 +            std::vector<Hint> hints;
 +            switch (mode) {
 +            case Mode::Home:
++            case Mode::LiveArea:
 +                if (prefs.bubbles) {
-+                    vita_background(canvas);
-+                    status_bar(canvas, fw, henkaku_bar);
-+                    draw_bubbles(canvas, items, tiles, tile, henkaku_bubble);
-+                    const Tile &t = tiles[tile];
-+                    hints.push_back({ Pad::Cross, t.kind == TileKind::Henkaku ? "Settings" : t.kind == TileKind::Install ? "Install games" : "Open" });
-+                    if (t.kind == TileKind::Game)
++                    if (peeling) {
++                        // what's under the card shows as it goes
++                        const int under = card - 1;
++                        if (under == 0)
++                            draw_home(canvas, home, tiles, tile_art_fn, 0, now);
++                        else
++                            canvas.copy_from(card_picture(under));
++                        const float t = std::min(1.f, ms_since(peel_at, now) / 520.f);
++                        peel(canvas, card_picture(card), t * t * (W + H + 40.f));
++                        if (t >= 1.f) {
++                            peeling = false;
++                            card_pictures.erase(cards[card - 1]);
++                            cards.erase(cards.begin() + (card - 1));
++                            show_card(under);
++                            card_pos.pos = static_cast<float>(card);
++                            card_pos.vel = 0;
++                        }
++                    } else {
++                        const float pos = card_pos.pos;
++                        for (int k = static_cast<int>(std::floor(pos)); k <= static_cast<int>(std::floor(pos)) + 1; k++) {
++                            if (k < 0 || k > static_cast<int>(cards.size()))
++                                continue;
++                            const int ox = static_cast<int>(std::lround((k - pos) * W));
++                            if (std::abs(ox) >= W)
++                                continue;
++                            if (k == 0)
++                                draw_home(canvas, home, tiles, tile_art_fn, ox, now);
++                            else
++                                canvas.copy_from(card_picture(k), ox);
++                        }
++                    }
++                    if (launching && live >= 0) {
++                        const float t = std::min(1.f, ms_since(launch_at, now) / 380.f);
++                        const float e = smoothstep(0.f, 1.f, t);
++                        const Item &item = items[live];
++                        const ps4ui::Image &picture = !item.livearea_gate.empty() ? item.livearea_gate : item.large;
++                        canvas.blit_scaled(picture, W / 2.f, GATE_Y + GATE_H / 2.f, 1.f + 1.6f * e);
++                        canvas.fill_rect(0, 0, W, H, rgb(0x000000, static_cast<uint8_t>(255 * e)));
++                        if (t >= 1.f) {
++                            launching = false;
++                            if (auto choice = start_game(live))
++                                return *choice;
++                        }
++                    }
++                    std::vector<const ps4ui::Image *> minis;
++                    for (const std::string &path : cards) {
++                        const int item = find_item(path);
++                        minis.push_back(item >= 0 ? &tile_art(item + 2).mini : &henkaku_bar);
++                    }
++                    status_bar(canvas, fw, henkaku_bar, minis, card_pos.pos);
++                    if (mode == Mode::Home) {
++                        const Tile &t = tiles[tile];
++                        hints.push_back({ Pad::Cross, t.kind == TileKind::Henkaku ? "Settings" : t.kind == TileKind::Install ? "Install games" : "Open" });
++                        if (t.kind == TileKind::Game)
++                            hints.push_back({ Pad::Square, "Game settings" });
++                        hints.push_back({ Pad::Triangle, "Install" });
++                        if (!cards.empty())
++                            hints.push_back({ Pad::R1, "LiveArea" });
++                        hints.push_back({ Pad::Options, "HENkaku" });
++                    } else {
++                        hints.push_back({ Pad::Cross, "Start" });
 +                        hints.push_back({ Pad::Square, "Game settings" });
-+                    hints.push_back({ Pad::Triangle, "Install" });
-+                    hints.push_back({ Pad::Options, "HENkaku" });
++                        hints.push_back({ Pad::Circle, "Home" });
++                        hints.push_back({ Pad::Triangle, "Close" });
++                        if (cards.size() > 1)
++                            hints.push_back({ Pad::DPad, "Other LiveAreas" });
++                    }
++                    draw_notice(canvas, notice);
++                    if (!launching)
++                        footer(canvas, hints, 1050, 0.8f, -1);
++                    if (job.running)
++                        draw_install(canvas, job);
++                    present(canvas);
++                    dirty = false;
++                    if (!animating) {
++                        // the bubbles of this page and the ones next to it, made while nothing moves
++                        const int count = static_cast<int>(tiles.size());
++                        const int first = std::max(0, (home.page - 1) * PER_PAGE), last = std::min(count, (home.page + 2) * PER_PAGE);
++                        for (int i = first; i < last; i++) {
++                            if (!art.count(i)) {
++                                tile_art(i);
++                                break;
++                            }
++                        }
++                        std::this_thread::sleep_for(std::chrono::milliseconds(16));
++                    }
++                    continue;
 +                } else {
 +                    // Vita3K's list, as it was
 +                    if (selected < top)
@@ -4743,12 +5623,6 @@ index 00000000..96c65f1e
 +                    hints.push_back({ Pad::Triangle, "Install games" });
 +                    hints.push_back({ Pad::Options, "HENkaku" });
 +                }
-+                break;
-+            case Mode::LiveArea:
-+                draw_livearea(canvas, items[live]);
-+                hints.push_back({ Pad::Cross, "Start" });
-+                hints.push_back({ Pad::Square, "Game settings" });
-+                hints.push_back({ Pad::Circle, "Back" });
 +                break;
 +            case Mode::Settings: {
 +                draw_settings(canvas, settings, henkaku_heading);

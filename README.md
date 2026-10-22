@@ -4,7 +4,7 @@
 in WSL Ubuntu with the M33 / Resonance / DolphinPS4 / Crema PS4 toolchain (clang 21 + libc++ 21 on
 OpenOrbis).
 
-Status: **v00.16**. On the console the launcher works (text, firmware download, installing a VPK),
+Status: **v00.17**. On the console the launcher works (text, firmware download, installing a VPK),
 PKGj runs (renderer on RADV, audio, dynarmic, the network), and Mortal Kombat (PCSE00023) plays:
 v00.12 fixed the GPU hang at the start of a fight by turning Vita3K's memory mapping off (see
 "Graphics" below). Its fights ran at 30 fps where the game wants 60 (slow motion); v00.13 (fast
@@ -17,7 +17,16 @@ stays, HENkaku > System > Style), the **HENkaku** settings for all games and for
 in-game HENkaku menu (L3 + R3) in sections and pages, and FSR 1 working on the PS4 (32-bit
 shaders) with a sharpness setting. v00.16 names the whole app HENkaku (its PS4 icon, home screen
 art and screens use the HENkaku ensō logo); it installs over Vita3K v00.15 and keeps its games
-and settings. Remember to install each new package from `/data/pkg`.
+and settings. v00.16's log showed Mortal Kombat no longer short of CPU: its threads are half idle and
+it holds 30 fps itself, waiting two vblanks for each frame in two calls (sceDisplayWaitSetFrameBuf,
+then sceDisplayWaitVblankStart), which Vita3K's FPS hack (a vcount of 2 made 1) never caught.
+v00.17 makes the FPS hack skip a frame's second wait too, and redoes the home screen as the Vita's
+(bubbles at its size and places, a blue wave wallpaper, glossy bubbles, pages turning with their
+rows following one another, a pressed bubble giving, LiveAreas as cards to the right, L1 / R1
+between them, Triangle peels one away, Cross zooms into the game) drawn from sprites made once and
+paced to the TV's refresh (v00.16 drew everything again, big soft circles included, for each
+press), and the in-game menu shows the button symbols. Remember to install each new package from
+`/data/pkg`.
 
 ## Using it
 

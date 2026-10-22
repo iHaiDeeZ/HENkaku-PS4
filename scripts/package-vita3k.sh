@@ -28,6 +28,8 @@ cp -r "$SRC/vita3k/shaders-builtin" "$STAGE/shaders-builtin"
 cp -r "$SRC/vita3k/icons" "$STAGE/icons"
 # the menus' HENkaku icon (scripts/make-henkaku-art.py, from assets/henkaku-logo.png)
 cp "$HERE/../assets/henkaku.png" "$STAGE/icons/henkaku.png"
+# the button symbols of the in-game HENkaku menu (same script)
+cp -r "$HERE/../assets/buttons" "$STAGE/icons/buttons"
 cp "$SRC/COPYING.txt" "$STAGE/COPYING.txt"
 # The launcher's and the overlay's font until the PS Vita's font package is installed (Roboto, OFL;
 # the app can't read the PS4's own fonts in /preinst)

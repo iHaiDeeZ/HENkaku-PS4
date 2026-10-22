@@ -45,7 +45,53 @@ def centered(d, y, text, f, fill, w):
     d.text(((w - d.textlength(text, font=f)) / 2, y), text, font=f, fill=fill)
 
 
+def buttons():
+    """The PlayStation button symbols for the in-game HENkaku menu (assets/buttons, 64x64)"""
+    out = os.path.join(ROOT, "assets", "buttons")
+    os.makedirs(out, exist_ok=True)
+    S, K = 64, 4  # drawn 4x larger, then shrunk: smooth edges
+    size = S * K
+
+    def disc():
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.ellipse((2 * K, 2 * K, size - 2 * K, size - 2 * K), fill=(0x20, 0x24, 0x2C, 255))
+        return img, d
+
+    def save(img, name):
+        img.resize((S, S), Image.LANCZOS).save(os.path.join(out, name))
+
+    c, w = size / 2, 5.5 * K
+    img, d = disc()
+    s = 13 * K
+    d.line((c - s, c - s, c + s, c + s), fill=(0x8F, 0xB6, 0xFF, 255), width=int(w))
+    d.line((c - s, c + s, c + s, c - s), fill=(0x8F, 0xB6, 0xFF, 255), width=int(w))
+    save(img, "cross.png")
+    img, d = disc()
+    r = 14 * K
+    d.ellipse((c - r, c - r, c + r, c + r), outline=(0xFF, 0x7A, 0x7A, 255), width=int(w))
+    save(img, "circle.png")
+    img, d = disc()
+    s = 13 * K
+    d.rectangle((c - s, c - s, c + s, c + s), outline=(0xFF, 0x8A, 0xD8, 255), width=int(w))
+    save(img, "square.png")
+    img, d = disc()
+    s = 16 * K
+    pts = [(c, c - s), (c - s, c + s * 0.62), (c + s, c + s * 0.62)]
+    d.line(pts + [pts[0]], fill=(0x4F, 0xE0, 0xB0, 255), width=int(w), joint="curve")
+    save(img, "triangle.png")
+    # the D-pad's left and right
+    img, d = disc()
+    a, h = 9 * K, 9 * K
+    for sign in (-1, 1):
+        tip = c + sign * 21 * K
+        d.polygon([(tip, c), (tip - sign * a * 1.3, c - h), (tip - sign * a * 1.3, c + h)], fill=(0xE8, 0xEC, 0xF4, 255))
+    d.rectangle((c - 4 * K, c - 4 * K, c + 4 * K, c + 4 * K), fill=(0x9A, 0xA6, 0xBD, 255))
+    save(img, "left_right.png")
+
+
 def main():
+    buttons()
     logo(512).save(os.path.join(ROOT, "assets", "henkaku.png"))
 
     icon = background(512, 512)
