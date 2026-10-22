@@ -704,22 +704,23 @@ index 54e89f88..e3308cfc 100644
  
      return std::make_unique<Dynarmic::A32::Jit>(config);
 diff --git a/vita3k/display/src/display.cpp b/vita3k/display/src/display.cpp
-index 6e673d1c..f84a9a8a 100644
+index 6e673d1c..987850af 100644
 --- a/vita3k/display/src/display.cpp
 +++ b/vita3k/display/src/display.cpp
-@@ -27,6 +27,11 @@
+@@ -27,6 +27,12 @@
  #include <motion/functions.h>
  #include <touch/functions.h>
  
 +#ifdef __PS4__
 +extern "C" void ps4_watch_thread(const char *name); // port/ps4_sampler.cpp
 +extern "C" void ps4_wait_add(int slot, long long ns);
++extern "C" bool ps4_wait_vblank(unsigned timeout_us); // vita3k/ps4/ps4_wsi.cpp
 +#endif
 +
  // Code heavily influenced by PPSSSPP's SceDisplay.cpp
  
  static constexpr int TARGET_FPS = 60;
-@@ -37,6 +42,9 @@ static constexpr int max_expected_swapchain_size = 6;
+@@ -37,6 +43,9 @@ static constexpr int max_expected_swapchain_size = 6;
  
  static void vblank_sync_thread(EmuEnvState &emuenv) {
      DisplayState &display = emuenv.display;
@@ -729,7 +730,19 @@ index 6e673d1c..f84a9a8a 100644
  
      while (!display.abort.load()) {
          {
-@@ -87,8 +95,15 @@ void wait_vblank(DisplayState &display, const ThreadStatePtr &wait_thread, const
+@@ -67,6 +76,11 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
+                 return waiter.entry.target_vcount <= display.vblank_count;
+             });
+         }
++#ifdef __PS4__
++        // the next vblank is the display's (59.94 a second, in step with the flips)
++        if (ps4_wait_vblank(50000))
++            continue;
++#endif
+         const auto time_ms = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+         const auto time_left = TARGET_MICRO_PER_FRAME - (time_ms % TARGET_MICRO_PER_FRAME);
+         std::this_thread::sleep_for(std::chrono::microseconds(time_left));
+@@ -87,8 +101,15 @@ void wait_vblank(DisplayState &display, const ThreadStatePtr &wait_thread, const
      if (target_vcount <= display.vblank_count)
          return;
  
@@ -4417,6 +4430,51 @@ index 3e2404bb..0ca2475e 100644
      res.add(ring.get_compiled());
  }
  
+diff --git a/vita3k/overlay/src/perf_overlay.cpp b/vita3k/overlay/src/perf_overlay.cpp
+index b5b30616..7f14196b 100644
+--- a/vita3k/overlay/src/perf_overlay.cpp
++++ b/vita3k/overlay/src/perf_overlay.cpp
+@@ -26,6 +26,10 @@
+ #include <algorithm>
+ #include <cmath>
+ 
++#ifdef __PS4__
++extern "C" bool ps4_frame_doubling(); // vita3k/ps4/ps4_settings.cpp
++#endif
++
+ namespace overlay {
+ 
+ perf_overlay::perf_overlay() {
+@@ -93,20 +97,26 @@ void perf_overlay::set_fps_data(uint32_t fps, uint32_t avg_fps, uint32_t min_fps
+ 
+ void perf_overlay::update_text() {
+     std::string text;
++    std::string fps = std::to_string(m_fps);
++#ifdef __PS4__
++    // frame generation: the game's frames and the in-between ones
++    if (ps4_frame_doubling())
++        fps = fmt::format("{} ({} on screen)", m_fps, std::min<uint32_t>(m_fps * 2, 60));
++#endif
+ 
+     switch (m_detail) {
+     case perf_detail_level::minimum:
+-        text = fmt::format("FPS: {}", m_fps);
++        text = fmt::format("FPS: {}", fps);
+         break;
+     case perf_detail_level::low:
+-        text = fmt::format("FPS: {} ({} ms)", m_fps, m_ms_per_frame);
++        text = fmt::format("FPS: {} ({} ms)", fps, m_ms_per_frame);
+         break;
+     case perf_detail_level::medium:
+     case perf_detail_level::maximum:
+         text = fmt::format("FPS: {} ({} ms)\n"
+                            "Avg: {}  Min: {}  Max: {}\n"
+                            "RAM: {} MiB",
+-            m_fps, m_ms_per_frame,
++            fps, m_ms_per_frame,
+             m_avg_fps, m_min_fps, m_max_fps,
+             m_ram_used / MiB(1));
+         break;
 diff --git a/vita3k/packages/CMakeLists.txt b/vita3k/packages/CMakeLists.txt
 index f3985580..396d151a 100644
 --- a/vita3k/packages/CMakeLists.txt
@@ -10803,10 +10861,10 @@ index 00000000..4291971e
 +} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_settings.cpp b/vita3k/ps4/ps4_settings.cpp
 new file mode 100644
-index 00000000..99e0a46b
+index 00000000..1246640b
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.cpp
-@@ -0,0 +1,702 @@
+@@ -0,0 +1,714 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -10853,6 +10911,7 @@ index 00000000..99e0a46b
 +#include <util/log.h>
 +
 +#include <algorithm>
++#include <atomic>
 +#include <cmath>
 +#include <cstdio>
 +#include <functional>
@@ -11177,7 +11236,7 @@ index 00000000..99e0a46b
 +}
 +
 +Item frame_generation_choice() {
-+    return pref_choice("Frame generation", { "Off", "On (30-40 fps games to 60)" },
++    return pref_choice("Frame generation", { "Off", "On (games under 50 fps shown at 60)" },
 +        [](const Prefs &p) { return p.frame_generation ? 1 : 0; },
 +        [](Prefs &p, int value) { p.frame_generation = value == 1; }, "in-between frames, a frame more of delay");
 +}
@@ -11350,6 +11409,17 @@ index 00000000..99e0a46b
 +// SceGxm (sceGxmDisplayQueueAddEntry) asks
 +extern "C" bool ps4_frame_generation() {
 +    return ps4settings::prefs().frame_generation;
++}
++
++// frame generation is making in-between frames now (renderer.cpp): the FPS overlay's "on screen"
++std::atomic<bool> g_frame_doubling{ false };
++
++extern "C" void ps4_set_frame_doubling(bool on) {
++    g_frame_doubling.store(on, std::memory_order_relaxed);
++}
++
++extern "C" bool ps4_frame_doubling() {
++    return g_frame_doubling.load(std::memory_order_relaxed) && ps4_frame_generation();
 +}
 +
 +extern "C" bool ps4_profiler() {
@@ -11643,10 +11713,10 @@ index 00000000..c06ce988
 +}
 diff --git a/vita3k/ps4/ps4_wsi.cpp b/vita3k/ps4/ps4_wsi.cpp
 new file mode 100644
-index 00000000..d3b09a34
+index 00000000..56d76b37
 --- /dev/null
 +++ b/vita3k/ps4/ps4_wsi.cpp
-@@ -0,0 +1,623 @@
+@@ -0,0 +1,683 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -11963,7 +12033,9 @@ index 00000000..d3b09a34
 +    auto sc = new PS4Swapchain();
 +    sc->device = device;
 +    sc->image_count = std::clamp<uint32_t>(info->minImageCount, 2, MAX_IMAGES);
-+    sc->flip_mode = info->presentMode == VK_PRESENT_MODE_FIFO_KHR ? ORBIS_VIDEO_OUT_FLIP_VSYNC : ORBIS_VIDEO_OUT_FLIP_HSYNC;
++    // vsynced flips for mailbox too (Vita3K's choice): VideoOut can't replace a queued flip, and an
++    // hsync flip shows a frame from the next line down, torn across the screen
++    sc->flip_mode = info->presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR ? ORBIS_VIDEO_OUT_FLIP_HSYNC : ORBIS_VIDEO_OUT_FLIP_VSYNC;
 +    auto create_image = device_fn<PFN_vkCreateImage>(device, "vkCreateImage");
 +    auto get_requirements = device_fn<PFN_vkGetImageMemoryRequirements>(device, "vkGetImageMemoryRequirements");
 +    auto allocate_memory = device_fn<PFN_vkAllocateMemory>(device, "vkAllocateMemory");
@@ -12262,6 +12334,64 @@ index 00000000..d3b09a34
 +    return &GetInstanceProcAddr;
 +}
 +
++// Waits for the display's next vblank (59.94 a second, as on the Vita), for the emulated vblanks
++// (display.cpp): a game's frames then keep their place against the vsynced flips instead of drifting
++// through them (a frame shown a vblank late every 17 s or so). False when it can't: the caller
++// keeps time itself. A missed vblank, or a display not at 60 Hz (the first 120 vblanks timed), turns
++// this off for good: a game must not slow down.
++extern "C" bool ps4_wait_vblank(unsigned timeout_us) {
++    static OrbisKernelEqueue queue = 0;
++    static int ready = 0; // 0 not set up yet, 1 set up, -1 not available
++    static int timed = 0;
++    static std::chrono::steady_clock::time_point first;
++    if (ready == 0) {
++        const int handle = ps4wsi_video_handle();
++        if (handle < 0)
++            return false;
++        // (the SDK declares it without its parameters)
++        using AddVblankEvent = int32_t (*)(OrbisKernelEqueue, int32_t, void *);
++        const int created = sceKernelCreateEqueue(&queue, "v3k vblank");
++        const int added = created < 0 ? created : reinterpret_cast<AddVblankEvent>(&sceVideoOutAddVblankEvent)(queue, handle, nullptr);
++        if (created < 0 || added < 0) {
++            LOG_WARN("PS4 WSI: no vblank events ({:08X}), the emulated vblanks keep their own time", static_cast<uint32_t>(created < 0 ? created : added));
++            ready = -1;
++            return false;
++        }
++        LOG_INFO("PS4 WSI: the emulated vblanks follow the display's");
++        ready = 1;
++    }
++    if (ready < 0)
++        return false;
++    OrbisKernelEvent event;
++    int got = 0;
++    OrbisKernelUseconds timeout = timeout_us;
++    const int waited = sceKernelWaitEqueue(queue, &event, 1, &got, &timeout);
++    if (waited >= 0 && got > 0) {
++        if (timed <= 120) {
++            const auto now = std::chrono::steady_clock::now();
++            if (timed == 0)
++                first = now;
++            else if (timed == 120) {
++                const double rate = 120.0 / std::chrono::duration<double>(now - first).count();
++                if (rate < 58.0 || rate > 61.0) {
++                    LOG_WARN("PS4 WSI: the display gives {:.2f} vblanks a second, the emulated vblanks keep their own time", rate);
++                    ready = -1;
++                    return false;
++                }
++                LOG_INFO("PS4 WSI: the display gives {:.2f} vblanks a second", rate);
++            }
++            timed++;
++        }
++        return true;
++    }
++    constexpr int ETIMEDOUT_ERROR = static_cast<int>(0x8002003C);
++    if (waited == ETIMEDOUT_ERROR || (waited >= 0 && got < 1)) {
++        LOG_WARN("PS4 WSI: no vblank event in {} us, the emulated vblanks keep their own time from now on", timeout_us);
++        ready = -1;
++    }
++    return false;
++}
++
 +int ps4wsi_video_handle() {
 +    const std::lock_guard<std::mutex> lock(mutex);
 +    return open_video_out() ? video : -1;
@@ -12505,10 +12635,10 @@ index 3860cced..17284694 100644
      void refresh_available_textures();
 diff --git a/vita3k/renderer/include/renderer/vulkan/frame_generation.h b/vita3k/renderer/include/renderer/vulkan/frame_generation.h
 new file mode 100644
-index 00000000..501947a3
+index 00000000..3054d2aa
 --- /dev/null
 +++ b/vita3k/renderer/include/renderer/vulkan/frame_generation.h
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,90 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -12528,14 +12658,16 @@ index 00000000..501947a3
 +
 +#pragma once
 +
-+// Frame generation: for a game whose frames come at most every other vblank (30 to 40 fps), a frame
-+// in between the last two from the motion between them, shown a vblank before the new one, so the
-+// screen gets twice the frames. Three compute passes over the game's frame as Vita3K presents it
++// Frame generation: for a game under about 50 fps (renderer.cpp: then held at 30), a frame in
++// between the last two from the motion between them, shown a vblank before the new one, so the
++// screen gets a frame every vblank. Three compute passes over the game's frame as Vita3K presents it
 +// (before the screen filter, which then scales the in-between frame like a real one):
 +//   fg_copy    the frame copied out of its surface, and its luma at 1/scale of its size
 +//   fg_motion  per 8x8 luma block, a search for where it was in the previous frame: first on the
-+//              luma at half size (camera pans), then on the luma from there
-+//   fg_interp  each pixel from both frames halfway along the blended block vectors
++//              luma at half size (camera pans), then on the luma from there; then a count of the
++//              blocks that found no match or move unlike their neighbours (the judge)
++//   fg_interp  each pixel along the best of the motions around it; the new frame's pixel where none
++//              fits, and the whole new frame when the judge says the motion can't be trusted
 +// The frames alternate between two images; the in-between frame goes to a third.
 +
 +#include <renderer/vulkan/state.h>
@@ -12564,7 +12696,7 @@ index 00000000..501947a3
 +        uint32_t scale;
 +        uint32_t luma_w, luma_h;
 +        uint32_t blocks_w;
-+        uint32_t pass_index; // fg_motion: 0 the coarse pass, 1 the fine one
++        uint32_t pass_index; // fg_motion: 0 the coarse pass, 1 the fine one, 2 the judge
 +    };
 +
 +    bool init();
@@ -12588,6 +12720,8 @@ index 00000000..501947a3
 +    vkutil::Buffer luma[2];
 +    vkutil::Buffer vectors;
 +    vkutil::Buffer coarse;
++    // fg_motion's counts: blocks without a match, blocks unlike their neighbours
++    vkutil::Buffer judge;
 +    vkutil::Image result;
 +    // which of frames / luma the next frame goes to; whether the other one holds the last frame
 +    int next = 0;
@@ -12767,19 +12901,26 @@ index 3efb94f7..96de53ee 100644
      bool create();
      // called after the logical device has been created
 diff --git a/vita3k/renderer/include/renderer/vulkan/state.h b/vita3k/renderer/include/renderer/vulkan/state.h
-index 1a5bc612..7319f58b 100644
+index 1a5bc612..6ffca13e 100644
 --- a/vita3k/renderer/include/renderer/vulkan/state.h
 +++ b/vita3k/renderer/include/renderer/vulkan/state.h
-@@ -62,6 +62,8 @@ struct VKState : public renderer::State {
+@@ -62,6 +62,15 @@ struct VKState : public renderer::State {
      vk::Device device;
  
      ScreenRenderer screen_renderer;
-+    // the vblank the last frame was presented on (frame generation: how far apart frames come)
-+    uint64_t last_presented_vblank = 0;
++    // frame generation's pacing (renderer.cpp render_frame): when the last frame came, how long this
++    // thread waited for swapchain images since, the game's own time a frame (averaged), and whether
++    // its frames get an in-between frame
++    struct FramePacing {
++        std::chrono::steady_clock::time_point last_frame{};
++        double waited_ms = 0.0;
++        double pace_ms = 0.0;
++        bool doubling = false;
++    } fg_pacing;
      OverlayRenderer overlay_renderer;
  
      // Used for memory allocation and general query later.
-@@ -112,6 +114,8 @@ struct VKState : public renderer::State {
+@@ -112,6 +121,8 @@ struct VKState : public renderer::State {
      vkutil::Buffer default_buffer;
  
      bool support_fsr = false;
@@ -13565,10 +13706,10 @@ index d89da55d..ebae243d 100644
          std::fill_n(vertex_stream_buffers, SCE_GXM_MAX_VERTEX_STREAMS, state.default_buffer.buffer);
 diff --git a/vita3k/renderer/src/vulkan/frame_generation.cpp b/vita3k/renderer/src/vulkan/frame_generation.cpp
 new file mode 100644
-index 00000000..a648d10d
+index 00000000..e8916462
 --- /dev/null
 +++ b/vita3k/renderer/src/vulkan/frame_generation.cpp
-@@ -0,0 +1,319 @@
+@@ -0,0 +1,336 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -13669,12 +13810,12 @@ index 00000000..a648d10d
 +        // copy: the game's frame, the history image, its luma
 +        { binding(0, vk::DescriptorType::eCombinedImageSampler, &nearest), binding(1, vk::DescriptorType::eStorageImage),
 +            binding(2, vk::DescriptorType::eStorageBuffer) },
-+        // motion: the two lumas, the vectors, the coarse vectors
++        // motion: the two lumas, the vectors, the coarse vectors, the judge's counts
 +        { binding(0, vk::DescriptorType::eStorageBuffer), binding(1, vk::DescriptorType::eStorageBuffer), binding(2, vk::DescriptorType::eStorageBuffer),
-+            binding(3, vk::DescriptorType::eStorageBuffer) },
-+        // in-between: the two frames, the vectors, the result
++            binding(3, vk::DescriptorType::eStorageBuffer), binding(4, vk::DescriptorType::eStorageBuffer) },
++        // in-between: the two frames, the vectors, the result, the judge's counts
 +        { binding(0, vk::DescriptorType::eCombinedImageSampler, &linear), binding(1, vk::DescriptorType::eCombinedImageSampler, &linear),
-+            binding(2, vk::DescriptorType::eStorageBuffer), binding(3, vk::DescriptorType::eStorageImage) },
++            binding(2, vk::DescriptorType::eStorageBuffer), binding(3, vk::DescriptorType::eStorageImage), binding(4, vk::DescriptorType::eStorageBuffer) },
 +    };
 +    const vk::PushConstantRange push{
 +        .stageFlags = vk::ShaderStageFlagBits::eCompute,
@@ -13706,7 +13847,7 @@ index 00000000..a648d10d
 +    const std::array<vk::DescriptorPoolSize, 3> sizes = {
 +        vk::DescriptorPoolSize{ .type = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = slots * 3 },
 +        vk::DescriptorPoolSize{ .type = vk::DescriptorType::eStorageImage, .descriptorCount = slots * 2 },
-+        vk::DescriptorPoolSize{ .type = vk::DescriptorType::eStorageBuffer, .descriptorCount = slots * 6 },
++        vk::DescriptorPoolSize{ .type = vk::DescriptorType::eStorageBuffer, .descriptorCount = slots * 8 },
 +    };
 +    vk::DescriptorPoolCreateInfo pool_info{ .maxSets = slots * 3 };
 +    pool_info.setPoolSizes(sizes);
@@ -13718,6 +13859,8 @@ index 00000000..a648d10d
 +        const auto allocated = device.allocateDescriptorSets(alloc);
 +        std::copy_n(allocated.begin(), 3, slot.begin());
 +    }
++    judge = vkutil::Buffer(4 * sizeof(uint32_t));
++    judge.init_buffer(vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst);
 +    LOG_INFO("Frame generation ready");
 +    return true;
 +}
@@ -13814,6 +13957,7 @@ index 00000000..a648d10d
 +    const vk::DescriptorBufferInfo luma_prev{ .buffer = luma[prev].buffer, .offset = 0, .range = VK_WHOLE_SIZE };
 +    const vk::DescriptorBufferInfo vector_info{ .buffer = vectors.buffer, .offset = 0, .range = VK_WHOLE_SIZE };
 +    const vk::DescriptorBufferInfo coarse_info{ .buffer = coarse.buffer, .offset = 0, .range = VK_WHOLE_SIZE };
++    const vk::DescriptorBufferInfo judge_info{ .buffer = judge.buffer, .offset = 0, .range = VK_WHOLE_SIZE };
 +    const auto write_image = [](vk::DescriptorSet dst, uint32_t binding, vk::DescriptorType type, const vk::DescriptorImageInfo &info) {
 +        vk::WriteDescriptorSet write{ .dstSet = dst, .dstBinding = binding, .descriptorCount = 1, .descriptorType = type };
 +        write.setImageInfo(info);
@@ -13834,12 +13978,21 @@ index 00000000..a648d10d
 +        writes.push_back(write_buffer(set[1], 1, luma_cur));
 +        writes.push_back(write_buffer(set[1], 2, vector_info));
 +        writes.push_back(write_buffer(set[1], 3, coarse_info));
++        writes.push_back(write_buffer(set[1], 4, judge_info));
 +        writes.push_back(write_image(set[2], 0, vk::DescriptorType::eCombinedImageSampler, prev_sampled));
 +        writes.push_back(write_image(set[2], 1, vk::DescriptorType::eCombinedImageSampler, cur_sampled));
 +        writes.push_back(write_buffer(set[2], 2, vector_info));
 +        writes.push_back(write_image(set[2], 3, vk::DescriptorType::eStorageImage, result_storage));
++        writes.push_back(write_buffer(set[2], 4, judge_info));
 +    }
 +    device.updateDescriptorSets(writes, {});
++
++    // the judge counts this pair's blocks from zero: once the last pair's passes have read the counts,
++    // and before this pair's (the barrier below)
++    if (inbetween) {
++        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags(), {}, {}, {});
++        cmd.fillBuffer(judge.buffer, 0, VK_WHOLE_SIZE, 0);
++    }
 +
 +    // the game's frame (drawn to before; the last frame's passes and screen pass read ours)
 +    const vk::MemoryBarrier before{
@@ -13864,6 +14017,11 @@ index 00000000..a648d10d
 +        cmd.dispatch((coarse_w + GROUP - 1) / GROUP, (coarse_h + GROUP - 1) / GROUP, 1);
 +        compute_barrier(cmd);
 +        constants.pass_index = 1;
++        cmd.pushConstants(pipeline_layouts[1], vk::ShaderStageFlagBits::eCompute, 0, sizeof(Constants), &constants);
++        cmd.dispatch((blocks_w + GROUP - 1) / GROUP, (blocks_h + GROUP - 1) / GROUP, 1);
++        // the judge: blocks moving unlike all their neighbours
++        compute_barrier(cmd);
++        constants.pass_index = 2;
 +        cmd.pushConstants(pipeline_layouts[1], vk::ShaderStageFlagBits::eCompute, 0, sizeof(Constants), &constants);
 +        cmd.dispatch((blocks_w + GROUP - 1) / GROUP, (blocks_h + GROUP - 1) / GROUP, 1);
 +
@@ -14005,7 +14163,7 @@ index ff6d0c5b..ab744977 100644
  
          if (request == nullptr)
 diff --git a/vita3k/renderer/src/vulkan/renderer.cpp b/vita3k/renderer/src/vulkan/renderer.cpp
-index ed8c71ad..221be476 100644
+index ed8c71ad..4cf9db15 100644
 --- a/vita3k/renderer/src/vulkan/renderer.cpp
 +++ b/vita3k/renderer/src/vulkan/renderer.cpp
 @@ -22,6 +22,7 @@
@@ -14029,18 +14187,19 @@ index ed8c71ad..221be476 100644
  #ifdef __ANDROID__
  #include <SDL3/SDL_system.h>
  #include <dlfcn.h>
-@@ -150,6 +157,10 @@ const static std::vector<const char *> required_device_extensions = {
+@@ -150,6 +157,11 @@ const static std::vector<const char *> required_device_extensions = {
      vk::KHRMaintenance1ExtensionName
  };
  
 +#ifdef __PS4__
 +extern "C" bool ps4_frame_generation(); // vita3k/ps4/ps4_settings.cpp
++extern "C" void ps4_set_frame_doubling(bool on); // the FPS overlay's "on screen" (ps4_settings.cpp)
 +#endif
 +
  namespace renderer::vulkan {
  
  #if defined(__ANDROID__) && defined(USE_ADRENO_TOOLS)
-@@ -379,6 +390,8 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
+@@ -379,6 +391,8 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
  
          if (!detect_patch_bcn(&texture_cache.support_dxt))
              return false;
@@ -14049,7 +14208,7 @@ index ed8c71ad..221be476 100644
  #else
          VULKAN_HPP_DEFAULT_DISPATCHER.init();
  #endif
-@@ -406,6 +419,10 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
+@@ -406,6 +420,10 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
              instance_extensions.push_back(vk::KHRWin32SurfaceExtensionName);
  #elif defined(__APPLE__)
              instance_extensions.push_back(vk::EXTMetalSurfaceExtensionName);
@@ -14060,7 +14219,7 @@ index ed8c71ad..221be476 100644
  #elif !defined(__ANDROID__)
              if (!select_linux_surface_extension(*this, frame_host->handle(), instance_extensions))
                  return false;
-@@ -713,6 +730,16 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
+@@ -713,6 +731,16 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
          // we need to make a copy of the vertex buffer for moltenvk, so disable memory mapping
          support_memory_mapping = false;
  #endif
@@ -14077,7 +14236,7 @@ index ed8c71ad..221be476 100644
  
  #ifdef __ANDROID__
          support_android_buffer_import &= SDL_GetAndroidSDKVersion() >= 26;
-@@ -945,6 +972,14 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
+@@ -945,6 +973,14 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
          LOG_WARN("Failed to initialize Vulkan overlay renderer, overlays will be disabled");
      }
  
@@ -14092,21 +14251,55 @@ index ed8c71ad..221be476 100644
      support_fsr &= static_cast<bool>(screen_renderer.surface_capabilities.supportedUsageFlags & vk::ImageUsageFlagBits::eStorage);
      // The FSR storage shaders write rgba8; BGRA8 swapchain views are not format-compatible.
      support_fsr &= screen_renderer.surface_format.format == vk::Format::eR8G8B8A8Unorm;
-@@ -1234,6 +1269,35 @@ void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState
+@@ -1143,8 +1179,17 @@ void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState
+     if (!frame.base && !has_overlays)
+         return;
+ 
++#ifdef __PS4__
++    // (frame generation: the time waited here for the screen is not the game's)
++    const auto acquire_start = std::chrono::steady_clock::now();
++    const bool acquired = screen_renderer.acquire_swapchain_image();
++    fg_pacing.waited_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - acquire_start).count();
++    if (!acquired)
++        return;
++#else
+     if (!screen_renderer.acquire_swapchain_image())
+         return;
++#endif
+ 
+     // store viewport for touch
+     {
+@@ -1234,6 +1279,55 @@ void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState
              layout = vk::ImageLayout::eShaderReadOnlyOptimal;
          }
  
 +#ifdef __PS4__
-+        // frame generation: a frame that came two vblanks or more after the last one (a game at 30
-+        // to 40 fps) gets an in-between frame from the motion between them, presented first, so
-+        // the PS4's vsynced flips show it a vblank before the real one
++        // frame generation: while the game makes under about 50 frames a second on its own (the time
++        // between its frames, less what this thread waited for the screen, is over 20 ms; back to
++        // plain frames under 17.8 ms), every frame gets an in-between frame from the motion between
++        // it and the last, presented first: the vsynced flips show it a vblank before the real one.
++        // Two flips a frame hold the game at 30 (its next frame waits for a swapchain image), so the
++        // screen gets a frame every vblank, evenly. A frame after a long gap (loading) gets none.
 +        if (ps4_frame_generation()) {
-+            const uint64_t vblank = display.vblank_count.load();
-+            const bool slow = last_presented_vblank != 0 && vblank >= last_presented_vblank + 2 && vblank - last_presented_vblank <= 6;
-+            last_presented_vblank = vblank;
++            const auto now = std::chrono::steady_clock::now();
++            const double gap_ms = fg_pacing.last_frame == std::chrono::steady_clock::time_point{} ? 0.0
++                                                                                                  : std::chrono::duration<double, std::milli>(now - fg_pacing.last_frame).count();
++            fg_pacing.last_frame = now;
++            const bool steady = gap_ms > 0.0 && gap_ms < 100.0;
++            if (steady) {
++                const double own_ms = std::max(gap_ms - fg_pacing.waited_ms, 1.0);
++                fg_pacing.pace_ms = fg_pacing.pace_ms == 0.0 ? own_ms : fg_pacing.pace_ms * 0.9 + own_ms * 0.1;
++                const bool doubling = fg_pacing.doubling ? fg_pacing.pace_ms > 17.8 : fg_pacing.pace_ms > 20.0;
++                if (doubling != fg_pacing.doubling) {
++                    fg_pacing.doubling = doubling;
++                    ps4_set_frame_doubling(doubling);
++                    LOG_INFO("Frame generation: {} (the game makes {:.0f} frames a second)", doubling ? "in-between frames, held at 30" : "plain frames", 1000.0 / fg_pacing.pace_ms);
++                }
++            }
++            fg_pacing.waited_ms = 0.0;
 +            if (!screen_renderer.frame_generator)
 +                screen_renderer.frame_generator = std::make_unique<FrameGenerator>(*this);
-+            if (screen_renderer.frame_generator->record(screen_renderer.current_cmd_buffer, screen_renderer.swapchain_image_idx, surface_handle, layout, viewport, slow)) {
++            if (screen_renderer.frame_generator->record(screen_renderer.current_cmd_buffer, screen_renderer.swapchain_image_idx, surface_handle, layout, viewport, steady && fg_pacing.doubling)) {
 +                screen_renderer.render(screen_renderer.frame_generator->inbetween(), vk::ImageLayout::eGeneral, screen_renderer.frame_generator->inbetween_viewport());
 +                if (has_overlays && screen_renderer.current_cmd_buffer) {
 +                    overlay_renderer.render(screen_renderer.current_cmd_buffer, screen_renderer.default_render_pass, screen_renderer.extent,
@@ -14114,21 +14307,25 @@ index ed8c71ad..221be476 100644
 +                }
 +                screen_renderer.swap_window();
 +                // the real frame on the next swapchain image
-+                if (!screen_renderer.acquire_swapchain_image())
++                const auto second_start = std::chrono::steady_clock::now();
++                const bool second = screen_renderer.acquire_swapchain_image();
++                fg_pacing.waited_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - second_start).count();
++                if (!second)
 +                    return;
 +                if (has_overlays && screen_renderer.current_cmd_buffer) {
 +                    overlay_renderer.prepare(screen_renderer.current_cmd_buffer, *overlay_manager, display.viewport_w, display.viewport_h,
 +                        screen_renderer.swapchain_image_idx);
 +                }
 +            }
-+        } else {
-+            last_presented_vblank = 0;
++        } else if (fg_pacing.last_frame != std::chrono::steady_clock::time_point{}) {
++            fg_pacing = {};
++            ps4_set_frame_doubling(false);
 +        }
 +#endif
          screen_renderer.render(surface_handle, layout, viewport);
      } else if (has_overlays) {
          screen_renderer.begin_default_render_pass();
-@@ -1724,6 +1788,8 @@ renderer::VulkanDeviceInfo renderer::enumerate_vulkan_devices(const std::string
+@@ -1724,6 +1818,8 @@ renderer::VulkanDeviceInfo renderer::enumerate_vulkan_devices(const std::string
              return info;
  
          dispatch.init(vk_get_instance_proc_addr);
@@ -14860,10 +15057,10 @@ HcmV?d00001
 
 diff --git a/vita3k/shaders-builtin/vulkan/fg_interp.comp b/vita3k/shaders-builtin/vulkan/fg_interp.comp
 new file mode 100644
-index 00000000..397e9212
+index 00000000..bc388e50
 --- /dev/null
 +++ b/vita3k/shaders-builtin/vulkan/fg_interp.comp
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,132 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -14882,10 +15079,15 @@ index 00000000..397e9212
 +// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 +
 +#version 450
-+// Frame generation, 3 of 3: the in-between frame. Each pixel takes the blocks' vectors around it
-+// (blended), and both frames halfway along that motion: the previous one at p + d/2, the new one
-+// at p - d/2. Where they agree, their average; where they don't (something appears, or is
-+// uncovered), the new frame's.
++// Frame generation, 3 of 3: the in-between frame. Each pixel tries a few motions d: none, the
++// blocks' vectors around it blended (smooth motion), and each of those 4 blocks' own (an edge between
++// two motions); a try samples both frames halfway along d (the previous one at p + d/2, the new one
++// at p - d/2) at 5 points around the pixel, and the closest match wins (no motion and the blend win
++// near ties). The pixel is the two samples' average. Where nothing matches (something appears, or is
++// uncovered, or changes), and in the whole frame when fg_motion counted too many blocks without a
++// match or unlike their neighbours (a cut, a whip, a fade), it is the new frame's pixel: the screen
++// then shows the new frame a vblank early, as without frame generation, instead of a smeared one.
++// What stays put (the HUD over a moving scene) is the average of both frames.
 +
 +layout(local_size_x = 8, local_size_y = 8) in;
 +
@@ -14905,8 +15107,15 @@ index 00000000..397e9212
 +    ivec2 vectors[];
 +};
 +layout(set = 0, binding = 3, rgba8) uniform writeonly image2D result;
++layout(set = 0, binding = 4) readonly buffer Judge {
++    uint no_match;
++    uint incoherent;
++} judge;
 +
 +const int BS = 8;
++const vec3 WEIGHTS = vec3(0.299, 0.587, 0.114);
++// a match: the frames differ by less than this around the pixel (luma, 0 to 1)
++const float GOOD = 0.05;
 +
 +vec2 vector_at(ivec2 b) {
 +    const int blocks_h = (int(c.luma_h) + BS - 1) / BS;
@@ -14914,95 +15123,178 @@ index 00000000..397e9212
 +    return vec2(vectors[b.y * int(c.blocks_w) + b.x]);
 +}
 +
++float difference(vec3 a, vec3 b) {
++    return dot(abs(a - b), WEIGHTS);
++}
++
++// how far apart the frames are around p (frame pixels) along the motion d
++float mismatch(vec2 p, vec2 d, vec2 size) {
++    const vec2 at[5] = vec2[](vec2(0.0), vec2(2.0, 0.0), vec2(-2.0, 0.0), vec2(0.0, 2.0), vec2(0.0, -2.0));
++    const float weight[5] = float[](2.0, 1.0, 1.0, 1.0, 1.0);
++    float sum = 0.0;
++    for (int i = 0; i < 5; i++) {
++        const vec3 was = textureLod(previous, (p + at[i] + d * 0.5) / size, 0.0).rgb;
++        const vec3 is = textureLod(current, (p + at[i] - d * 0.5) / size, 0.0).rgb;
++        sum += weight[i] * difference(was, is);
++    }
++    return sum / 6.0;
++}
++
 +void main() {
-+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
-+    if (p.x >= int(c.frame_size.x) || p.y >= int(c.frame_size.y))
++    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
++    if (pixel.x >= int(c.frame_size.x) || pixel.y >= int(c.frame_size.y))
 +        return;
-+    // the pixel among the blocks (their centres), in luma pixels
-+    const vec2 at = (vec2(p) + 0.5) / float(c.scale) / float(BS) - 0.5;
-+    const ivec2 b = ivec2(floor(at));
-+    const vec2 f = at - vec2(b);
-+    const vec2 d = mix(mix(vector_at(b), vector_at(b + ivec2(1, 0)), f.x), mix(vector_at(b + ivec2(0, 1)), vector_at(b + ivec2(1, 1)), f.x), f.y)
-+        * float(c.scale);
-+    const vec2 size = vec2(c.frame_size);
-+    const vec3 weights = vec3(0.299, 0.587, 0.114);
-+    // what stays put (the HUD over a panning scene) keeps its place: the same in both frames
-+    const vec4 was = textureLod(previous, (vec2(p) + 0.5) / size, 0.0);
-+    const vec4 is = textureLod(current, (vec2(p) + 0.5) / size, 0.0);
-+    if (dot(abs(was.rgb - is.rgb), weights) < 0.03) {
-+        imageStore(result, p, vec4(mix(was.rgb, is.rgb, 0.5), 1.0));
++    const vec3 is = texelFetch(current, pixel, 0).rgb;
++    // the frame's motion can't be trusted: the new frame
++    const uint blocks = c.blocks_w * uint((int(c.luma_h) + BS - 1) / BS);
++    if (judge.no_match * 4u > blocks || judge.incoherent * 20u > blocks * 7u) {
++        imageStore(result, pixel, vec4(is, 1.0));
 +        return;
 +    }
-+    const vec4 before = textureLod(previous, (vec2(p) + 0.5 + d * 0.5) / size, 0.0);
-+    const vec4 after = textureLod(current, (vec2(p) + 0.5 - d * 0.5) / size, 0.0);
-+    const float difference = dot(abs(before.rgb - after.rgb), weights);
-+    const vec3 color = difference < 0.1 ? mix(before.rgb, after.rgb, 0.5) : after.rgb;
-+    imageStore(result, p, vec4(color, 1.0));
++    const vec3 was = texelFetch(previous, pixel, 0).rgb;
++    if (difference(was, is) < 0.03) {
++        imageStore(result, pixel, vec4(mix(was, is, 0.5), 1.0));
++        return;
++    }
++
++    const vec2 size = vec2(c.frame_size);
++    const vec2 p = vec2(pixel) + 0.5;
++    // the pixel among the blocks (their centres), in luma pixels
++    const vec2 at = p / float(c.scale) / float(BS) - 0.5;
++    const ivec2 b = ivec2(floor(at));
++    const vec2 f = at - vec2(b);
++    const float scale = float(c.scale);
++    const vec2 tries[5] = vec2[](
++        mix(mix(vector_at(b), vector_at(b + ivec2(1, 0)), f.x), mix(vector_at(b + ivec2(0, 1)), vector_at(b + ivec2(1, 1)), f.x), f.y) * scale,
++        vector_at(b) * scale, vector_at(b + ivec2(1, 0)) * scale, vector_at(b + ivec2(0, 1)) * scale, vector_at(b + ivec2(1, 1)) * scale);
++    // no motion first; the blend and no motion are favoured (still things and smooth motion)
++    vec2 d = vec2(0.0);
++    float best_mismatch = mismatch(p, d, size);
++    float best = best_mismatch * 0.9;
++    for (int i = 0; i < 5; i++) {
++        bool tried = tries[i] == vec2(0.0);
++        for (int j = 0; j < i; j++)
++            tried = tried || tries[j] == tries[i];
++        if (tried)
++            continue;
++        const float m = mismatch(p, tries[i], size);
++        const float score = m * (i == 0 ? 0.85 : 1.0);
++        if (score < best - 1e-4) {
++            best = score;
++            best_mismatch = m;
++            d = tries[i];
++        }
++    }
++    if (best_mismatch >= GOOD) {
++        imageStore(result, pixel, vec4(is, 1.0));
++        return;
++    }
++    const vec3 before = textureLod(previous, (p + d * 0.5) / size, 0.0).rgb;
++    const vec3 after = textureLod(current, (p - d * 0.5) / size, 0.0).rgb;
++    imageStore(result, pixel, vec4(mix(before, after, 0.5), 1.0));
 +}
 diff --git a/vita3k/shaders-builtin/vulkan/fg_interp.comp.spv b/vita3k/shaders-builtin/vulkan/fg_interp.comp.spv
 new file mode 100644
-index 0000000000000000000000000000000000000000..5d451db1b57f8cfdcc2c1f17de7b76d4167c9282
+index 0000000000000000000000000000000000000000..979c12c769f03446c357c2579e0ba6072d2355d4
 GIT binary patch
-literal 6592
-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
+literal 11864
+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
+MZbE#oY5QLL51Oxl=>Px#
 
 literal 0
 HcmV?d00001
 
 diff --git a/vita3k/shaders-builtin/vulkan/fg_motion.comp b/vita3k/shaders-builtin/vulkan/fg_motion.comp
 new file mode 100644
-index 00000000..2b3e6c3c
+index 00000000..2a500e26
 --- /dev/null
 +++ b/vita3k/shaders-builtin/vulkan/fg_motion.comp
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,164 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -15027,7 +15319,11 @@ index 00000000..2b3e6c3c
 +//   pass 0  on the luma at half size (2x2 means): from no motion or the block's last vector, steps
 +//           of 8, 4, 2 and 1, up to 24 (48 luma pixels)
 +//   pass 1  on the luma: from the best of no motion, the block's last vector and twice the coarse
-+//           vectors around it, steps of 2 and 1
++//           vectors around it, steps of 2 and 1; a block whose best still differs by more than 0.07
++//           a pixel is counted (it found no match)
++//   pass 2  per block: counted when its vector is unlike all four neighbours' (by more than 4 luma
++//           pixels). Many blocks of either kind: a cut, a whip or a fade, where an in-between frame
++//           would be a mess (fg_interp shows the new frame instead)
 +
 +layout(local_size_x = 8, local_size_y = 8) in;
 +
@@ -15053,6 +15349,10 @@ index 00000000..2b3e6c3c
 +layout(set = 0, binding = 3) buffer Coarse {
 +    ivec2 coarse[];
 +};
++layout(set = 0, binding = 4) buffer Judge {
++    uint no_match;
++    uint incoherent;
++} judge;
 +
 +const int BS = 8;
 +
@@ -15089,6 +15389,19 @@ index 00000000..2b3e6c3c
 +    if (block.x >= bw || block.y >= bh)
 +        return;
 +    const int index = block.y * bw + block.x;
++    if (c.pass_index == 2) {
++        const ivec2 v = vectors[index];
++        int nearest = 1 << 30;
++        for (int k = 0; k < 4; k++) {
++            const ivec2 around = k == 0 ? ivec2(-1, 0) : k == 1 ? ivec2(1, 0) : k == 2 ? ivec2(0, -1) : ivec2(0, 1);
++            const ivec2 q = clamp(block + around, ivec2(0), ivec2(bw - 1, bh - 1));
++            const ivec2 w = vectors[q.y * bw + q.x];
++            nearest = min(nearest, abs(v.x - w.x) + abs(v.y - w.y));
++        }
++        if (nearest > 4)
++            atomicAdd(judge.incoherent, 1u);
++        return;
++    }
 +    const int limit = c.pass_index == 0 ? 24 : 48;
 +
 +    ivec2 d = ivec2(0);
@@ -15138,113 +15451,133 @@ index 00000000..2b3e6c3c
 +        d = next;
 +        best = next_best;
 +    }
-+    if (c.pass_index == 0)
++    if (c.pass_index == 0) {
 +        coarse[index] = d;
-+    else
++    } else {
 +        vectors[index] = d;
++        if (best - 0.02 * float(abs(d.x) + abs(d.y)) > 0.07 * float(BS * BS))
++            atomicAdd(judge.no_match, 1u);
++    }
 +}
 diff --git a/vita3k/shaders-builtin/vulkan/fg_motion.comp.spv b/vita3k/shaders-builtin/vulkan/fg_motion.comp.spv
 new file mode 100644
-index 0000000000000000000000000000000000000000..31e84426d1cdb810c9f8dcff16a44066264e4078
+index 0000000000000000000000000000000000000000..8cb380bea3bcb1496f8f7e404cd7e679b3795baf
 GIT binary patch
-literal 14020
-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
+literal 16412
+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
+T`{Yyqb-~U-op+$Jci{g49xqYD
 
 literal 0
 HcmV?d00001
