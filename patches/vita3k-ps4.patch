@@ -673,6 +673,66 @@ index 6e673d1c..f84a9a8a 100644
  }
  
  static void reset_swapchain_cycle(DisplayState &display, Address sync_object) {
+diff --git a/vita3k/io/include/io/vfs.h b/vita3k/io/include/io/vfs.h
+index 1222b690..6697043c 100644
+--- a/vita3k/io/include/io/vfs.h
++++ b/vita3k/io/include/io/vfs.h
+@@ -28,5 +28,8 @@ using FileBuffer = std::vector<SceUInt8>;
+ 
+ bool read_file(VitaIoDevice device, FileBuffer &buf, const fs::path &vita_fs_path, const fs::path &vfs_file_path);
+ bool read_app_file(FileBuffer &buf, const fs::path &vita_fs_path, const std::string &app_path, const fs::path &vfs_file_path);
++// The host path below base whose names match relative's without case (the Vita's file system
++// doesn't tell case apart), or empty
++fs::path find_case_insensitive(const fs::path &base, const fs::path &relative);
+ SceSize get_directory_used_size(const VitaIoDevice device, const std::string &vfs_path, const fs::path &vita_fs_path);
+ } // namespace vfs
+diff --git a/vita3k/io/src/io.cpp b/vita3k/io/src/io.cpp
+index 006cf39f..9df4d0a7 100644
+--- a/vita3k/io/src/io.cpp
++++ b/vita3k/io/src/io.cpp
+@@ -64,9 +64,41 @@ constexpr bool log_file_stat = false;
+ 
+ namespace vfs {
+ 
++// The path as it is on the host, its names matched without case below base, as the Vita's file
++// system does (a game asks for app0:GOW1.self, which was copied as gow1.self). Empty if none matches.
++fs::path find_case_insensitive(const fs::path &base, const fs::path &relative) {
++    fs::path found = base;
++    for (const auto &part : relative) {
++        if (part.empty() || part == "/" || part == ".")
++            continue;
++        boost::system::error_code ec;
++        if (fs::exists(found / part, ec)) {
++            found /= part;
++            continue;
++        }
++        const std::string wanted = string_utils::tolower(fs_utils::path_to_utf8(part));
++        bool matched = false;
++        for (fs::directory_iterator it(found, ec), end; !ec && it != end; it.increment(ec)) {
++            if (string_utils::tolower(fs_utils::path_to_utf8(it->path().filename())) == wanted) {
++                found = it->path();
++                matched = true;
++                break;
++            }
++        }
++        if (!matched)
++            return {};
++    }
++    return found;
++}
++
+ bool read_file(const VitaIoDevice device, FileBuffer &buf, const fs::path &vita_fs_path, const fs::path &vfs_file_path) {
+     const auto host_file_path = device::construct_emulated_path(device, vfs_file_path, vita_fs_path).generic_path();
+-    return fs_utils::read_data(host_file_path, buf);
++    if (fs_utils::read_data(host_file_path, buf))
++        return true;
++    // on a host whose file system tells case apart
++    const auto device_root = device::construct_emulated_path(device, "", vita_fs_path);
++    const fs::path matched = find_case_insensitive(device_root, vfs_file_path);
++    return !matched.empty() && matched != host_file_path && fs_utils::read_data(matched, buf);
+ }
+ 
+ bool read_app_file(FileBuffer &buf, const fs::path &vita_fs_path, const std::string &app_path, const fs::path &vfs_file_path) {
 diff --git a/vita3k/kernel/include/kernel/sync_primitives.h b/vita3k/kernel/include/kernel/sync_primitives.h
 index 80c44ba4..7812715a 100644
 --- a/vita3k/kernel/include/kernel/sync_primitives.h
@@ -1394,6 +1454,33 @@ index 040421ec..989f2107 100644
  	add_executable(
  		module-tests
  		tests/arg_layout_tests.cpp
+diff --git a/vita3k/modules/SceAppMgr/SceAppMgr.cpp b/vita3k/modules/SceAppMgr/SceAppMgr.cpp
+index 515edbf3..7c862e08 100644
+--- a/vita3k/modules/SceAppMgr/SceAppMgr.cpp
++++ b/vita3k/modules/SceAppMgr/SceAppMgr.cpp
+@@ -18,6 +18,8 @@
+ #include "SceAppMgr.h"
+ 
+ #include <io/state.h>
++#include <io/vfs.h>
++#include <util/fs.h>
+ #include <kernel/state.h>
+ #include <packages/sfo.h>
+ #include <renderer/state.h>
+@@ -434,6 +436,13 @@ EXPORT(SceInt32, _sceAppMgrLoadExec, const char *appPath, Ptr<char> const argv[]
+     // Load exec executable
+     vfs::FileBuffer exec_buffer;
+     if (vfs::read_app_file(exec_buffer, emuenv.vita_fs_path, emuenv.io.app_path, exec_path)) {
++        // the name as the file has it, which the relaunch loads (a game asks for GOW1.self, copied as gow1.self)
++        const fs::path app_dir = emuenv.vita_fs_path / "ux0" / "app" / emuenv.io.app_path;
++        if (!fs::exists(app_dir / exec_path)) {
++            const fs::path found = vfs::find_case_insensitive(app_dir, exec_path);
++            if (!found.empty())
++                exec_path = fs_utils::path_to_utf8(found.lexically_relative(app_dir));
++        }
+         std::vector<std::string> exec_argv;
+         if (argv && argv->get(emuenv.mem)) {
+             size_t args = 0;
 diff --git a/vita3k/modules/SceDisplay/SceDisplay.cpp b/vita3k/modules/SceDisplay/SceDisplay.cpp
 index 5ce4c807..59ac584a 100644
 --- a/vita3k/modules/SceDisplay/SceDisplay.cpp
