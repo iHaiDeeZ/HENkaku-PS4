@@ -8921,6 +8921,128 @@ index 65b81052..c999b5c1 100644
      bool disable_surface_sync;
      bool stretch_the_display_area;
      bool fullscreen_hd_res_pixel_perfect;
+diff --git a/vita3k/renderer/include/renderer/vulkan/ps4_vertex_layout.h b/vita3k/renderer/include/renderer/vulkan/ps4_vertex_layout.h
+new file mode 100644
+index 00000000..fbd77ce2
+--- /dev/null
++++ b/vita3k/renderer/include/renderer/vulkan/ps4_vertex_layout.h
+@@ -0,0 +1,116 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#pragma once
++
++// PS4: the PS4's GPU (GCN 2) fetches a vertex attribute wrong when its address isn't aligned to its
++// components, which Vulkan doesn't allow but the Vita does: God of War II keeps 19 byte vertices with
++// half floats at offsets 3 and 11, which came out as spikes and blocks for letters. A stream with a
++// stride or an attribute offset that isn't a multiple of 4 is repacked when it is uploaded: each
++// attribute in a slot of its own, 4 byte aligned, in the order of the program's attributes. The
++// pipeline's vertex input takes the same layout.
++
++#include <gxm/functions.h>
++#include <renderer/gxm_types.h>
++#include <renderer/types.h>
++
++#include <algorithm>
++#include <cstdint>
++#include <cstring>
++#include <vector>
++
++namespace renderer::vulkan::ps4 {
++
++inline uint32_t attribute_bytes(const SceGxmVertexAttribute &attribute) {
++    return gxm::attribute_format_size(static_cast<SceGxmAttributeFormat>(attribute.format)) * attribute.componentCount;
++}
++
++inline uint32_t slot_bytes(const SceGxmVertexAttribute &attribute) {
++    return (attribute_bytes(attribute) + 3) & ~3u;
++}
++
++// Whether a stream is repacked: its stride or one of its attributes isn't 4 byte aligned (a
++// stream with an attribute the shader reads as raw registers is left as it is)
++inline bool stream_repacked(const SceGxmVertexProgram &program, uint32_t stream_index) {
++    if (stream_index >= program.streams.size())
++        return false;
++    bool misaligned = program.streams[stream_index].stride % 4 != 0;
++    const auto &infos = program.renderer_data->attribute_infos;
++    for (const SceGxmVertexAttribute &attribute : program.attributes) {
++        if (attribute.streamIndex != stream_index)
++            continue;
++        const auto info = infos.find(attribute.regIndex);
++        if (info != infos.end() && info->second.regformat)
++            return false;
++        if (attribute.offset % 4 != 0)
++            misaligned = true;
++    }
++    return misaligned;
++}
++
++// Where the attribute at attribute_index goes in its repacked vertex
++inline uint32_t repacked_offset(const SceGxmVertexProgram &program, size_t attribute_index) {
++    const uint32_t stream_index = program.attributes[attribute_index].streamIndex;
++    uint32_t offset = 0;
++    for (size_t i = 0; i < attribute_index; i++)
++        if (program.attributes[i].streamIndex == stream_index)
++            offset += slot_bytes(program.attributes[i]);
++    return offset;
++}
++
++// The size of a repacked vertex
++inline uint32_t repacked_vertex_size(const SceGxmVertexProgram &program, uint32_t stream_index) {
++    uint32_t size = 0;
++    for (const SceGxmVertexAttribute &attribute : program.attributes)
++        if (attribute.streamIndex == stream_index)
++            size += slot_bytes(attribute);
++    return size;
++}
++
++// The repacked stride (0 stays 0: every vertex reads the same attributes)
++inline uint32_t repacked_stride(const SceGxmVertexProgram &program, uint32_t stream_index) {
++    return program.streams[stream_index].stride == 0 ? 0 : repacked_vertex_size(program, stream_index);
++}
++
++// Repacks the size bytes of a stream at data into out
++inline void repack_stream(const SceGxmVertexProgram &program, uint32_t stream_index, const uint8_t *data, size_t size, std::vector<uint8_t> &out) {
++    const uint32_t stride = program.streams[stream_index].stride;
++    const uint32_t vertex_size = repacked_vertex_size(program, stream_index);
++    const size_t count = stride ? (size + stride - 1) / stride : 1;
++
++    struct Move {
++        uint32_t from, to, bytes;
++    };
++    std::vector<Move> moves;
++    for (size_t i = 0; i < program.attributes.size(); i++)
++        if (program.attributes[i].streamIndex == stream_index)
++            moves.push_back({ program.attributes[i].offset, repacked_offset(program, i), attribute_bytes(program.attributes[i]) });
++
++    // (room past the end: a 3 component attribute read as 4 components)
++    out.assign(count * vertex_size + 16, 0);
++    for (size_t vertex = 0; vertex < count; vertex++) {
++        const size_t source = vertex * stride;
++        uint8_t *const destination = out.data() + vertex * vertex_size;
++        for (const Move &move : moves) {
++            if (source + move.from >= size)
++                continue;
++            std::memcpy(destination + move.to, data + source + move.from, std::min<size_t>(move.bytes, size - source - move.from));
++        }
++    }
++}
++
++} // namespace renderer::vulkan::ps4
 diff --git a/vita3k/renderer/include/renderer/vulkan/state.h b/vita3k/renderer/include/renderer/vulkan/state.h
 index 1a5bc612..b18966ea 100644
 --- a/vita3k/renderer/include/renderer/vulkan/state.h
@@ -9059,10 +9181,20 @@ index 689060fb..11e3e88a 100644
                  LOG_ERROR("Could not wait for fences.");
                  assert(false);
 diff --git a/vita3k/renderer/src/vulkan/pipeline_cache.cpp b/vita3k/renderer/src/vulkan/pipeline_cache.cpp
-index ff6d0c5b..854eb9a6 100644
+index ff6d0c5b..73baa13b 100644
 --- a/vita3k/renderer/src/vulkan/pipeline_cache.cpp
 +++ b/vita3k/renderer/src/vulkan/pipeline_cache.cpp
-@@ -36,6 +36,14 @@
+@@ -16,6 +16,9 @@
+ // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+ 
+ #include <renderer/vulkan/pipeline_cache.h>
++#ifdef __PS4__
++#include <renderer/vulkan/ps4_vertex_layout.h>
++#endif
+ 
+ #include <renderer/vulkan/gxm_to_vulkan.h>
+ #include <renderer/vulkan/state.h>
+@@ -36,6 +39,14 @@
  #define XXH_INLINE_ALL
  #include <xxhash.h>
  
@@ -9077,7 +9209,7 @@ index ff6d0c5b..854eb9a6 100644
  namespace renderer::vulkan {
  
  // Size of the record containing what is needed for the pipeline construction (what is after is dynamic state)
-@@ -227,6 +235,12 @@ void PipelineCache::init(bool support_rasterized_order_access) {
+@@ -227,6 +238,12 @@ void PipelineCache::init(bool support_rasterized_order_access) {
          }
  
          state.features.support_rgb_attributes = unsupported_rgb_vertex_attribute_formats.empty();
@@ -9090,7 +9222,7 @@ index ff6d0c5b..854eb9a6 100644
      }
  
      support_coherent_framebuffer_fetch = support_rasterized_order_access;
-@@ -815,6 +829,20 @@ vk::PipelineVertexInputStateCreateInfo PipelineCache::get_vertex_input_state(con
+@@ -815,12 +832,32 @@ vk::PipelineVertexInputStateCreateInfo PipelineCache::get_vertex_input_state(con
              }
          }
  
@@ -9108,10 +9240,32 @@ index ff6d0c5b..854eb9a6 100644
 +                    info.regformat ? "regformat, " : "", static_cast<int>(info.gxm_type), info.is_integer, info.is_signed, stream.stride, attribute.offset, vk::to_string(format), static_cast<int>(component_count));
 +        }
 +#endif
++        uint32_t attribute_offset = attribute.offset;
++#ifdef __PS4__
++        // the stream's vertices repacked 4 byte aligned (ps4_vertex_layout.h)
++        if (ps4::stream_repacked(vertex_program, attribute.streamIndex))
++            attribute_offset = ps4::repacked_offset(vertex_program, &attribute - vertex_program.attributes.data());
++#endif
          for (uint32_t i = 0; i < array_size; i++) {
              attr_descr.push_back(vk::VertexInputAttributeDescription{
                  .location = info.location + i,
-@@ -854,7 +882,13 @@ void PipelineCache::compiler_thread(MemState &mem) {
+                 .binding = attribute.streamIndex,
+                 .format = format,
+-                .offset = attribute.offset + i * array_element_size });
++                .offset = attribute_offset + i * array_element_size });
+         }
+     }
+ 
+@@ -834,6 +871,8 @@ vk::PipelineVertexInputStateCreateInfo PipelineCache::get_vertex_input_state(con
+ 
+ #ifdef __APPLE__
+         const uint32_t stride = align(stream.stride, 4);
++#elif defined(__PS4__)
++        const uint32_t stride = ps4::stream_repacked(vertex_program, stream_index) ? ps4::repacked_stride(vertex_program, stream_index) : stream.stride;
+ #else
+         const uint32_t stride = stream.stride;
+ #endif
+@@ -854,7 +893,13 @@ void PipelineCache::compiler_thread(MemState &mem) {
  
      // just a single loop, waiting for a pipeline compile request and compiling it
      CompileRequest *request;
@@ -9203,6 +9357,36 @@ index ed8c71ad..093208ad 100644
  #else
          dispatch.init();
  #endif
+diff --git a/vita3k/renderer/src/vulkan/scene.cpp b/vita3k/renderer/src/vulkan/scene.cpp
+index acd85ab5..b7a7464b 100644
+--- a/vita3k/renderer/src/vulkan/scene.cpp
++++ b/vita3k/renderer/src/vulkan/scene.cpp
+@@ -19,6 +19,9 @@
+ 
+ #include <gxm/functions.h>
+ #include <renderer/vulkan/gxm_to_vulkan.h>
++#ifdef __PS4__
++#include <renderer/vulkan/ps4_vertex_layout.h>
++#endif
+ 
+ #include <config/state.h>
+ #include <spdlog/fmt/bin_to_hex.h>
+@@ -305,6 +308,15 @@ static void bind_vertex_streams(VKContext &context, MemState &mem, uint32_t inst
+                 if (restride) {
+                     restride_stream(stream, stream_size, vertex_program.streams[i].stride);
+                 }
++#endif
++#ifdef __PS4__
++                // vertices with attributes the PS4's GPU can't fetch where they are (ps4_vertex_layout.h)
++                static thread_local std::vector<uint8_t> repacked;
++                if (ps4::stream_repacked(vertex_program, i)) {
++                    ps4::repack_stream(vertex_program, i, stream, stream_size, repacked);
++                    stream = repacked.data();
++                    stream_size = static_cast<uint32_t>(repacked.size());
++                }
+ #endif
+                 context.vertex_stream_ring_buffer.allocate(context.prerender_cmd, stream_size, stream);
+                 context.vertex_stream_offsets[i] = context.vertex_stream_ring_buffer.data_offset;
 diff --git a/vita3k/renderer/src/vulkan/screen_filters.cpp b/vita3k/renderer/src/vulkan/screen_filters.cpp
 index 192dba99..4ae1b08b 100644
 --- a/vita3k/renderer/src/vulkan/screen_filters.cpp
