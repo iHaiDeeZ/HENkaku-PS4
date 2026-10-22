@@ -2083,10 +2083,10 @@ index 78029915..baf00c6a 100644
      const auto guard = lock();
      if (!guard)
 diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
-index c01e4699..c71a71be 100644
+index c01e4699..b20bd9ba 100644
 --- a/vita3k/kernel/src/thread.cpp
 +++ b/vita3k/kernel/src/thread.cpp
-@@ -32,6 +32,95 @@
+@@ -32,6 +32,108 @@
  #include <sstream>
  #include <utility>
  
@@ -2115,14 +2115,22 @@ index c01e4699..c71a71be 100644
 +namespace {
 +
 +// The owner changes under the mutex; it marks its own calls without it (most calls: the thread
-+// that runs keeps its core), which the others read when they wait for the core
++// that runs keeps its core), which the others read when they wait for the core. A thread gives its
++// core up as soon as it blocks in a kernel wait (ThreadState::wait), as a Vita core switches then:
++// a game whose threads hand work to each other hundreds of times a frame (job systems: Ninja
++// Gaiden Sigma Plus's MTC threads) otherwise waited 0.3 ms for the core at every hand-over.
 +struct VitaCore {
 +    std::mutex mutex;
++    std::condition_variable freed;
 +    std::atomic<const void *> owner{ nullptr };
 +    std::atomic<bool> in_call{ false };
 +    std::atomic<uint64_t> since{ 0 }; // when the owner took the core or entered its call (TSC)
 +};
 +VitaCore g_vita_cores[3];
++
++// The core this host thread's guest thread holds (or waits for), for ThreadState::wait
++thread_local int t_vita_core = -1;
++thread_local const void *t_vita_thread = nullptr;
 +
 +// The Vita core a thread is pinned to (one of the three game cores), or -1
 +int vita_core_of(SceInt32 affinity_mask) {
@@ -2143,17 +2151,18 @@ index c01e4699..c71a71be 100644
 +
 +void vita_core_take(int core, const void *self) {
 +    VitaCore &c = g_vita_cores[core];
++    t_vita_core = core;
++    t_vita_thread = self;
 +    if (c.owner.load(std::memory_order_acquire) == self) {
 +        c.in_call.store(false, std::memory_order_relaxed);
 +        c.since.store(__builtin_ia32_rdtsc(), std::memory_order_release);
 +        return;
 +    }
 +    std::unique_lock<std::mutex> lock(c.mutex);
-+    while (c.owner && c.owner != self && __builtin_ia32_rdtsc() - c.since < (c.in_call ? 300 : 10000) * ticks_per_us()) {
-+        lock.unlock();
-+        std::this_thread::sleep_for(std::chrono::microseconds(50));
-+        lock.lock();
-+    }
++    // free, or its owner blocked on the host for 0.3 ms, or ran a 10 ms slice: woken when it's freed,
++    // and every 100 us to look at the owner's times
++    while (c.owner && c.owner != self && __builtin_ia32_rdtsc() - c.since < (c.in_call ? 300 : 10000) * ticks_per_us())
++        c.freed.wait_for(lock, std::chrono::microseconds(100));
 +    c.owner = self;
 +    c.in_call = false;
 +    c.since = __builtin_ia32_rdtsc();
@@ -2171,9 +2180,13 @@ index c01e4699..c71a71be 100644
 +    if (core < 0)
 +        return;
 +    VitaCore &c = g_vita_cores[core];
-+    const std::lock_guard<std::mutex> lock(c.mutex);
-+    if (c.owner == self)
++    {
++        const std::lock_guard<std::mutex> lock(c.mutex);
++        if (c.owner != self)
++            return;
 +        c.owner = nullptr;
++    }
++    c.freed.notify_one();
 +}
 +
 +} // namespace
@@ -2182,7 +2195,7 @@ index c01e4699..c71a71be 100644
  // Set in the wait type of a wait that runs callbacks
  constexpr SceUInt32 WAITTYPE_CB_BIT = 0x80000000U;
  // What a thread waiting for a thread signal reports as its wait UID on a Vita, which isn't a UID
-@@ -190,6 +279,10 @@ void ThreadState::request_removal() {
+@@ -190,6 +292,10 @@ void ThreadState::request_removal() {
  }
  
  void ThreadState::run_loop(bool top_level) {
@@ -2193,7 +2206,7 @@ index c01e4699..c71a71be 100644
      bool guest_returned = false;
  
      // Set thread-local CPU state so signal handlers can access it. The guard puts back what was
-@@ -248,6 +341,12 @@ void ThreadState::run_loop(bool top_level) {
+@@ -248,6 +354,12 @@ void ThreadState::run_loop(bool top_level) {
      while (true) {
          // This level is done once its guest function returned or the thread is ending
          if (exiting() || guest_returned) {
@@ -2206,7 +2219,7 @@ index c01e4699..c71a71be 100644
              // A nested level returns to the one below it
              if (!top_level)
                  break;
-@@ -272,6 +371,10 @@ void ThreadState::run_loop(bool top_level) {
+@@ -272,6 +384,10 @@ void ThreadState::run_loop(bool top_level) {
  
          // Park until we have something to do.
          if (status != ThreadStatus::running) {
@@ -2217,7 +2230,7 @@ index c01e4699..c71a71be 100644
              status_cond.wait(lock, [&] { return status == ThreadStatus::running || exiting(); });
              continue;
          }
-@@ -297,17 +400,59 @@ void ThreadState::run_loop(bool top_level) {
+@@ -297,17 +413,59 @@ void ThreadState::run_loop(bool top_level) {
              if (exiting())
                  break;
              const bool do_step = std::exchange(step_requested, false);
@@ -2277,7 +2290,7 @@ index c01e4699..c71a71be 100644
                  clear_exclusive(*cpu);
              }
  
-@@ -501,6 +646,11 @@ bool ThreadState::is_deleted() {
+@@ -501,6 +659,11 @@ bool ThreadState::is_deleted() {
      return status == ThreadStatus::deleted;
  }
  
@@ -2289,6 +2302,18 @@ index c01e4699..c71a71be 100644
  ThreadStatus ThreadState::get_status() const {
      const std::lock_guard<std::mutex> lock(mutex);
      return status;
+@@ -559,6 +722,11 @@ WaitResult ThreadState::wait(WaitTarget target, Deadline deadline, bool callback
+     const auto woken = [&] { return exiting() || wake_pending || (runs_callbacks && callbacks_notified()); };
+     wait_target = { callbacks ? target.type | WAITTYPE_CB_BIT : target.type, target.id };
+     update_status(ThreadStatus::waiting);
++#ifdef __PS4__
++    // blocking: the Vita core goes to the next thread of it at once (taken back after the call)
++    if (t_vita_thread == this && t_vita_core >= 0 && !woken())
++        vita_core_release(t_vita_core, this);
++#endif
+     bool satisfied = true;
+     if (deadline == Deadline::max())
+         wait_cv.wait(lock, woken);
 diff --git a/vita3k/mem/CMakeLists.txt b/vita3k/mem/CMakeLists.txt
 index 2e2bd287..659ab47a 100644
 --- a/vita3k/mem/CMakeLists.txt
@@ -10778,10 +10803,10 @@ index 00000000..4291971e
 +} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_settings.cpp b/vita3k/ps4/ps4_settings.cpp
 new file mode 100644
-index 00000000..a9d7b8f0
+index 00000000..99e0a46b
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.cpp
-@@ -0,0 +1,684 @@
+@@ -0,0 +1,702 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -11076,6 +11101,8 @@ index 00000000..a9d7b8f0
 +        });
 +}
 +
++Item frame_generation_choice();
++
 +std::vector<Item> display_items(EmuEnvState &emuenv, const std::shared_ptr<Scope> &scope, bool global) {
 +    std::vector<Item> items;
 +    if (global) {
@@ -11085,8 +11112,10 @@ index 00000000..a9d7b8f0
 +    }
 +    items.push_back(section("Picture"));
 +    items.push_back(choice<std::string>(scope, "Screen filter", FILTER_NAMES, FILTERS, &Config::CurrentConfig::screen_filter));
-+    if (global)
++    if (global) {
 +        items.push_back(fsr_sharpness(emuenv));
++        items.push_back(frame_generation_choice());
++    }
 +    items.push_back(choice<int>(scope, "Texture filtering", { "Standard", "2x anisotropic", "4x anisotropic", "8x anisotropic", "16x anisotropic" }, { 1, 2, 4, 8, 16 }, &Config::CurrentConfig::anisotropic_filtering));
 +    return items;
 +}
@@ -11145,6 +11174,12 @@ index 00000000..a9d7b8f0
 +        emuenv.camera.back()->update_config(CameraType::SolidColor, {}, {}, color);
 +    };
 +    return item;
++}
++
++Item frame_generation_choice() {
++    return pref_choice("Frame generation", { "Off", "On (30-40 fps games to 60)" },
++        [](const Prefs &p) { return p.frame_generation ? 1 : 0; },
++        [](Prefs &p, int value) { p.frame_generation = value == 1; }, "in-between frames, a frame more of delay");
 +}
 +
 +Item frame_queue_choice() {
@@ -11261,6 +11296,8 @@ index 00000000..a9d7b8f0
 +            g_prefs.cluster_threads = value == "cluster";
 +        else if (key == "frame-queue")
 +            g_prefs.frame_overlap = value != "vita3k";
++        else if (key == "frame-generation")
++            g_prefs.frame_generation = value == "on";
 +        else if (key == "vita-cores")
 +            g_prefs.vita_cores = value != "parallel";
 +        else if (key == "profiler")
@@ -11293,6 +11330,7 @@ index 00000000..a9d7b8f0
 +    std::fprintf(f, "game-threads = %s\n", g_prefs.cluster_threads ? "cluster" : "all");
 +    std::fprintf(f, "frame-queue = %s\n", g_prefs.frame_overlap ? "vita" : "vita3k");
 +    std::fprintf(f, "vita-cores = %s\n", g_prefs.vita_cores ? "vita" : "parallel");
++    std::fprintf(f, "frame-generation = %s\n", g_prefs.frame_generation ? "on" : "off");
 +    std::fprintf(f, "profiler = %s\n", g_prefs.profiler ? "on" : "off");
 +    std::fprintf(f, "renderer-profiler = %s\n", g_prefs.host_profiler ? "on" : "off");
 +    std::fprintf(f, "freeze-log = %s\n", g_prefs.freeze_log ? "on" : "off");
@@ -11310,6 +11348,10 @@ index 00000000..a9d7b8f0
 +} // namespace ps4settings
 +
 +// SceGxm (sceGxmDisplayQueueAddEntry) asks
++extern "C" bool ps4_frame_generation() {
++    return ps4settings::prefs().frame_generation;
++}
++
 +extern "C" bool ps4_profiler() {
 +    return ps4settings::prefs().profiler;
 +}
@@ -11430,6 +11472,7 @@ index 00000000..a9d7b8f0
 +    display.push_back(section("Picture"));
 +    display.push_back(choice<std::string>(live, "Screen filter", FILTER_NAMES, FILTERS, &Config::CurrentConfig::screen_filter));
 +    display.push_back(fsr_sharpness(emuenv));
++    display.push_back(frame_generation_choice());
 +    display.push_back(choice<int>(live, "Texture filtering", { "Standard", "2x anisotropic", "4x anisotropic", "8x anisotropic", "16x anisotropic" }, { 1, 2, 4, 8, 16 }, &Config::CurrentConfig::anisotropic_filtering));
 +
 +    std::vector<Item> sound;
@@ -11468,10 +11511,10 @@ index 00000000..a9d7b8f0
 +} // namespace ps4settings
 diff --git a/vita3k/ps4/ps4_settings.h b/vita3k/ps4/ps4_settings.h
 new file mode 100644
-index 00000000..07a0d06f
+index 00000000..1244a32a
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.h
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,95 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -11520,6 +11563,9 @@ index 00000000..07a0d06f
 +    // a game that keeps one frame in its display queue (Mortal Kombat) may build the next one while
 +    // that frame waits for its vblank, as on the Vita, where Vita3K waits until it is shown
 +    bool frame_overlap = true;
++    // frame generation: in-between frames for games at 30 to 40 fps, which the screen then shows at
++    // 60 (renderer/vulkan/frame_generation.h); a vblank more of delay
++    bool frame_generation = false;
 +    // the threads a game pins to one Vita core run one at a time, switching when one blocks, as on
 +    // the Vita (some games deadlock when they run side by side), or all side by side
 +    bool vita_cores = true;
@@ -11597,10 +11643,10 @@ index 00000000..c06ce988
 +}
 diff --git a/vita3k/ps4/ps4_wsi.cpp b/vita3k/ps4/ps4_wsi.cpp
 new file mode 100644
-index 00000000..54fd7c7e
+index 00000000..d3b09a34
 --- /dev/null
 +++ b/vita3k/ps4/ps4_wsi.cpp
-@@ -0,0 +1,619 @@
+@@ -0,0 +1,623 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -12097,6 +12143,8 @@ index 00000000..54fd7c7e
 +    return VK_SUCCESS;
 +}
 +
++extern "C" bool ps4_frame_generation(); // ps4_settings.cpp
++
 +VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *info) {
 +    VkResult result = VK_SUCCESS;
 +    for (uint32_t i = 0; i < info->swapchainCount; i++) {
@@ -12106,12 +12154,14 @@ index 00000000..54fd7c7e
 +        const uint32_t buffer = static_cast<uint32_t>(sc->first_buffer) + info->pImageIndices[i];
 +        const int64_t arg = static_cast<int64_t>(flips_submitted + 1);
 +        // the flip goes to the GPU behind the frame's commands: no CPU wait for the GPU or vblank
-+        int r = ac_ps4_submit_flip(video, buffer, sc->flip_mode, arg);
++        // frame generation presents two frames at once: vsynced flips show each a whole vblank
++        const uint32_t flip_mode = ps4_frame_generation() ? ORBIS_VIDEO_OUT_FLIP_VSYNC : sc->flip_mode;
++        int r = ac_ps4_submit_flip(video, buffer, flip_mode, arg);
 +        const bool gpu_flip = r == 0;
 +        if (!gpu_flip) {
 +            // fallback: wait for the GPU on the CPU, then flip
 +            device_fn<PFN_vkQueueWaitIdle>(sc->device, "vkQueueWaitIdle")(queue);
-+            r = sceVideoOutSubmitFlip(video, static_cast<int>(buffer), sc->flip_mode, arg);
++            r = sceVideoOutSubmitFlip(video, static_cast<int>(buffer), flip_mode, arg);
 +        }
 +        if (r < 0) {
 +            LOG_ERROR("PS4 WSI: flip failed: {:08X}", static_cast<uint32_t>(r));
@@ -12269,10 +12319,18 @@ index 00000000..ced3b207
 +// Flips submitted by swapchains so far
 +unsigned long long ps4wsi_flip_count();
 diff --git a/vita3k/renderer/CMakeLists.txt b/vita3k/renderer/CMakeLists.txt
-index 0e409449..c92eb3d6 100644
+index 0e409449..191a8c51 100644
 --- a/vita3k/renderer/CMakeLists.txt
 +++ b/vita3k/renderer/CMakeLists.txt
-@@ -79,3 +79,13 @@ endif()
+@@ -24,6 +24,7 @@ add_library(
+ 	src/vulkan/renderer.cpp
+ 	src/vulkan/scene.cpp
+ 	src/vulkan/overlay_renderer.cpp
++	src/vulkan/frame_generation.cpp
+ 	src/vulkan/screen_filters.cpp
+ 	src/vulkan/screen_renderer.cpp
+ 	src/vulkan/surface_cache.cpp
+@@ -79,3 +80,13 @@ endif()
  if(TRACY_ENABLE_ON_CORE_COMPONENTS)
  	target_link_libraries(renderer PRIVATE tracy)
  endif()
@@ -12412,10 +12470,31 @@ index 65b81052..c999b5c1 100644
      bool stretch_the_display_area;
      bool fullscreen_hd_res_pixel_perfect;
 diff --git a/vita3k/renderer/include/renderer/texture_cache.h b/vita3k/renderer/include/renderer/texture_cache.h
-index 3860cced..698329d3 100644
+index 3860cced..17284694 100644
 --- a/vita3k/renderer/include/renderer/texture_cache.h
 +++ b/vita3k/renderer/include/renderer/texture_cache.h
-@@ -156,7 +156,7 @@ public:
+@@ -48,6 +48,8 @@ static constexpr size_t TextureCacheSize = 1024;
+ typedef std::array<uint32_t, 4> TextureGxmDataRepr;
+ struct TextureCacheInfo {
+     uint64_t hash = 0;
++    // the command batch its hash was taken in (TextureCache::batch): one hash a batch is enough
++    uint64_t hashed_batch = 0;
+     SceGxmTexture texture;
+     int index = 0;
+     uint32_t texture_size = 0;
+@@ -104,6 +106,11 @@ protected:
+ 
+ public:
+     Backend backend;
++    // Counts the command batches the render thread processes (renderer/src/batch.cpp). A batch is
++    // what the game submitted at once (a scene): its draws all read the textures as they are when
++    // the render thread processes it, so a texture is hashed once a batch, not at every draw that
++    // binds it (God of War II: 11,800 times a second; a video frame 80 us each).
++    uint64_t batch = 1;
+     bool use_protect = false;
+     YUVConversionCache yuv_conversion_cache;
+     // use a separate sampler cache
+@@ -156,7 +163,7 @@ public:
      void cache_and_bind_texture(const SceGxmTexture &gxm_texture, MemState &mem);
  
      // is called by cache_and_bind_texture if use_sampler_cache is set to true
@@ -12424,6 +12503,98 @@ index 3860cced..698329d3 100644
  
      // look at the texture folder and update the available imported / exported hashes
      void refresh_available_textures();
+diff --git a/vita3k/renderer/include/renderer/vulkan/frame_generation.h b/vita3k/renderer/include/renderer/vulkan/frame_generation.h
+new file mode 100644
+index 00000000..501947a3
+--- /dev/null
++++ b/vita3k/renderer/include/renderer/vulkan/frame_generation.h
+@@ -0,0 +1,86 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#pragma once
++
++// Frame generation: for a game whose frames come at most every other vblank (30 to 40 fps), a frame
++// in between the last two from the motion between them, shown a vblank before the new one, so the
++// screen gets twice the frames. Three compute passes over the game's frame as Vita3K presents it
++// (before the screen filter, which then scales the in-between frame like a real one):
++//   fg_copy    the frame copied out of its surface, and its luma at 1/scale of its size
++//   fg_motion  per 8x8 luma block, a search for where it was in the previous frame: first on the
++//              luma at half size (camera pans), then on the luma from there
++//   fg_interp  each pixel from both frames halfway along the blended block vectors
++// The frames alternate between two images; the in-between frame goes to a third.
++
++#include <renderer/vulkan/state.h>
++#include <vkutil/objects.h>
++
++#include <array>
++
++namespace renderer::vulkan {
++
++class FrameGenerator {
++public:
++    explicit FrameGenerator(VKState &state);
++    ~FrameGenerator();
++
++    // Copies the frame (the view of its surface, the part the viewport says) into the history, in
++    // cmd. With make_inbetween and a previous frame of the same size, also makes the in-between
++    // frame: true then, and inbetween() and inbetween_viewport() are what to show first.
++    bool record(vk::CommandBuffer cmd, uint32_t slot, vk::ImageView src, vk::ImageLayout src_layout, const Viewport &viewport, bool make_inbetween);
++    vk::ImageView inbetween() const { return result.view; }
++    Viewport inbetween_viewport() const;
++
++private:
++    struct Constants {
++        int32_t src_x, src_y;
++        uint32_t frame_w, frame_h;
++        uint32_t scale;
++        uint32_t luma_w, luma_h;
++        uint32_t blocks_w;
++        uint32_t pass_index; // fg_motion: 0 the coarse pass, 1 the fine one
++    };
++
++    bool init();
++    void resize(vk::CommandBuffer cmd, uint32_t width, uint32_t height);
++
++    VKState &state;
++    bool ready = false;
++    bool failed = false;
++
++    vk::Sampler nearest, linear;
++    vk::ShaderModule shaders[3];
++    vk::DescriptorSetLayout set_layouts[3];
++    vk::PipelineLayout pipeline_layouts[3];
++    vk::Pipeline pipelines[3];
++    vk::DescriptorPool pool;
++    // per swapchain slot: copy, motion, in-between
++    std::vector<std::array<vk::DescriptorSet, 3>> sets;
++
++    uint32_t width = 0, height = 0, scale = 1, luma_w = 0, luma_h = 0, blocks_w = 0, blocks_h = 0;
++    vkutil::Image frames[2];
++    vkutil::Buffer luma[2];
++    vkutil::Buffer vectors;
++    vkutil::Buffer coarse;
++    vkutil::Image result;
++    // which of frames / luma the next frame goes to; whether the other one holds the last frame
++    int next = 0;
++    bool has_previous = false;
++};
++
++} // namespace renderer::vulkan
 diff --git a/vita3k/renderer/include/renderer/vulkan/ps4_vertex_layout.h b/vita3k/renderer/include/renderer/vulkan/ps4_vertex_layout.h
 new file mode 100644
 index 00000000..dad76a8f
@@ -12566,11 +12737,49 @@ index 00000000..dad76a8f
 +}
 +
 +} // namespace renderer::vulkan::ps4
+diff --git a/vita3k/renderer/include/renderer/vulkan/screen_renderer.h b/vita3k/renderer/include/renderer/vulkan/screen_renderer.h
+index 3efb94f7..96de53ee 100644
+--- a/vita3k/renderer/include/renderer/vulkan/screen_renderer.h
++++ b/vita3k/renderer/include/renderer/vulkan/screen_renderer.h
+@@ -29,6 +29,7 @@
+ namespace renderer::vulkan {
+ 
+ struct VKState;
++class FrameGenerator;
+ 
+ #ifdef __ANDROID__
+ bool has_android_surface();
+@@ -64,6 +65,8 @@ public:
+ #endif
+ 
+     std::unique_ptr<ScreenFilter> filter;
++    // frame generation (frame_generation.h), made when it is first used
++    std::unique_ptr<FrameGenerator> frame_generator;
+ 
+     std::vector<vkutil::Image> vita_surface;
+     vma::Allocation vita_surface_staging_alloc;
+@@ -82,6 +85,7 @@ public:
+     bool need_surface_recreate = false;
+ 
+     ScreenRenderer(VKState &state);
++    ~ScreenRenderer();
+ 
+     bool create();
+     // called after the logical device has been created
 diff --git a/vita3k/renderer/include/renderer/vulkan/state.h b/vita3k/renderer/include/renderer/vulkan/state.h
-index 1a5bc612..b18966ea 100644
+index 1a5bc612..7319f58b 100644
 --- a/vita3k/renderer/include/renderer/vulkan/state.h
 +++ b/vita3k/renderer/include/renderer/vulkan/state.h
-@@ -112,6 +112,8 @@ struct VKState : public renderer::State {
+@@ -62,6 +62,8 @@ struct VKState : public renderer::State {
+     vk::Device device;
+ 
+     ScreenRenderer screen_renderer;
++    // the vblank the last frame was presented on (frame generation: how far apart frames come)
++    uint64_t last_presented_vblank = 0;
+     OverlayRenderer overlay_renderer;
+ 
+     // Used for memory allocation and general query later.
+@@ -112,6 +114,8 @@ struct VKState : public renderer::State {
      vkutil::Buffer default_buffer;
  
      bool support_fsr = false;
@@ -12658,7 +12867,7 @@ index 4adf5464..2f68352b 100644
      vkutil::Image depthstencil;
      vkutil::Image mask;
 diff --git a/vita3k/renderer/src/batch.cpp b/vita3k/renderer/src/batch.cpp
-index 87e5a8e1..6f2ddf72 100644
+index 87e5a8e1..e084333a 100644
 --- a/vita3k/renderer/src/batch.cpp
 +++ b/vita3k/renderer/src/batch.cpp
 @@ -32,6 +32,7 @@
@@ -12703,7 +12912,18 @@ index 87e5a8e1..6f2ddf72 100644
  namespace renderer {
  Command *generic_command_allocate() {
      return new Command;
-@@ -117,6 +145,11 @@ static void process_batch(renderer::State &state, const FeatureState &features,
+@@ -104,6 +132,10 @@ static void process_batch(renderer::State &state, const FeatureState &features,
+     if (command_list.context)
+         state.context = command_list.context;
+ 
++    // a new batch: its textures are hashed again (once)
++    if (TextureCache *texture_cache = state.get_texture_cache())
++        texture_cache->batch++;
++
+     Command *cmd = command_list.first;
+ 
+     // Take a batch, and execute it. Hope it's not too large
+@@ -117,6 +149,11 @@ static void process_batch(renderer::State &state, const FeatureState &features,
              LOG_ERROR("Unimplemented command opcode {}", static_cast<int>(cmd->opcode));
          } else {
              CommandHelper helper(cmd);
@@ -12715,7 +12935,7 @@ index 87e5a8e1..6f2ddf72 100644
              handler->second(state, mem, config, helper, features, command_list.context);
          }
  
-@@ -135,6 +168,12 @@ void process_batches(renderer::State &state, const FeatureState &features, MemSt
+@@ -135,6 +172,12 @@ void process_batches(renderer::State &state, const FeatureState &features, MemSt
      auto max_time = duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() + max_wait_ms;
  
      while (!state.should_display) {
@@ -12728,7 +12948,7 @@ index 87e5a8e1..6f2ddf72 100644
          if (state.render_abort.load(std::memory_order_relaxed))
              return;
  
-@@ -175,6 +214,9 @@ void process_batches(renderer::State &state, const FeatureState &features, MemSt
+@@ -175,6 +218,9 @@ void process_batches(renderer::State &state, const FeatureState &features, MemSt
          }
  
          state.command_buffer_queue.pop();
@@ -12738,7 +12958,7 @@ index 87e5a8e1..6f2ddf72 100644
          process_batch(state, features, mem, config, *cmd_list);
      }
  }
-@@ -185,6 +227,9 @@ void reset_command_list(CommandList &command_list) {
+@@ -185,6 +231,9 @@ void reset_command_list(CommandList &command_list) {
  }
  
  static void render_loop(renderer::State &state, DisplayState &display, GxmState &gxm, MemState &mem, Config &config) {
@@ -12748,7 +12968,7 @@ index 87e5a8e1..6f2ddf72 100644
      if (state.precompile_requested) {
          auto progress_overlay = state.overlay_manager
              ? state.overlay_manager->create<overlay::shader_precompile_progress>()
-@@ -274,8 +319,18 @@ static void render_loop(renderer::State &state, DisplayState &display, GxmState
+@@ -274,8 +323,18 @@ static void render_loop(renderer::State &state, DisplayState &display, GxmState
              }
          }
  
@@ -13037,7 +13257,7 @@ index e983487e..6ebbcc23 100644
      } else {
          LOG_ERROR("Unknown state set command {}", static_cast<uint16_t>(gxm_state_to_set));
 diff --git a/vita3k/renderer/src/texture/cache.cpp b/vita3k/renderer/src/texture/cache.cpp
-index 955648eb..9376e2fc 100644
+index 955648eb..d681387d 100644
 --- a/vita3k/renderer/src/texture/cache.cpp
 +++ b/vita3k/renderer/src/texture/cache.cpp
 @@ -325,8 +325,8 @@ void TextureCache::upload_texture(const SceGxmTexture &gxm_texture, MemState &me
@@ -13066,7 +13286,32 @@ index 955648eb..9376e2fc 100644
          default:
              break;
          }
-@@ -802,7 +810,7 @@ void TextureCache::cache_and_bind_texture(const SceGxmTexture &gxm_texture, MemS
+@@ -705,18 +713,23 @@ void TextureCache::cache_and_bind_texture(const SceGxmTexture &gxm_texture, MemS
+             else
+                 // the xor 1 is to make sure it won't be the same as hash_texture_nostride
+                 info->hash = hash_texture_data(gxm_texture, info->texture_size, mem) ^ 1;
++            info->hashed_batch = batch;
+         }
+     } else {
+         // Texture is cached.
+         index = cached_gxm_texture_index;
+         info = gxm_it->second;
+         configure = false;
+-        if (info->use_hash) {
++        if (info->use_hash && info->hashed_batch == batch) {
++            // already hashed (and uploaded if it changed) in this batch
++            upload = false;
++        } else if (info->use_hash) {
+             const uint64_t previous_hash = info->hash;
+             if (import_textures || export_textures)
+                 info->hash = hash_texture_nostride(gxm_texture, mem);
+             else
+                 info->hash = hash_texture_data(gxm_texture, info->texture_size, mem) ^ 1;
++            info->hashed_batch = batch;
+ 
+             upload = previous_hash != info->hash;
+         } else {
+@@ -802,7 +815,7 @@ void TextureCache::cache_and_bind_texture(const SceGxmTexture &gxm_texture, MemS
          cache_and_bind_sampler(gxm_texture);
  }
  
@@ -13075,7 +13320,7 @@ index 955648eb..9376e2fc 100644
      uint32_t compact_repr = 0;
      if (gxm_texture.texture_type() != SCE_GXM_TEXTURE_LINEAR_STRIDED) {
          compact_repr = 0b01
-@@ -822,9 +830,7 @@ int TextureCache::cache_and_bind_sampler(const SceGxmTexture &gxm_texture, bool
+@@ -822,9 +835,7 @@ int TextureCache::cache_and_bind_sampler(const SceGxmTexture &gxm_texture, bool
              | (gxm_texture.mag_filter << 8);
      }
  
@@ -13086,7 +13331,7 @@ index 955648eb..9376e2fc 100644
  
      auto it = sampler_lookup.find(compact_repr);
      if (it != sampler_lookup.end()) {
-@@ -844,7 +850,7 @@ int TextureCache::cache_and_bind_sampler(const SceGxmTexture &gxm_texture, bool
+@@ -844,7 +855,7 @@ int TextureCache::cache_and_bind_sampler(const SceGxmTexture &gxm_texture, bool
      sampler_lookup[compact_repr] = info;
  
      info->value = compact_repr;
@@ -13318,6 +13563,331 @@ index d89da55d..ebae243d 100644
      if (state.features.enable_memory_mapping) {
          // use the default buffer
          std::fill_n(vertex_stream_buffers, SCE_GXM_MAX_VERTEX_STREAMS, state.default_buffer.buffer);
+diff --git a/vita3k/renderer/src/vulkan/frame_generation.cpp b/vita3k/renderer/src/vulkan/frame_generation.cpp
+new file mode 100644
+index 00000000..a648d10d
+--- /dev/null
++++ b/vita3k/renderer/src/vulkan/frame_generation.cpp
+@@ -0,0 +1,319 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#include <renderer/vulkan/frame_generation.h>
++
++#include <util/log.h>
++#include <vkutil/vkutil.h>
++
++namespace renderer::vulkan {
++
++namespace {
++
++constexpr int BLOCK = 8; // luma pixels a side of a motion block
++constexpr uint32_t GROUP = 8; // the shaders' work groups: 8x8
++
++// Waits for what the last passes wrote (and the screen pass read) before the next ones
++void compute_barrier(vk::CommandBuffer cmd) {
++    const vk::MemoryBarrier barrier{
++        .srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eShaderRead,
++        .dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
++    };
++    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eFragmentShader,
++        vk::PipelineStageFlagBits::eComputeShader, vk::DependencyFlags(), barrier, {}, {});
++}
++
++} // namespace
++
++FrameGenerator::FrameGenerator(VKState &state)
++    : state(state) {}
++
++FrameGenerator::~FrameGenerator() {
++    vk::Device device = state.device;
++    if (!device)
++        return;
++    device.waitIdle();
++    for (int i = 0; i < 3; i++) {
++        device.destroy(pipelines[i]);
++        device.destroy(pipeline_layouts[i]);
++        device.destroy(set_layouts[i]);
++        device.destroy(shaders[i]);
++    }
++    device.destroy(pool);
++    device.destroy(nearest);
++    device.destroy(linear);
++}
++
++bool FrameGenerator::init() {
++    vk::Device device = state.device;
++    nearest = device.createSampler(vk::SamplerCreateInfo{
++        .magFilter = vk::Filter::eNearest,
++        .minFilter = vk::Filter::eNearest,
++        .addressModeU = vk::SamplerAddressMode::eClampToEdge,
++        .addressModeV = vk::SamplerAddressMode::eClampToEdge,
++        .addressModeW = vk::SamplerAddressMode::eClampToEdge,
++    });
++    linear = device.createSampler(vk::SamplerCreateInfo{
++        .magFilter = vk::Filter::eLinear,
++        .minFilter = vk::Filter::eLinear,
++        .addressModeU = vk::SamplerAddressMode::eClampToEdge,
++        .addressModeV = vk::SamplerAddressMode::eClampToEdge,
++        .addressModeW = vk::SamplerAddressMode::eClampToEdge,
++    });
++
++    const fs::path dir = state.static_assets / "shaders-builtin/vulkan";
++    const char *const names[3] = { "fg_copy.comp.spv", "fg_motion.comp.spv", "fg_interp.comp.spv" };
++    for (int i = 0; i < 3; i++) {
++        shaders[i] = vkutil::load_shader(device, dir / names[i]);
++        if (!shaders[i]) {
++            LOG_ERROR("Frame generation: {} couldn't be loaded", names[i]);
++            return false;
++        }
++    }
++
++    const auto binding = [](uint32_t index, vk::DescriptorType type, const vk::Sampler *sampler = nullptr) {
++        return vk::DescriptorSetLayoutBinding{
++            .binding = index,
++            .descriptorType = type,
++            .descriptorCount = 1,
++            .stageFlags = vk::ShaderStageFlagBits::eCompute,
++            .pImmutableSamplers = sampler,
++        };
++    };
++    const std::vector<vk::DescriptorSetLayoutBinding> layouts[3] = {
++        // copy: the game's frame, the history image, its luma
++        { binding(0, vk::DescriptorType::eCombinedImageSampler, &nearest), binding(1, vk::DescriptorType::eStorageImage),
++            binding(2, vk::DescriptorType::eStorageBuffer) },
++        // motion: the two lumas, the vectors, the coarse vectors
++        { binding(0, vk::DescriptorType::eStorageBuffer), binding(1, vk::DescriptorType::eStorageBuffer), binding(2, vk::DescriptorType::eStorageBuffer),
++            binding(3, vk::DescriptorType::eStorageBuffer) },
++        // in-between: the two frames, the vectors, the result
++        { binding(0, vk::DescriptorType::eCombinedImageSampler, &linear), binding(1, vk::DescriptorType::eCombinedImageSampler, &linear),
++            binding(2, vk::DescriptorType::eStorageBuffer), binding(3, vk::DescriptorType::eStorageImage) },
++    };
++    const vk::PushConstantRange push{
++        .stageFlags = vk::ShaderStageFlagBits::eCompute,
++        .offset = 0,
++        .size = sizeof(Constants),
++    };
++    for (int i = 0; i < 3; i++) {
++        vk::DescriptorSetLayoutCreateInfo layout_info{};
++        layout_info.setBindings(layouts[i]);
++        set_layouts[i] = device.createDescriptorSetLayout(layout_info);
++        vk::PipelineLayoutCreateInfo pipeline_layout_info{};
++        pipeline_layout_info.setSetLayouts(set_layouts[i]);
++        pipeline_layout_info.setPushConstantRanges(push);
++        pipeline_layouts[i] = device.createPipelineLayout(pipeline_layout_info);
++        const vk::ComputePipelineCreateInfo pipeline_info{
++            .stage = { .stage = vk::ShaderStageFlagBits::eCompute, .module = shaders[i], .pName = "main" },
++            .layout = pipeline_layouts[i],
++        };
++        const auto created = device.createComputePipeline(nullptr, pipeline_info);
++        if (created.result != vk::Result::eSuccess) {
++            LOG_ERROR("Frame generation: compute pipeline {} failed", i);
++            return false;
++        }
++        pipelines[i] = created.value;
++    }
++
++    // a set of the three per swapchain image (a slot's sets are free again once its fence passed)
++    const uint32_t slots = std::max<uint32_t>(state.screen_renderer.swapchain_size, 1) + 1;
++    const std::array<vk::DescriptorPoolSize, 3> sizes = {
++        vk::DescriptorPoolSize{ .type = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = slots * 3 },
++        vk::DescriptorPoolSize{ .type = vk::DescriptorType::eStorageImage, .descriptorCount = slots * 2 },
++        vk::DescriptorPoolSize{ .type = vk::DescriptorType::eStorageBuffer, .descriptorCount = slots * 6 },
++    };
++    vk::DescriptorPoolCreateInfo pool_info{ .maxSets = slots * 3 };
++    pool_info.setPoolSizes(sizes);
++    pool = device.createDescriptorPool(pool_info);
++    sets.resize(slots);
++    for (auto &slot : sets) {
++        vk::DescriptorSetAllocateInfo alloc{ .descriptorPool = pool };
++        alloc.setSetLayouts(set_layouts);
++        const auto allocated = device.allocateDescriptorSets(alloc);
++        std::copy_n(allocated.begin(), 3, slot.begin());
++    }
++    LOG_INFO("Frame generation ready");
++    return true;
++}
++
++void FrameGenerator::resize(vk::CommandBuffer cmd, uint32_t new_width, uint32_t new_height) {
++    width = new_width;
++    height = new_height;
++    // the luma is about 480 wide whatever the resolution multiplier
++    scale = std::max<uint32_t>(1, (width + 479) / 480);
++    luma_w = (width + scale - 1) / scale;
++    luma_h = (height + scale - 1) / scale;
++    blocks_w = (luma_w + BLOCK - 1) / BLOCK;
++    blocks_h = (luma_h + BLOCK - 1) / BLOCK;
++
++    for (auto *image : { &frames[0], &frames[1], &result }) {
++        image->destroy();
++        *image = vkutil::Image(width, height, vk::Format::eR8G8B8A8Unorm);
++        image->init_image(vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled);
++        image->transition_to_discard(cmd, vkutil::ImageLayout::StorageImage);
++    }
++    for (auto &buffer : luma) {
++        buffer.destroy();
++        buffer = vkutil::Buffer(static_cast<vk::DeviceSize>(luma_w) * luma_h * sizeof(float));
++        buffer.init_buffer(vk::BufferUsageFlagBits::eStorageBuffer);
++    }
++    vectors.destroy();
++    vectors = vkutil::Buffer(static_cast<vk::DeviceSize>(blocks_w) * blocks_h * 2 * sizeof(int32_t));
++    vectors.init_buffer(vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst);
++    // the coarse pass's blocks: on the luma at half size
++    const uint32_t coarse_w = ((luma_w + 1) / 2 + BLOCK - 1) / BLOCK, coarse_h = ((luma_h + 1) / 2 + BLOCK - 1) / BLOCK;
++    coarse.destroy();
++    coarse = vkutil::Buffer(static_cast<vk::DeviceSize>(coarse_w) * coarse_h * 2 * sizeof(int32_t));
++    coarse.init_buffer(vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst);
++    // the motion search starts from the last vectors: none yet
++    cmd.fillBuffer(vectors.buffer, 0, VK_WHOLE_SIZE, 0);
++    cmd.fillBuffer(coarse.buffer, 0, VK_WHOLE_SIZE, 0);
++    const vk::MemoryBarrier filled{
++        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
++        .dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
++    };
++    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eComputeShader, vk::DependencyFlags(), filled, {}, {});
++    has_previous = false;
++    next = 0;
++}
++
++Viewport FrameGenerator::inbetween_viewport() const {
++    return Viewport{
++        .offset_x = 0,
++        .offset_y = 0,
++        .width = width,
++        .height = height,
++        .texture_width = width,
++        .texture_height = height,
++    };
++}
++
++bool FrameGenerator::record(vk::CommandBuffer cmd, uint32_t slot, vk::ImageView src, vk::ImageLayout src_layout, const Viewport &viewport, bool make_inbetween) {
++    if (failed || !cmd || !src || viewport.width == 0 || viewport.height == 0)
++        return false;
++    if (!ready) {
++        if (!init()) {
++            failed = true;
++            return false;
++        }
++        ready = true;
++    }
++    if (viewport.width != width || viewport.height != height)
++        resize(cmd, viewport.width, viewport.height);
++    slot %= sets.size();
++    auto &set = sets[slot];
++    vk::Device device = state.device;
++
++    const int cur = next, prev = next ^ 1;
++    Constants constants{
++        .src_x = static_cast<int32_t>(viewport.offset_x),
++        .src_y = static_cast<int32_t>(viewport.offset_y),
++        .frame_w = width,
++        .frame_h = height,
++        .scale = scale,
++        .luma_w = luma_w,
++        .luma_h = luma_h,
++        .blocks_w = blocks_w,
++        .pass_index = 0,
++    };
++    const bool inbetween = make_inbetween && has_previous;
++
++    // the descriptors of this slot (its last use finished: the swapchain image's fence)
++    const vk::DescriptorImageInfo src_info{ .imageView = src, .imageLayout = src_layout };
++    const vk::DescriptorImageInfo cur_storage{ .imageView = frames[cur].view, .imageLayout = vk::ImageLayout::eGeneral };
++    const vk::DescriptorImageInfo prev_sampled{ .imageView = frames[prev].view, .imageLayout = vk::ImageLayout::eGeneral };
++    const vk::DescriptorImageInfo cur_sampled{ .imageView = frames[cur].view, .imageLayout = vk::ImageLayout::eGeneral };
++    const vk::DescriptorImageInfo result_storage{ .imageView = result.view, .imageLayout = vk::ImageLayout::eGeneral };
++    const vk::DescriptorBufferInfo luma_cur{ .buffer = luma[cur].buffer, .offset = 0, .range = VK_WHOLE_SIZE };
++    const vk::DescriptorBufferInfo luma_prev{ .buffer = luma[prev].buffer, .offset = 0, .range = VK_WHOLE_SIZE };
++    const vk::DescriptorBufferInfo vector_info{ .buffer = vectors.buffer, .offset = 0, .range = VK_WHOLE_SIZE };
++    const vk::DescriptorBufferInfo coarse_info{ .buffer = coarse.buffer, .offset = 0, .range = VK_WHOLE_SIZE };
++    const auto write_image = [](vk::DescriptorSet dst, uint32_t binding, vk::DescriptorType type, const vk::DescriptorImageInfo &info) {
++        vk::WriteDescriptorSet write{ .dstSet = dst, .dstBinding = binding, .descriptorCount = 1, .descriptorType = type };
++        write.setImageInfo(info);
++        return write;
++    };
++    const auto write_buffer = [](vk::DescriptorSet dst, uint32_t binding, const vk::DescriptorBufferInfo &info) {
++        vk::WriteDescriptorSet write{ .dstSet = dst, .dstBinding = binding, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer };
++        write.setBufferInfo(info);
++        return write;
++    };
++    std::vector<vk::WriteDescriptorSet> writes = {
++        write_image(set[0], 0, vk::DescriptorType::eCombinedImageSampler, src_info),
++        write_image(set[0], 1, vk::DescriptorType::eStorageImage, cur_storage),
++        write_buffer(set[0], 2, luma_cur),
++    };
++    if (inbetween) {
++        writes.push_back(write_buffer(set[1], 0, luma_prev));
++        writes.push_back(write_buffer(set[1], 1, luma_cur));
++        writes.push_back(write_buffer(set[1], 2, vector_info));
++        writes.push_back(write_buffer(set[1], 3, coarse_info));
++        writes.push_back(write_image(set[2], 0, vk::DescriptorType::eCombinedImageSampler, prev_sampled));
++        writes.push_back(write_image(set[2], 1, vk::DescriptorType::eCombinedImageSampler, cur_sampled));
++        writes.push_back(write_buffer(set[2], 2, vector_info));
++        writes.push_back(write_image(set[2], 3, vk::DescriptorType::eStorageImage, result_storage));
++    }
++    device.updateDescriptorSets(writes, {});
++
++    // the game's frame (drawn to before; the last frame's passes and screen pass read ours)
++    const vk::MemoryBarrier before{
++        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite | vk::AccessFlagBits::eShaderRead,
++        .dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
++    };
++    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput | vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eFragmentShader | vk::PipelineStageFlagBits::eTransfer,
++        vk::PipelineStageFlagBits::eComputeShader, vk::DependencyFlags(), before, {}, {});
++
++    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipelines[0]);
++    cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layouts[0], 0, set[0], {});
++    cmd.pushConstants(pipeline_layouts[0], vk::ShaderStageFlagBits::eCompute, 0, sizeof(Constants), &constants);
++    cmd.dispatch((luma_w + GROUP - 1) / GROUP, (luma_h + GROUP - 1) / GROUP, 1);
++
++    if (inbetween) {
++        // the motion: the coarse pass, then the fine one from it
++        compute_barrier(cmd);
++        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipelines[1]);
++        cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layouts[1], 0, set[1], {});
++        const uint32_t coarse_w = ((luma_w + 1) / 2 + BLOCK - 1) / BLOCK, coarse_h = ((luma_h + 1) / 2 + BLOCK - 1) / BLOCK;
++        cmd.pushConstants(pipeline_layouts[1], vk::ShaderStageFlagBits::eCompute, 0, sizeof(Constants), &constants);
++        cmd.dispatch((coarse_w + GROUP - 1) / GROUP, (coarse_h + GROUP - 1) / GROUP, 1);
++        compute_barrier(cmd);
++        constants.pass_index = 1;
++        cmd.pushConstants(pipeline_layouts[1], vk::ShaderStageFlagBits::eCompute, 0, sizeof(Constants), &constants);
++        cmd.dispatch((blocks_w + GROUP - 1) / GROUP, (blocks_h + GROUP - 1) / GROUP, 1);
++
++        compute_barrier(cmd);
++        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipelines[2]);
++        cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layouts[2], 0, set[2], {});
++        cmd.pushConstants(pipeline_layouts[2], vk::ShaderStageFlagBits::eCompute, 0, sizeof(Constants), &constants);
++        cmd.dispatch((width + GROUP - 1) / GROUP, (height + GROUP - 1) / GROUP, 1);
++    }
++
++    // the screen pass (and its filter's compute passes) read the in-between frame
++    const vk::MemoryBarrier after{
++        .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
++        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
++    };
++    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eFragmentShader,
++        vk::DependencyFlags(), after, {}, {});
++
++    next ^= 1;
++    has_previous = true;
++    return inbetween;
++}
++
++} // namespace renderer::vulkan
 diff --git a/vita3k/renderer/src/vulkan/gxm_to_vulkan.cpp b/vita3k/renderer/src/vulkan/gxm_to_vulkan.cpp
 index a7fd4fb8..f5d369e3 100644
 --- a/vita3k/renderer/src/vulkan/gxm_to_vulkan.cpp
@@ -13435,10 +14005,18 @@ index ff6d0c5b..ab744977 100644
  
          if (request == nullptr)
 diff --git a/vita3k/renderer/src/vulkan/renderer.cpp b/vita3k/renderer/src/vulkan/renderer.cpp
-index ed8c71ad..093208ad 100644
+index ed8c71ad..221be476 100644
 --- a/vita3k/renderer/src/vulkan/renderer.cpp
 +++ b/vita3k/renderer/src/vulkan/renderer.cpp
-@@ -45,6 +45,12 @@
+@@ -22,6 +22,7 @@
+ 
+ #include <renderer/functions.h>
+ #include <renderer/types.h>
++#include <renderer/vulkan/frame_generation.h>
+ #include <renderer/vulkan/functions.h>
+ #include <renderer/vulkan/state.h>
+ 
+@@ -45,6 +46,12 @@
  #include <MoltenVK/mvk_vulkan.h>
  #endif
  
@@ -13451,7 +14029,18 @@ index ed8c71ad..093208ad 100644
  #ifdef __ANDROID__
  #include <SDL3/SDL_system.h>
  #include <dlfcn.h>
-@@ -379,6 +385,8 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
+@@ -150,6 +157,10 @@ const static std::vector<const char *> required_device_extensions = {
+     vk::KHRMaintenance1ExtensionName
+ };
+ 
++#ifdef __PS4__
++extern "C" bool ps4_frame_generation(); // vita3k/ps4/ps4_settings.cpp
++#endif
++
+ namespace renderer::vulkan {
+ 
+ #if defined(__ANDROID__) && defined(USE_ADRENO_TOOLS)
+@@ -379,6 +390,8 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
  
          if (!detect_patch_bcn(&texture_cache.support_dxt))
              return false;
@@ -13460,7 +14049,7 @@ index ed8c71ad..093208ad 100644
  #else
          VULKAN_HPP_DEFAULT_DISPATCHER.init();
  #endif
-@@ -406,6 +414,10 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
+@@ -406,6 +419,10 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
              instance_extensions.push_back(vk::KHRWin32SurfaceExtensionName);
  #elif defined(__APPLE__)
              instance_extensions.push_back(vk::EXTMetalSurfaceExtensionName);
@@ -13471,7 +14060,7 @@ index ed8c71ad..093208ad 100644
  #elif !defined(__ANDROID__)
              if (!select_linux_surface_extension(*this, frame_host->handle(), instance_extensions))
                  return false;
-@@ -713,6 +725,16 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
+@@ -713,6 +730,16 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
          // we need to make a copy of the vertex buffer for moltenvk, so disable memory mapping
          support_memory_mapping = false;
  #endif
@@ -13488,7 +14077,7 @@ index ed8c71ad..093208ad 100644
  
  #ifdef __ANDROID__
          support_android_buffer_import &= SDL_GetAndroidSDKVersion() >= 26;
-@@ -945,6 +967,14 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
+@@ -945,6 +972,14 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
          LOG_WARN("Failed to initialize Vulkan overlay renderer, overlays will be disabled");
      }
  
@@ -13503,7 +14092,43 @@ index ed8c71ad..093208ad 100644
      support_fsr &= static_cast<bool>(screen_renderer.surface_capabilities.supportedUsageFlags & vk::ImageUsageFlagBits::eStorage);
      // The FSR storage shaders write rgba8; BGRA8 swapchain views are not format-compatible.
      support_fsr &= screen_renderer.surface_format.format == vk::Format::eR8G8B8A8Unorm;
-@@ -1724,6 +1754,8 @@ renderer::VulkanDeviceInfo renderer::enumerate_vulkan_devices(const std::string
+@@ -1234,6 +1269,35 @@ void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState
+             layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+         }
+ 
++#ifdef __PS4__
++        // frame generation: a frame that came two vblanks or more after the last one (a game at 30
++        // to 40 fps) gets an in-between frame from the motion between them, presented first, so
++        // the PS4's vsynced flips show it a vblank before the real one
++        if (ps4_frame_generation()) {
++            const uint64_t vblank = display.vblank_count.load();
++            const bool slow = last_presented_vblank != 0 && vblank >= last_presented_vblank + 2 && vblank - last_presented_vblank <= 6;
++            last_presented_vblank = vblank;
++            if (!screen_renderer.frame_generator)
++                screen_renderer.frame_generator = std::make_unique<FrameGenerator>(*this);
++            if (screen_renderer.frame_generator->record(screen_renderer.current_cmd_buffer, screen_renderer.swapchain_image_idx, surface_handle, layout, viewport, slow)) {
++                screen_renderer.render(screen_renderer.frame_generator->inbetween(), vk::ImageLayout::eGeneral, screen_renderer.frame_generator->inbetween_viewport());
++                if (has_overlays && screen_renderer.current_cmd_buffer) {
++                    overlay_renderer.render(screen_renderer.current_cmd_buffer, screen_renderer.default_render_pass, screen_renderer.extent,
++                        display.viewport_x, display.viewport_y, display.viewport_w, display.viewport_h);
++                }
++                screen_renderer.swap_window();
++                // the real frame on the next swapchain image
++                if (!screen_renderer.acquire_swapchain_image())
++                    return;
++                if (has_overlays && screen_renderer.current_cmd_buffer) {
++                    overlay_renderer.prepare(screen_renderer.current_cmd_buffer, *overlay_manager, display.viewport_w, display.viewport_h,
++                        screen_renderer.swapchain_image_idx);
++                }
++            }
++        } else {
++            last_presented_vblank = 0;
++        }
++#endif
+         screen_renderer.render(surface_handle, layout, viewport);
+     } else if (has_overlays) {
+         screen_renderer.begin_default_render_pass();
+@@ -1724,6 +1788,8 @@ renderer::VulkanDeviceInfo renderer::enumerate_vulkan_devices(const std::string
              return info;
  
          dispatch.init(vk_get_instance_proc_addr);
@@ -13688,6 +14313,35 @@ index 192dba99..4ae1b08b 100644
      };
      cmd_buffer.pushConstants(pipeline_layout_rcas, vk::ShaderStageFlagBits::eCompute, 0, sizeof(RcasConstant), &rcas_constant);
      cmd_buffer.dispatch(dispatch_x, dispatch_y, 1);
+diff --git a/vita3k/renderer/src/vulkan/screen_renderer.cpp b/vita3k/renderer/src/vulkan/screen_renderer.cpp
+index bbc6ba97..279c7983 100644
+--- a/vita3k/renderer/src/vulkan/screen_renderer.cpp
++++ b/vita3k/renderer/src/vulkan/screen_renderer.cpp
+@@ -16,6 +16,7 @@
+ // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+ 
+ #include "renderer/vulkan/screen_renderer.h"
++#include "renderer/vulkan/frame_generation.h"
+ 
+ #include "renderer/vulkan/state.h"
+ #include "util/log.h"
+@@ -69,6 +70,8 @@ bool has_android_surface() {
+ }
+ #endif
+ 
++ScreenRenderer::~ScreenRenderer() = default;
++
+ ScreenRenderer::ScreenRenderer(VKState &state)
+     : state(state) {
+ }
+@@ -347,6 +350,7 @@ void ScreenRenderer::cleanup() {
+     state.device.waitIdle();
+ 
+     filter.reset();
++    frame_generator.reset();
+ 
+     for (auto &img : vita_surface)
+         img.destroy();
 diff --git a/vita3k/renderer/src/vulkan/surface_cache.cpp b/vita3k/renderer/src/vulkan/surface_cache.cpp
 index 84f14b6a..59999c19 100644
 --- a/vita3k/renderer/src/vulkan/surface_cache.cpp
@@ -14098,6 +14752,503 @@ index 8ae6b391..7385a3ef 100644
      if (!is_uint) {
          opr = b.createUnaryOp(spv::OpConvertFToS, target_type, opr);
      } else {
+diff --git a/vita3k/shaders-builtin/vulkan/fg_copy.comp b/vita3k/shaders-builtin/vulkan/fg_copy.comp
+new file mode 100644
+index 00000000..2637d120
+--- /dev/null
++++ b/vita3k/shaders-builtin/vulkan/fg_copy.comp
+@@ -0,0 +1,59 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#version 450
++// Frame generation, 1 of 3 (renderer/vulkan/frame_generation.cpp): the game's frame copied out of
++// its surface (which the game draws the next one into), and its brightness at 1/scale of its size
++// (one luma value per scale x scale pixels), which the motion search compares.
++
++layout(local_size_x = 8, local_size_y = 8) in;
++
++layout(push_constant) uniform Constants {
++    ivec2 src_offset;
++    uvec2 frame_size;
++    uint scale;
++    uint luma_w;
++    uint luma_h;
++    uint blocks_w;
++    uint pass_index;
++} c;
++
++layout(set = 0, binding = 0) uniform sampler2D src;
++layout(set = 0, binding = 1, rgba8) uniform writeonly image2D frame;
++layout(set = 0, binding = 2) writeonly buffer Luma {
++    float luma[];
++};
++
++void main() {
++    const uvec2 l = gl_GlobalInvocationID.xy;
++    if (l.x >= c.luma_w || l.y >= c.luma_h)
++        return;
++    float sum = 0.0;
++    uint count = 0;
++    for (uint j = 0; j < c.scale; j++) {
++        for (uint i = 0; i < c.scale; i++) {
++            const uvec2 p = l * c.scale + uvec2(i, j);
++            if (p.x >= c.frame_size.x || p.y >= c.frame_size.y)
++                continue;
++            const vec4 v = texelFetch(src, c.src_offset + ivec2(p), 0);
++            imageStore(frame, ivec2(p), vec4(v.rgb, 1.0));
++            sum += dot(v.rgb, vec3(0.299, 0.587, 0.114));
++            count++;
++        }
++    }
++    luma[l.y * c.luma_w + l.x] = count > 0 ? sum / float(count) : 0.0;
++}
+diff --git a/vita3k/shaders-builtin/vulkan/fg_copy.comp.spv b/vita3k/shaders-builtin/vulkan/fg_copy.comp.spv
+new file mode 100644
+index 0000000000000000000000000000000000000000..c7d4efb3fda946cb4e47218a4a11958873baacd1
+GIT binary patch
+literal 4196
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/vita3k/shaders-builtin/vulkan/fg_interp.comp b/vita3k/shaders-builtin/vulkan/fg_interp.comp
+new file mode 100644
+index 00000000..397e9212
+--- /dev/null
++++ b/vita3k/shaders-builtin/vulkan/fg_interp.comp
+@@ -0,0 +1,75 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#version 450
++// Frame generation, 3 of 3: the in-between frame. Each pixel takes the blocks' vectors around it
++// (blended), and both frames halfway along that motion: the previous one at p + d/2, the new one
++// at p - d/2. Where they agree, their average; where they don't (something appears, or is
++// uncovered), the new frame's.
++
++layout(local_size_x = 8, local_size_y = 8) in;
++
++layout(push_constant) uniform Constants {
++    ivec2 src_offset;
++    uvec2 frame_size;
++    uint scale;
++    uint luma_w;
++    uint luma_h;
++    uint blocks_w;
++    uint pass_index;
++} c;
++
++layout(set = 0, binding = 0) uniform sampler2D previous;
++layout(set = 0, binding = 1) uniform sampler2D current;
++layout(set = 0, binding = 2) readonly buffer Vectors {
++    ivec2 vectors[];
++};
++layout(set = 0, binding = 3, rgba8) uniform writeonly image2D result;
++
++const int BS = 8;
++
++vec2 vector_at(ivec2 b) {
++    const int blocks_h = (int(c.luma_h) + BS - 1) / BS;
++    b = clamp(b, ivec2(0), ivec2(int(c.blocks_w) - 1, blocks_h - 1));
++    return vec2(vectors[b.y * int(c.blocks_w) + b.x]);
++}
++
++void main() {
++    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
++    if (p.x >= int(c.frame_size.x) || p.y >= int(c.frame_size.y))
++        return;
++    // the pixel among the blocks (their centres), in luma pixels
++    const vec2 at = (vec2(p) + 0.5) / float(c.scale) / float(BS) - 0.5;
++    const ivec2 b = ivec2(floor(at));
++    const vec2 f = at - vec2(b);
++    const vec2 d = mix(mix(vector_at(b), vector_at(b + ivec2(1, 0)), f.x), mix(vector_at(b + ivec2(0, 1)), vector_at(b + ivec2(1, 1)), f.x), f.y)
++        * float(c.scale);
++    const vec2 size = vec2(c.frame_size);
++    const vec3 weights = vec3(0.299, 0.587, 0.114);
++    // what stays put (the HUD over a panning scene) keeps its place: the same in both frames
++    const vec4 was = textureLod(previous, (vec2(p) + 0.5) / size, 0.0);
++    const vec4 is = textureLod(current, (vec2(p) + 0.5) / size, 0.0);
++    if (dot(abs(was.rgb - is.rgb), weights) < 0.03) {
++        imageStore(result, p, vec4(mix(was.rgb, is.rgb, 0.5), 1.0));
++        return;
++    }
++    const vec4 before = textureLod(previous, (vec2(p) + 0.5 + d * 0.5) / size, 0.0);
++    const vec4 after = textureLod(current, (vec2(p) + 0.5 - d * 0.5) / size, 0.0);
++    const float difference = dot(abs(before.rgb - after.rgb), weights);
++    const vec3 color = difference < 0.1 ? mix(before.rgb, after.rgb, 0.5) : after.rgb;
++    imageStore(result, p, vec4(color, 1.0));
++}
+diff --git a/vita3k/shaders-builtin/vulkan/fg_interp.comp.spv b/vita3k/shaders-builtin/vulkan/fg_interp.comp.spv
+new file mode 100644
+index 0000000000000000000000000000000000000000..5d451db1b57f8cfdcc2c1f17de7b76d4167c9282
+GIT binary patch
+literal 6592
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/vita3k/shaders-builtin/vulkan/fg_motion.comp b/vita3k/shaders-builtin/vulkan/fg_motion.comp
+new file mode 100644
+index 00000000..2b3e6c3c
+--- /dev/null
++++ b/vita3k/shaders-builtin/vulkan/fg_motion.comp
+@@ -0,0 +1,140 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#version 450
++// Frame generation, 2 of 3: per 8x8 block of the new frame's luma, where it was in the previous
++// frame's (the vector d: new(p) = previous(p + d)), by the sum of absolute differences plus a small
++// cost per pixel of motion, so flat areas keep still. Coarse to fine, so camera pans are found:
++//   pass 0  on the luma at half size (2x2 means): from no motion or the block's last vector, steps
++//           of 8, 4, 2 and 1, up to 24 (48 luma pixels)
++//   pass 1  on the luma: from the best of no motion, the block's last vector and twice the coarse
++//           vectors around it, steps of 2 and 1
++
++layout(local_size_x = 8, local_size_y = 8) in;
++
++layout(push_constant) uniform Constants {
++    ivec2 src_offset;
++    uvec2 frame_size;
++    uint scale;
++    uint luma_w;
++    uint luma_h;
++    uint blocks_w;
++    uint pass_index;
++} c;
++
++layout(set = 0, binding = 0) readonly buffer Previous {
++    float previous[];
++};
++layout(set = 0, binding = 1) readonly buffer Current {
++    float current[];
++};
++layout(set = 0, binding = 2) buffer Vectors {
++    ivec2 vectors[];
++};
++layout(set = 0, binding = 3) buffer Coarse {
++    ivec2 coarse[];
++};
++
++const int BS = 8;
++
++int level_w() { return c.pass_index == 0 ? (int(c.luma_w) + 1) / 2 : int(c.luma_w); }
++int level_h() { return c.pass_index == 0 ? (int(c.luma_h) + 1) / 2 : int(c.luma_h); }
++
++float luma_at(bool is_current, ivec2 p) {
++    const ivec2 last = ivec2(int(c.luma_w) - 1, int(c.luma_h) - 1);
++    if (c.pass_index == 0) {
++        // a 2x2 mean of the luma
++        const ivec2 q = clamp(p * 2, ivec2(0), last);
++        const ivec2 r = clamp(p * 2 + 1, ivec2(0), last);
++        const int w = int(c.luma_w);
++        if (is_current)
++            return 0.25 * (current[q.y * w + q.x] + current[q.y * w + r.x] + current[r.y * w + q.x] + current[r.y * w + r.x]);
++        return 0.25 * (previous[q.y * w + q.x] + previous[q.y * w + r.x] + previous[r.y * w + q.x] + previous[r.y * w + r.x]);
++    }
++    const ivec2 q = clamp(p, ivec2(0), last);
++    return is_current ? current[q.y * int(c.luma_w) + q.x] : previous[q.y * int(c.luma_w) + q.x];
++}
++
++float sad(ivec2 block, ivec2 d) {
++    float s = 0.0;
++    const ivec2 origin = block * BS;
++    for (int j = 0; j < BS; j++)
++        for (int i = 0; i < BS; i++)
++            s += abs(luma_at(true, origin + ivec2(i, j)) - luma_at(false, origin + ivec2(i, j) + d));
++    return s + 0.02 * float(abs(d.x) + abs(d.y));
++}
++
++void main() {
++    const ivec2 block = ivec2(gl_GlobalInvocationID.xy);
++    const int bw = (level_w() + BS - 1) / BS, bh = (level_h() + BS - 1) / BS;
++    if (block.x >= bw || block.y >= bh)
++        return;
++    const int index = block.y * bw + block.x;
++    const int limit = c.pass_index == 0 ? 24 : 48;
++
++    ivec2 d = ivec2(0);
++    float best = sad(block, d);
++    const ivec2 last = c.pass_index == 0 ? coarse[index] : vectors[index];
++    if (last != ivec2(0)) {
++        const float s = sad(block, last);
++        if (s < best) {
++            best = s;
++            d = last;
++        }
++    }
++    if (c.pass_index == 1) {
++        // the coarse vectors of the parent block and around it
++        const int cw = ((int(c.luma_w) + 1) / 2 + BS - 1) / BS, ch = ((int(c.luma_h) + 1) / 2 + BS - 1) / BS;
++        const ivec2 parent = block / 2;
++        for (int k = 0; k < 5; k++) {
++            const ivec2 around = k == 0 ? ivec2(0) : k == 1 ? ivec2(-1, 0) : k == 2 ? ivec2(1, 0) : k == 3 ? ivec2(0, -1) : ivec2(0, 1);
++            const ivec2 q = clamp(parent + around, ivec2(0), ivec2(cw - 1, ch - 1));
++            const ivec2 candidate = coarse[q.y * cw + q.x] * 2;
++            if (candidate == d)
++                continue;
++            const float s = sad(block, candidate);
++            if (s < best) {
++                best = s;
++                d = candidate;
++            }
++        }
++    }
++    for (int step = c.pass_index == 0 ? 8 : 2; step >= 1; step >>= 1) {
++        ivec2 next = d;
++        float next_best = best;
++        for (int j = -1; j <= 1; j++) {
++            for (int i = -1; i <= 1; i++) {
++                if (i == 0 && j == 0)
++                    continue;
++                const ivec2 candidate = d + ivec2(i, j) * step;
++                if (abs(candidate.x) > limit || abs(candidate.y) > limit)
++                    continue;
++                const float s = sad(block, candidate);
++                if (s < next_best) {
++                    next_best = s;
++                    next = candidate;
++                }
++            }
++        }
++        d = next;
++        best = next_best;
++    }
++    if (c.pass_index == 0)
++        coarse[index] = d;
++    else
++        vectors[index] = d;
++}
+diff --git a/vita3k/shaders-builtin/vulkan/fg_motion.comp.spv b/vita3k/shaders-builtin/vulkan/fg_motion.comp.spv
+new file mode 100644
+index 0000000000000000000000000000000000000000..31e84426d1cdb810c9f8dcff16a44066264e4078
+GIT binary patch
+literal 14020
+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
+
+literal 0
+HcmV?d00001
+
 diff --git a/vita3k/shaders-builtin/vulkan/fsr_filter_easu_f32.comp b/vita3k/shaders-builtin/vulkan/fsr_filter_easu_f32.comp
 new file mode 100644
 index 00000000..34435bae
