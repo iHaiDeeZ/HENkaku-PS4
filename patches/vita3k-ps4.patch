@@ -6286,7 +6286,7 @@ index 00000000..0210098f
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..88434498
+index 00000000..18dae10c
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
 @@ -0,0 +1,539 @@
@@ -6440,7 +6440,7 @@ index 00000000..88434498
 +                emuenv.fps, (vblank_count - vblanks) / seconds, ms[1], ms[2], ms[3], ms[4], ms[0], busy);
 +            // a thread in one call for 15 s: the waits behind it, a few times
 +            static int wait_logs = 0;
-+            if (ps4perf::report(seconds, (tsc - last_tsc) / (seconds * 1000.0)) >= 15.0 && wait_logs < 3) {
++            if (ps4perf::report(seconds, (tsc - last_tsc) / (seconds * 1000.0)) >= 15.0 && wait_logs < 3 && ps4settings::prefs().freeze_log) {
 +                wait_logs++;
 +                ps4_log_waits(emuenv.kernel);
 +            }
@@ -7167,10 +7167,10 @@ index 00000000..ff30f0d3
 +} // namespace ps4pad
 diff --git a/vita3k/ps4/ps4_perf.cpp b/vita3k/ps4/ps4_perf.cpp
 new file mode 100644
-index 00000000..454e5bd2
+index 00000000..0756bfd9
 --- /dev/null
 +++ b/vita3k/ps4/ps4_perf.cpp
-@@ -0,0 +1,422 @@
+@@ -0,0 +1,423 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -7299,6 +7299,7 @@ index 00000000..454e5bd2
 +}
 +
 +extern "C" bool ps4_profiler(); // vita3k/ps4/ps4_settings.cpp
++extern "C" bool ps4_freeze_log();
 +
 +extern "C" int ps4_perf_code_end() {
 +    GuestThread *const thread = t_thread;
@@ -7444,14 +7445,14 @@ index 00000000..454e5bd2
 +        // a thread in guest code for 2 s or more without a call: a spin. Stopped once, it logs where
 +        // (and goes on).
 +        const uint64_t code_start = thread.code_start.load(std::memory_order_acquire);
-+        if (log && code_start != 0 && (__builtin_ia32_rdtsc() - code_start) / ticks_per_ms >= 2000.0 && thread.halt && !thread.halted_for_pc.load()) {
++        if (log && ps4_freeze_log() && code_start != 0 && (__builtin_ia32_rdtsc() - code_start) / ticks_per_ms >= 2000.0 && thread.halt && !thread.halted_for_pc.load()) {
 +            thread.halted_for_pc.store(true);
 +            thread.halt(thread.cpu.load(std::memory_order_relaxed));
 +        }
 +
 +        // a thread in the same import for 2 s or more: what it waits for (a freeze shows here)
 +        const int depth = std::min(thread.depth.load(std::memory_order_acquire), static_cast<int>(GuestThread::kDepth));
-+        if (log && depth > 0) {
++        if (log && depth > 0 && ps4_freeze_log()) {
 +            const uint64_t now = __builtin_ia32_rdtsc();
 +            std::string stuck;
 +            for (int d = 0; d < depth; d++) {
@@ -7664,10 +7665,10 @@ index 00000000..4291971e
 +} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_settings.cpp b/vita3k/ps4/ps4_settings.cpp
 new file mode 100644
-index 00000000..a3a9e9ab
+index 00000000..26492d41
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.cpp
-@@ -0,0 +1,602 @@
+@@ -0,0 +1,649 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -8057,6 +8058,33 @@ index 00000000..a3a9e9ab
 +    return items;
 +}
 +
++extern "C" void ps4_sampler_set_enabled(int on); // port/ps4_sampler.cpp
++
++// The diagnostics, each with its own switch: they cost a little time, and only help finding what
++// is wrong
++std::vector<Item> diagnostics_items() {
++    std::vector<Item> items;
++    items.push_back(section("In /data/Vita3K/vita3k.log"));
++    items.push_back(pref_choice("Game code profiler", { "Off", "On" },
++        [](const Prefs &p) { return p.profiler ? 1 : 0; },
++        [](Prefs &p, int value) { p.profiler = value == 1; }, "the hottest game code every 10 s"));
++    items.push_back(pref_choice("Freeze log", { "Off", "On" },
++        [](const Prefs &p) { return p.freeze_log ? 1 : 0; },
++        [](Prefs &p, int value) { p.freeze_log = value == 1; }, "what a stuck game waits for"));
++    items.push_back(pref_choice("Format log", { "Off", "On" },
++        [](const Prefs &p) { return p.format_log ? 1 : 0; },
++        [](Prefs &p, int value) { p.format_log = value == 1; }, "the vertex and texture formats a game uses"));
++    items.push_back(section("In /data/Vita3K/samples.log"));
++    items.push_back(pref_choice("Renderer profiler", { "Off", "On" },
++        [](const Prefs &p) { return p.host_profiler ? 1 : 0; },
++        [](Prefs &p, int value) {
++            p.host_profiler = value == 1;
++            ps4_sampler_set_enabled(p.host_profiler ? 1 : 0);
++        },
++        "where HENkaku's render thread spends its time"));
++    return items;
++}
++
 +std::vector<Item> cpu_items(const std::shared_ptr<Scope> &scope, bool global, const std::string &next_start) {
 +    std::vector<Item> items;
 +    items.push_back(choice<bool>(scope, "CPU optimisations", { "On (fast)", "Off (accurate, slow)" }, { true, false }, &Config::CurrentConfig::cpu_opt, next_start));
@@ -8068,9 +8096,6 @@ index 00000000..a3a9e9ab
 +        items.push_back(pref_choice("Threads on one Vita core", { "Side by side", "One at a time (as on the Vita)" },
 +            [](const Prefs &p) { return p.vita_cores ? 1 : 0; },
 +            [](Prefs &p, int value) { p.vita_cores = value == 1; }, {}));
-+        items.push_back(pref_choice("Profiler (hot game code in the log)", { "Off", "On" },
-+            [](const Prefs &p) { return p.profiler ? 1 : 0; },
-+            [](Prefs &p, int value) { p.profiler = value == 1; }, {}));
 +    }
 +    return items;
 +}
@@ -8105,6 +8130,12 @@ index 00000000..a3a9e9ab
 +            g_prefs.vita_cores = value != "parallel";
 +        else if (key == "profiler")
 +            g_prefs.profiler = value == "on";
++        else if (key == "renderer-profiler")
++            g_prefs.host_profiler = value == "on";
++        else if (key == "freeze-log")
++            g_prefs.freeze_log = value == "on";
++        else if (key == "format-log")
++            g_prefs.format_log = value == "on";
 +        else if (key == "theme")
 +            g_prefs.theme = std::clamp(std::atoi(value.c_str()), 0, static_cast<int>(theme_names().size()) - 1);
 +        else if (key == "moving-wallpaper")
@@ -8128,6 +8159,9 @@ index 00000000..a3a9e9ab
 +    std::fprintf(f, "frame-queue = %s\n", g_prefs.frame_overlap ? "vita" : "vita3k");
 +    std::fprintf(f, "vita-cores = %s\n", g_prefs.vita_cores ? "vita" : "parallel");
 +    std::fprintf(f, "profiler = %s\n", g_prefs.profiler ? "on" : "off");
++    std::fprintf(f, "renderer-profiler = %s\n", g_prefs.host_profiler ? "on" : "off");
++    std::fprintf(f, "freeze-log = %s\n", g_prefs.freeze_log ? "on" : "off");
++    std::fprintf(f, "format-log = %s\n", g_prefs.format_log ? "on" : "off");
 +    std::fprintf(f, "theme = %d\n", g_prefs.theme);
 +    std::fprintf(f, "moving-wallpaper = %s\n", g_prefs.moving_wallpaper ? "on" : "off");
 +    std::fprintf(f, "wallpaper = %s\n", g_prefs.wallpaper.empty() ? "wave" : g_prefs.wallpaper.c_str());
@@ -8143,6 +8177,18 @@ index 00000000..a3a9e9ab
 +// SceGxm (sceGxmDisplayQueueAddEntry) asks
 +extern "C" bool ps4_profiler() {
 +    return ps4settings::prefs().profiler;
++}
++
++extern "C" bool ps4_host_profiler() {
++    return ps4settings::prefs().host_profiler;
++}
++
++extern "C" bool ps4_freeze_log() {
++    return ps4settings::prefs().freeze_log;
++}
++
++extern "C" bool ps4_format_log() {
++    return ps4settings::prefs().format_log;
 +}
 +
 +extern "C" bool ps4_vita_cores() {
@@ -8208,6 +8254,7 @@ index 00000000..a3a9e9ab
 +    pages.push_back(section("PS4"));
 +    pages.push_back(page("Look", look_items(), "theme, wallpaper"));
 +    pages.push_back(page("System", std::move(system), "home screen, buttons"));
++    pages.push_back(page("Diagnostics", diagnostics_items(), "profilers and logs, each can be off"));
 +    pages.push_back(page("About", about_items(), AUTHOR));
 +    return pages;
 +}
@@ -8265,6 +8312,7 @@ index 00000000..a3a9e9ab
 +    if (!emuenv.io.app_path.empty())
 +        items.push_back(page("This game", game_pages(emuenv, emuenv.io.app_path), "its own settings"));
 +    items.push_back(section("HENkaku"));
++    items.push_back(page("Diagnostics", diagnostics_items(), "profilers and logs, each can be off"));
 +    items.push_back(page("About", about_items(), AUTHOR));
 +    return items;
 +}
@@ -8272,10 +8320,10 @@ index 00000000..a3a9e9ab
 +} // namespace ps4settings
 diff --git a/vita3k/ps4/ps4_settings.h b/vita3k/ps4/ps4_settings.h
 new file mode 100644
-index 00000000..bd2a6377
+index 00000000..0abc4a4c
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.h
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,92 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -8327,8 +8375,15 @@ index 00000000..bd2a6377
 +    // the threads a game pins to one Vita core run one at a time, switching when one blocks, as on
 +    // the Vita (some games deadlock when they run side by side), or all side by side
 +    bool vita_cores = true;
++    // the diagnostics (HENkaku > Diagnostics), each one can be switched off:
 +    // samples where the game's threads run, and logs the hottest code every 10 s
 +    bool profiler = true;
++    // samples where HENkaku's render thread runs, into /data/Vita3K/samples.log every 10 s
++    bool host_profiler = true;
++    // a thread stuck in one call for seconds: the call, and every thread's wait and lock holders
++    bool freeze_log = true;
++    // each vertex and texture format a game uses, once
++    bool format_log = false;
 +    // the home screen's look: a theme (its colours, theme_names()), its wave moving, and the
 +    // wallpaper: the theme's wave, or a picture's file name in wallpaper_dir()
 +    int theme = 0;
@@ -9080,10 +9135,10 @@ index 65b81052..c999b5c1 100644
      bool fullscreen_hd_res_pixel_perfect;
 diff --git a/vita3k/renderer/include/renderer/vulkan/ps4_vertex_layout.h b/vita3k/renderer/include/renderer/vulkan/ps4_vertex_layout.h
 new file mode 100644
-index 00000000..fbd77ce2
+index 00000000..dad76a8f
 --- /dev/null
 +++ b/vita3k/renderer/include/renderer/vulkan/ps4_vertex_layout.h
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,136 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -9186,15 +9241,35 @@ index 00000000..fbd77ce2
 +        if (program.attributes[i].streamIndex == stream_index)
 +            moves.push_back({ program.attributes[i].offset, repacked_offset(program, i), attribute_bytes(program.attributes[i]) });
 +
-+    // (room past the end: a 3 component attribute read as 4 components)
-+    out.assign(count * vertex_size + 16, 0);
-+    for (size_t vertex = 0; vertex < count; vertex++) {
-+        const size_t source = vertex * stride;
-+        uint8_t *const destination = out.data() + vertex * vertex_size;
-+        for (const Move &move : moves) {
-+            if (source + move.from >= size)
-+                continue;
-+            std::memcpy(destination + move.to, data + source + move.from, std::min<size_t>(move.bytes, size - source - move.from));
++    // (room past the end: a 3 component attribute read as 4 components; the slots' padding is
++    // never read, so nothing is cleared)
++    out.resize(count * vertex_size + 16);
++    for (const Move &move : moves) {
++        // the vertices whose attribute is whole in the data, then the one cut short
++        const size_t whole = move.from + move.bytes > size ? 0 : (stride ? std::min<size_t>(count, (size - move.from - move.bytes) / stride + 1) : 1);
++        const uint8_t *source = data + move.from;
++        uint8_t *destination = out.data() + move.to;
++        const auto copy_all = [&]<size_t N>() {
++            for (size_t vertex = 0; vertex < whole; vertex++, source += stride, destination += vertex_size)
++                std::memcpy(destination, source, N);
++        };
++        switch (move.bytes) {
++        case 2: copy_all.template operator()<2>(); break;
++        case 3: copy_all.template operator()<3>(); break;
++        case 4: copy_all.template operator()<4>(); break;
++        case 6: copy_all.template operator()<6>(); break;
++        case 8: copy_all.template operator()<8>(); break;
++        case 12: copy_all.template operator()<12>(); break;
++        case 16: copy_all.template operator()<16>(); break;
++        default:
++            for (size_t vertex = 0; vertex < whole; vertex++, source += stride, destination += vertex_size)
++                std::memcpy(destination, source, move.bytes);
++            break;
++        }
++        if (whole < count) {
++            const size_t at = whole * stride + move.from;
++            if (at < size)
++                std::memcpy(out.data() + whole * vertex_size + move.to, data + at, std::min<size_t>(move.bytes, size - at));
 +        }
 +    }
 +}
@@ -9214,7 +9289,7 @@ index 1a5bc612..b18966ea 100644
      bool support_standard_layout = false;
      bool support_rasterized_order_access = false;
 diff --git a/vita3k/renderer/src/batch.cpp b/vita3k/renderer/src/batch.cpp
-index 87e5a8e1..df46ea78 100644
+index 87e5a8e1..2be5f2fa 100644
 --- a/vita3k/renderer/src/batch.cpp
 +++ b/vita3k/renderer/src/batch.cpp
 @@ -32,6 +32,7 @@
@@ -9225,13 +9300,16 @@ index 87e5a8e1..df46ea78 100644
  
  #ifdef TRACY_ENABLE
  #include <tracy/Tracy.hpp>
-@@ -39,6 +40,29 @@
+@@ -39,6 +40,32 @@
  
  struct FeatureState;
  
 +#ifdef __PS4__
 +// port/ps4_sampler.cpp: the perf lines' counters
 +extern "C" void ps4_watch_thread(const char *name);
++extern "C" void ps4_sampler_register_thread(const char *name);
++extern "C" void ps4_sampler_set_enabled(int on);
++extern "C" bool ps4_host_profiler(); // vita3k/ps4/ps4_settings.cpp
 +extern "C" void ps4_thread_cpu_tick();
 +extern "C" void ps4_wait_add(int slot, long long ns);
 +
@@ -9255,7 +9333,7 @@ index 87e5a8e1..df46ea78 100644
  namespace renderer {
  Command *generic_command_allocate() {
      return new Command;
-@@ -135,6 +159,11 @@ void process_batches(renderer::State &state, const FeatureState &features, MemSt
+@@ -135,6 +162,11 @@ void process_batches(renderer::State &state, const FeatureState &features, MemSt
      auto max_time = duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() + max_wait_ms;
  
      while (!state.should_display) {
@@ -9267,7 +9345,7 @@ index 87e5a8e1..df46ea78 100644
          if (state.render_abort.load(std::memory_order_relaxed))
              return;
  
-@@ -175,6 +204,9 @@ void process_batches(renderer::State &state, const FeatureState &features, MemSt
+@@ -175,6 +207,9 @@ void process_batches(renderer::State &state, const FeatureState &features, MemSt
          }
  
          state.command_buffer_queue.pop();
@@ -9277,17 +9355,20 @@ index 87e5a8e1..df46ea78 100644
          process_batch(state, features, mem, config, *cmd_list);
      }
  }
-@@ -185,6 +217,9 @@ void reset_command_list(CommandList &command_list) {
+@@ -185,6 +220,12 @@ void reset_command_list(CommandList &command_list) {
  }
  
  static void render_loop(renderer::State &state, DisplayState &display, GxmState &gxm, MemState &mem, Config &config) {
 +#ifdef __PS4__
-+    ps4_watch_thread("render");
++    // (the renderer profiler samples this thread)
++    ps4_sampler_register_thread("render");
++    if (ps4_host_profiler())
++        ps4_sampler_set_enabled(1);
 +#endif
      if (state.precompile_requested) {
          auto progress_overlay = state.overlay_manager
              ? state.overlay_manager->create<overlay::shader_precompile_progress>()
-@@ -274,8 +309,18 @@ static void render_loop(renderer::State &state, DisplayState &display, GxmState
+@@ -274,8 +315,18 @@ static void render_loop(renderer::State &state, DisplayState &display, GxmState
              }
          }
  
@@ -9338,7 +9419,7 @@ index 689060fb..11e3e88a 100644
                  LOG_ERROR("Could not wait for fences.");
                  assert(false);
 diff --git a/vita3k/renderer/src/vulkan/pipeline_cache.cpp b/vita3k/renderer/src/vulkan/pipeline_cache.cpp
-index ff6d0c5b..73baa13b 100644
+index ff6d0c5b..ab744977 100644
 --- a/vita3k/renderer/src/vulkan/pipeline_cache.cpp
 +++ b/vita3k/renderer/src/vulkan/pipeline_cache.cpp
 @@ -16,6 +16,9 @@
@@ -9351,7 +9432,7 @@ index ff6d0c5b..73baa13b 100644
  
  #include <renderer/vulkan/gxm_to_vulkan.h>
  #include <renderer/vulkan/state.h>
-@@ -36,6 +39,14 @@
+@@ -36,6 +39,15 @@
  #define XXH_INLINE_ALL
  #include <xxhash.h>
  
@@ -9359,6 +9440,7 @@ index ff6d0c5b..73baa13b 100644
 +#include <set>
 +
 +#ifdef __PS4__
++extern "C" bool ps4_format_log(); // vita3k/ps4/ps4_settings.cpp
 +extern "C" void ps4_watch_thread(const char *name); // port/ps4_sampler.cpp
 +extern "C" void ps4_thread_cpu_tick();
 +#endif
@@ -9366,7 +9448,7 @@ index ff6d0c5b..73baa13b 100644
  namespace renderer::vulkan {
  
  // Size of the record containing what is needed for the pipeline construction (what is after is dynamic state)
-@@ -227,6 +238,12 @@ void PipelineCache::init(bool support_rasterized_order_access) {
+@@ -227,6 +239,12 @@ void PipelineCache::init(bool support_rasterized_order_access) {
          }
  
          state.features.support_rgb_attributes = unsupported_rgb_vertex_attribute_formats.empty();
@@ -9379,7 +9461,7 @@ index ff6d0c5b..73baa13b 100644
      }
  
      support_coherent_framebuffer_fetch = support_rasterized_order_access;
-@@ -815,12 +832,32 @@ vk::PipelineVertexInputStateCreateInfo PipelineCache::get_vertex_input_state(con
+@@ -815,12 +833,32 @@ vk::PipelineVertexInputStateCreateInfo PipelineCache::get_vertex_input_state(con
              }
          }
  
@@ -9392,7 +9474,7 @@ index ff6d0c5b..73baa13b 100644
 +            const uint64_t key = (uint64_t(attribute.format) << 48) ^ (uint64_t(attribute.componentCount) << 40) ^ (uint64_t(info.regformat) << 39) ^ (uint64_t(info.gxm_type) << 32)
 +                ^ (uint64_t(stream.stride) << 16) ^ (uint64_t(attribute.offset & 0xF) << 8) ^ uint64_t(static_cast<uint32_t>(format) & 0xFF);
 +            const std::lock_guard<std::mutex> guard(seen_mutex);
-+            if (seen.size() < 200 && seen.insert(key).second)
++            if (ps4_format_log() && seen.size() < 200 && seen.insert(key).second)
 +                LOG_INFO("PS4 vertex attribute: gxm format {} x{}, {}type {}, integer {} signed {}, stream stride {} offset {} -> {} x{}", static_cast<int>(attribute.format), static_cast<int>(attribute.componentCount),
 +                    info.regformat ? "regformat, " : "", static_cast<int>(info.gxm_type), info.is_integer, info.is_signed, stream.stride, attribute.offset, vk::to_string(format), static_cast<int>(component_count));
 +        }
@@ -9413,7 +9495,7 @@ index ff6d0c5b..73baa13b 100644
          }
      }
  
-@@ -834,6 +871,8 @@ vk::PipelineVertexInputStateCreateInfo PipelineCache::get_vertex_input_state(con
+@@ -834,6 +872,8 @@ vk::PipelineVertexInputStateCreateInfo PipelineCache::get_vertex_input_state(con
  
  #ifdef __APPLE__
          const uint32_t stride = align(stream.stride, 4);
@@ -9422,7 +9504,7 @@ index ff6d0c5b..73baa13b 100644
  #else
          const uint32_t stride = stream.stride;
  #endif
-@@ -854,7 +893,13 @@ void PipelineCache::compiler_thread(MemState &mem) {
+@@ -854,7 +894,13 @@ void PipelineCache::compiler_thread(MemState &mem) {
  
      // just a single loop, waiting for a pipeline compile request and compiling it
      CompileRequest *request;
@@ -9574,7 +9656,7 @@ index 192dba99..4ae1b08b 100644
      cmd_buffer.pushConstants(pipeline_layout_rcas, vk::ShaderStageFlagBits::eCompute, 0, sizeof(RcasConstant), &rcas_constant);
      cmd_buffer.dispatch(dispatch_x, dispatch_y, 1);
 diff --git a/vita3k/renderer/src/vulkan/texture.cpp b/vita3k/renderer/src/vulkan/texture.cpp
-index 3a0120c1..0e1ac2c1 100644
+index 3a0120c1..e4d8cb35 100644
 --- a/vita3k/renderer/src/vulkan/texture.cpp
 +++ b/vita3k/renderer/src/vulkan/texture.cpp
 @@ -15,6 +15,7 @@
@@ -9585,7 +9667,18 @@ index 3a0120c1..0e1ac2c1 100644
  #include <renderer/vulkan/functions.h>
  
  #include <renderer/vulkan/gxm_to_vulkan.h>
-@@ -385,6 +386,15 @@ void VKTextureCache::configure_texture(const SceGxmTexture &gxm_texture) {
+@@ -27,6 +28,10 @@
+ #include <util/align.h>
+ #include <vkutil/vkutil.h>
+ 
++#ifdef __PS4__
++extern "C" bool ps4_format_log(); // vita3k/ps4/ps4_settings.cpp
++#endif
++
+ namespace renderer::vulkan {
+ 
+ // return if this format can be used to read a depth stencil buffer
+@@ -385,6 +390,15 @@ void VKTextureCache::configure_texture(const SceGxmTexture &gxm_texture) {
          vk_format = bcn_to_rgba8(vk_format);
      if (gxm_texture.gamma_mode)
          vk_format = linear_to_srgb(vk_format);
@@ -9593,7 +9686,7 @@ index 3a0120c1..0e1ac2c1 100644
 +    {
 +        // each texture format once, with how it is read (a game whose pictures come out wrong)
 +        static std::set<uint32_t> seen;
-+        if (seen.size() < 100 && seen.insert(static_cast<uint32_t>(format) ^ (static_cast<uint32_t>(gxm_texture.texture_type()) << 2)).second)
++        if (ps4_format_log() && seen.size() < 100 && seen.insert(static_cast<uint32_t>(format) ^ (static_cast<uint32_t>(gxm_texture.texture_type()) << 2)).second)
 +            LOG_INFO("PS4 texture: gxm format {:08X}, type {}, {}x{}, {} mips -> {}, swizzle {} {} {} {}", static_cast<uint32_t>(format), static_cast<uint32_t>(gxm_texture.texture_type()), width, height, mip_count,
 +                vk::to_string(vk_format), vk::to_string(swizzle.r), vk::to_string(swizzle.g), vk::to_string(swizzle.b), vk::to_string(swizzle.a));
 +    }
