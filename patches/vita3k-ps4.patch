@@ -700,7 +700,7 @@ index 4c4694be..af094577 100644
      bool is_deleted();
      // The status a thread that ended exited with, or NOT_DORMANT or DORMANT if it hasn't ended
 diff --git a/vita3k/kernel/src/kernel.cpp b/vita3k/kernel/src/kernel.cpp
-index 97794b3d..7e3caf90 100644
+index 97794b3d..42316451 100644
 --- a/vita3k/kernel/src/kernel.cpp
 +++ b/vita3k/kernel/src/kernel.cpp
 @@ -23,6 +23,7 @@
@@ -770,7 +770,7 @@ index 97794b3d..7e3caf90 100644
 +        const WaitTarget target = thread->get_wait_target();
 +        const ThreadStatus status = thread->get_status();
 +        if (target.type == 0) {
-+            LOG_INFO("waits: {} ({}): status {}, not waiting", thread->name, thread->id, static_cast<SceUInt32>(status));
++            LOG_INFO("waits: {} ({}, priority {}, cores {}): status {}, not waiting", thread->name, thread->id, thread->get_priority(), log_hex(static_cast<SceUInt32>(thread->get_affinity_mask())), static_cast<SceUInt32>(status));
 +            continue;
 +        }
 +        std::string what = fmt::format("object {}", target.id);
@@ -792,7 +792,7 @@ index 97794b3d..7e3caf90 100644
 +                break;
 +            }
 +        }
-+        LOG_INFO("waits: {} ({}): wait type {}, on {}", thread->name, thread->id, log_hex(target.type), what);
++        LOG_INFO("waits: {} ({}, priority {}, cores {}): wait type {}, on {}", thread->name, thread->id, thread->get_priority(), log_hex(static_cast<SceUInt32>(thread->get_affinity_mask())), log_hex(target.type), what);
 +    }
 +}
 +#endif
@@ -815,10 +815,10 @@ index 78029915..1e21caeb 100644
      owner = 0;
      if (auto *waiter = waiters.front()) {
 diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
-index c01e4699..cdd59fa5 100644
+index c01e4699..2ee9d8ee 100644
 --- a/vita3k/kernel/src/thread.cpp
 +++ b/vita3k/kernel/src/thread.cpp
-@@ -32,6 +32,16 @@
+@@ -32,6 +32,88 @@
  #include <sstream>
  #include <utility>
  
@@ -830,13 +830,135 @@ index c01e4699..cdd59fa5 100644
 +extern "C" void ps4_perf_import_begin(uint32_t nid, uint32_t arg0);
 +extern "C" void ps4_perf_code_begin(void *cpu, void (*halt)(void *));
 +extern "C" bool ps4_perf_code_end();
++extern "C" bool ps4_vita_cores(); // vita3k/ps4/ps4_settings.cpp
++extern "C" uint64_t sceKernelGetTscFrequency();
++
++#include <chrono>
++#include <condition_variable>
++#include <mutex>
++
++// PS4: the threads a game puts on one Vita core run one at a time, as there. A Vita core switches
++// threads when the running one blocks, not in the middle of what it does, and games (FIOS, God of War
++// Collection's file reads) count on it: two threads that take two locks in opposite orders never
++// meet on one core, while on parallel PS4 cores they deadlock. A thread takes its core to run guest
++// code and keeps it through its calls; another one takes it over once the owner sits in a call
++// (blocked: 0.3 ms) or ran a time slice (10 ms), so a thread blocked on the host never stalls the rest.
++namespace {
++
++struct VitaCore {
++    std::mutex mutex;
++    const void *owner = nullptr;
++    bool in_call = false;
++    uint64_t since = 0; // when the owner took the core or entered its call (TSC)
++};
++VitaCore g_vita_cores[3];
++
++// The Vita core a thread is pinned to (one of the three game cores), or -1
++int vita_core_of(SceInt32 affinity_mask) {
++    if (!ps4_vita_cores())
++        return -1;
++    switch (affinity_mask & 0x70000) {
++    case 0x10000: return 0;
++    case 0x20000: return 1;
++    case 0x40000: return 2;
++    default: return -1;
++    }
++}
++
++uint64_t ticks_per_us() {
++    static const uint64_t ticks = std::max<uint64_t>(sceKernelGetTscFrequency() / 1000000, 1);
++    return ticks;
++}
++
++void vita_core_take(int core, const void *self) {
++    VitaCore &c = g_vita_cores[core];
++    std::unique_lock<std::mutex> lock(c.mutex);
++    while (c.owner && c.owner != self && __builtin_ia32_rdtsc() - c.since < (c.in_call ? 300 : 10000) * ticks_per_us()) {
++        lock.unlock();
++        std::this_thread::sleep_for(std::chrono::microseconds(50));
++        lock.lock();
++    }
++    c.owner = self;
++    c.in_call = false;
++    c.since = __builtin_ia32_rdtsc();
++}
++
++void vita_core_call(int core, const void *self) {
++    VitaCore &c = g_vita_cores[core];
++    const std::lock_guard<std::mutex> lock(c.mutex);
++    if (c.owner == self) {
++        c.in_call = true;
++        c.since = __builtin_ia32_rdtsc();
++    }
++}
++
++void vita_core_release(int core, const void *self) {
++    if (core < 0)
++        return;
++    VitaCore &c = g_vita_cores[core];
++    const std::lock_guard<std::mutex> lock(c.mutex);
++    if (c.owner == self)
++        c.owner = nullptr;
++}
++
++} // namespace
 +#endif
 +
  // Set in the wait type of a wait that runs callbacks
  constexpr SceUInt32 WAITTYPE_CB_BIT = 0x80000000U;
  // What a thread waiting for a thread signal reports as its wait UID on a Vita, which isn't a UID
-@@ -301,13 +311,35 @@ void ThreadState::run_loop(bool top_level) {
+@@ -190,6 +272,10 @@ void ThreadState::request_removal() {
+ }
+ 
+ void ThreadState::run_loop(bool top_level) {
++#ifdef __PS4__
++    // the Vita core this level runs on, when the game pinned the thread to one
++    int vita_core = -1;
++#endif
+     bool guest_returned = false;
+ 
+     // Set thread-local CPU state so signal handlers can access it. The guard puts back what was
+@@ -248,6 +334,12 @@ void ThreadState::run_loop(bool top_level) {
+     while (true) {
+         // This level is done once its guest function returned or the thread is ending
+         if (exiting() || guest_returned) {
++#ifdef __PS4__
++            if (top_level) {
++                vita_core_release(vita_core, this);
++                vita_core = -1;
++            }
++#endif
+             // A nested level returns to the one below it
+             if (!top_level)
+                 break;
+@@ -272,6 +364,10 @@ void ThreadState::run_loop(bool top_level) {
+ 
+         // Park until we have something to do.
+         if (status != ThreadStatus::running) {
++#ifdef __PS4__
++            vita_core_release(vita_core, this);
++            vita_core = -1;
++#endif
+             status_cond.wait(lock, [&] { return status == ThreadStatus::running || exiting(); });
+             continue;
+         }
+@@ -297,17 +393,56 @@ void ThreadState::run_loop(bool top_level) {
+             if (exiting())
+                 break;
+             const bool do_step = std::exchange(step_requested, false);
++#ifdef __PS4__
++            const int core = vita_core_of(affinity_mask);
++#endif
+ 
              lock.unlock();
++#ifdef __PS4__
++            if (core != vita_core) {
++                vita_core_release(vita_core, this);
++                vita_core = core;
++            }
++            if (vita_core >= 0)
++                vita_core_take(vita_core, this);
++#endif
  
              // Single step or run
 +#ifdef __PS4__
@@ -863,15 +985,21 @@ index c01e4699..cdd59fa5 100644
                  const uint32_t nid = *Ptr<uint32_t>(read_pc(*cpu) + 4).get(mem);
 +#ifdef __PS4__
 +                ps4_perf_import_begin(nid, read_reg(*cpu, 0));
++                if (vita_core >= 0)
++                    vita_core_call(vita_core, this);
 +#endif
                  kernel.call_import(*cpu, nid, id);
++#ifdef __PS4__
++                if (vita_core >= 0)
++                    vita_core_take(vita_core, this);
++#endif
 +#ifdef __PS4__
 +                ps4_perf_import(nid, __builtin_ia32_rdtsc() - run_end);
 +#endif
                  clear_exclusive(*cpu);
              }
  
-@@ -501,6 +533,11 @@ bool ThreadState::is_deleted() {
+@@ -501,6 +636,11 @@ bool ThreadState::is_deleted() {
      return status == ThreadStatus::deleted;
  }
  
@@ -3315,10 +3443,10 @@ index 00000000..01fdf0f1
 +} // namespace ps4download
 diff --git a/vita3k/ps4/ps4_launcher.cpp b/vita3k/ps4/ps4_launcher.cpp
 new file mode 100644
-index 00000000..08738cad
+index 00000000..4bb3acea
 --- /dev/null
 +++ b/vita3k/ps4/ps4_launcher.cpp
-@@ -0,0 +1,2674 @@
+@@ -0,0 +1,2694 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -3352,6 +3480,8 @@ index 00000000..08738cad
 +#include "ps4_wsi.h"
 +
 +#include "archive.h"
++
++#include <miniz.h>
 +
 +#include <app/functions.h>
 +#include <app/state.h>
@@ -3847,6 +3977,8 @@ index 00000000..08738cad
 +
 +// Installs what the browser picked. consume: they're in the install folder, and what installs moves
 +// into its done/ (with a package's .zrif file).
++bool is_vitamin_dump(const fs::path &archive);
++
 +void install_worker(EmuEnvState &emuenv, InstallJob &job, std::vector<Entry> list, bool consume) {
 +    std::stable_sort(list.begin(), list.end(), [](const Entry &a, const Entry &b) { return install_order(a.kind) < install_order(b.kind); });
 +    const fs::path done_dir = fs::path(INSTALL_DIR) / "done";
@@ -3932,7 +4064,7 @@ index 00000000..08738cad
 +                const bool ok = !contents.empty() && std::all_of(contents.begin(), contents.end(), [](const ContentInfo &c) { return c.state; });
 +                if (ok)
 +                    installed_app(contents.front().title_id);
-+                finish(p, ok, "nothing in it could be installed");
++                finish(p, ok, is_vitamin_dump(p) ? "a Vitamin dump, which Vita3K can't run: use a NoNpDrm dump (PKGj, or the game's .pkg with its zRIF)" : "nothing in it could be installed");
 +                break;
 +            }
 +            case Kind::GameFolder: {
@@ -3977,6 +4109,22 @@ index 00000000..08738cad
 +    const bool read = std::fread(magic, 1, sizeof(magic), f) == sizeof(magic);
 +    std::fclose(f);
 +    return read && std::memcmp(magic, "SCE\0", sizeof(magic)) != 0;
++}
++
++// Whether an archive is a Vitamin dump (its game decrypted by Vitamin, which loads it through
++// steroid.suprx): Vita3K refuses those
++bool is_vitamin_dump(const fs::path &archive) {
++    mz_zip_archive zip{};
++    if (!mz_zip_reader_init_file(&zip, fs_utils::path_to_utf8(archive).c_str(), 0))
++        return false;
++    bool vitamin = false;
++    for (mz_uint i = 0; i < mz_zip_reader_get_num_files(&zip) && !vitamin; i++) {
++        char name[512];
++        if (mz_zip_reader_get_filename(&zip, i, name, sizeof(name)) && std::strstr(name, "sce_module/steroid.suprx"))
++            vitamin = true;
++    }
++    mz_zip_reader_end(&zip);
++    return vitamin;
 +}
 +
 +// Decrypts it in place with its work.bin, as installing the dump would have, license and all
@@ -7284,10 +7432,10 @@ index 00000000..273e4e27
 +} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_settings.cpp b/vita3k/ps4/ps4_settings.cpp
 new file mode 100644
-index 00000000..4d37f0c2
+index 00000000..12c0c2b9
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.cpp
-@@ -0,0 +1,582 @@
+@@ -0,0 +1,592 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -7685,6 +7833,9 @@ index 00000000..4d37f0c2
 +            [](const Prefs &p) { return p.cluster_threads ? 1 : 0; },
 +            [](Prefs &p, int value) { p.cluster_threads = value == 1; }, next_start));
 +        items.push_back(frame_queue_choice());
++        items.push_back(pref_choice("Threads on one Vita core", { "Side by side", "One at a time (as on the Vita)" },
++            [](const Prefs &p) { return p.vita_cores ? 1 : 0; },
++            [](Prefs &p, int value) { p.vita_cores = value == 1; }, {}));
 +    }
 +    return items;
 +}
@@ -7715,6 +7866,8 @@ index 00000000..4d37f0c2
 +            g_prefs.cluster_threads = value == "cluster";
 +        else if (key == "frame-queue")
 +            g_prefs.frame_overlap = value != "vita3k";
++        else if (key == "vita-cores")
++            g_prefs.vita_cores = value != "parallel";
 +        else if (key == "theme")
 +            g_prefs.theme = std::clamp(std::atoi(value.c_str()), 0, static_cast<int>(theme_names().size()) - 1);
 +        else if (key == "moving-wallpaper")
@@ -7736,6 +7889,7 @@ index 00000000..4d37f0c2
 +    std::fprintf(f, "fsr-sharpness = %d\n", g_prefs.fsr_sharpness);
 +    std::fprintf(f, "game-threads = %s\n", g_prefs.cluster_threads ? "cluster" : "all");
 +    std::fprintf(f, "frame-queue = %s\n", g_prefs.frame_overlap ? "vita" : "vita3k");
++    std::fprintf(f, "vita-cores = %s\n", g_prefs.vita_cores ? "vita" : "parallel");
 +    std::fprintf(f, "theme = %d\n", g_prefs.theme);
 +    std::fprintf(f, "moving-wallpaper = %s\n", g_prefs.moving_wallpaper ? "on" : "off");
 +    std::fprintf(f, "wallpaper = %s\n", g_prefs.wallpaper.empty() ? "wave" : g_prefs.wallpaper.c_str());
@@ -7749,6 +7903,10 @@ index 00000000..4d37f0c2
 +} // namespace ps4settings
 +
 +// SceGxm (sceGxmDisplayQueueAddEntry) asks
++extern "C" bool ps4_vita_cores() {
++    return ps4settings::prefs().vita_cores;
++}
++
 +extern "C" bool ps4_frame_overlap() {
 +    return ps4settings::prefs().frame_overlap;
 +}
@@ -7872,10 +8030,10 @@ index 00000000..4d37f0c2
 +} // namespace ps4settings
 diff --git a/vita3k/ps4/ps4_settings.h b/vita3k/ps4/ps4_settings.h
 new file mode 100644
-index 00000000..73ce1efa
+index 00000000..11adb308
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.h
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,83 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -7924,6 +8082,9 @@ index 00000000..73ce1efa
 +    // a game that keeps one frame in its display queue (Mortal Kombat) may build the next one while
 +    // that frame waits for its vblank, as on the Vita, where Vita3K waits until it is shown
 +    bool frame_overlap = true;
++    // the threads a game pins to one Vita core run one at a time, switching when one blocks, as on
++    // the Vita (some games deadlock when they run side by side), or all side by side
++    bool vita_cores = true;
 +    // the home screen's look: a theme (its colours, theme_names()), its wave moving, and the
 +    // wallpaper: the theme's wave, or a picture's file name in wallpaper_dir()
 +    int theme = 0;
