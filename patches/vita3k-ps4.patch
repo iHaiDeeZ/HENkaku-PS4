@@ -2426,10 +2426,10 @@ index 3e2404bb..0ca2475e 100644
  
 diff --git a/vita3k/ps4/ps4.cmake b/vita3k/ps4/ps4.cmake
 new file mode 100644
-index 00000000..14dfe225
+index 00000000..ee872066
 --- /dev/null
 +++ b/vita3k/ps4/ps4.cmake
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,41 @@
 +# PS4: Vita3K's frontend for the console, included from vita3k/CMakeLists.txt once the vita3k target
 +# exists. Built with the port's toolchain (toolchain/ps4-vita3k.cmake, and ps4-love-style.cmake as
 +# the project include: PS4_RUNTIME_SOURCES, ps4_link_mesa, ps4_add_eboot).
@@ -2442,6 +2442,8 @@ index 00000000..14dfe225
 +	ps4/ps4_download.h
 +	ps4/ps4_launcher.cpp
 +	ps4/ps4_launcher.h
++	ps4/ps4_controls.cpp
++	ps4/ps4_controls.h
 +	ps4/ps4_pad.cpp
 +	ps4/ps4_pad.h
 +	ps4/ps4_perf.cpp
@@ -3310,6 +3312,413 @@ index 00000000..3c973064
 +void set_vita_font_dir(const std::string &dir);
 +
 +} // namespace ps4ui
+diff --git a/vita3k/ps4/ps4_controls.cpp b/vita3k/ps4/ps4_controls.cpp
+new file mode 100644
+index 00000000..b2f65b37
+--- /dev/null
++++ b/vita3k/ps4/ps4_controls.cpp
+@@ -0,0 +1,286 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// PS4: the controls, saved as "key = value" lines (ps4_controls.h).
++
++#include "ps4_controls.h"
++
++#include <util/log.h>
++
++#include <orbis/Pad.h>
++
++#include <algorithm>
++#include <cstdio>
++#include <cstring>
++#include <functional>
++#include <map>
++#include <mutex>
++
++#include <sys/stat.h>
++
++namespace ps4controls {
++
++namespace {
++
++using Item = overlay::pause_menu_item;
++
++const char *const DIR = "/data/Vita3K/controls";
++
++const char *const PAD_NAMES[PadButtonCount] = { "Cross", "Circle", "Square", "Triangle", "Up", "Down", "Left", "Right", "L1", "R1", "L2", "R2", "L3", "R3",
++    "OPTIONS", "Touch pad click" };
++const char *const PAD_KEYS[PadButtonCount] = { "cross", "circle", "square", "triangle", "up", "down", "left", "right", "l1", "r1", "l2", "r2", "l3", "r3",
++    "options", "touchpad-click" };
++const uint32_t PAD_BITS[PadButtonCount] = { ORBIS_PAD_BUTTON_CROSS, ORBIS_PAD_BUTTON_CIRCLE, ORBIS_PAD_BUTTON_SQUARE, ORBIS_PAD_BUTTON_TRIANGLE,
++    ORBIS_PAD_BUTTON_UP, ORBIS_PAD_BUTTON_DOWN, ORBIS_PAD_BUTTON_LEFT, ORBIS_PAD_BUTTON_RIGHT, ORBIS_PAD_BUTTON_L1, ORBIS_PAD_BUTTON_R1,
++    ORBIS_PAD_BUTTON_L2, ORBIS_PAD_BUTTON_R2, ORBIS_PAD_BUTTON_L3, ORBIS_PAD_BUTTON_R3, ORBIS_PAD_BUTTON_OPTIONS, ORBIS_PAD_BUTTON_TOUCH_PAD };
++
++const char *const PLACE_NAMES[9] = { "centre", "left", "right", "top", "bottom", "top left", "top right", "bottom left", "bottom right" };
++const char *const PLACE_KEYS[9] = { "centre", "left", "right", "top", "bottom", "top-left", "top-right", "bottom-left", "bottom-right" };
++const float PLACES[9][2] = { { 0.5f, 0.5f }, { 0.2f, 0.5f }, { 0.8f, 0.5f }, { 0.5f, 0.2f }, { 0.5f, 0.8f }, { 0.2f, 0.2f }, { 0.8f, 0.2f },
++    { 0.2f, 0.8f }, { 0.8f, 0.8f } };
++
++const char *const TOUCHPAD_NAMES[TouchpadUseCount] = { "Front screen", "Rear touch pad", "Left half front, right half rear", "Nothing" };
++const char *const TOUCHPAD_KEYS[TouchpadUseCount] = { "front", "back", "split", "off" };
++
++// The actions' names in the menus and keys in the files
++struct ActionName {
++    std::string label, key;
++};
++const std::vector<ActionName> &action_names() {
++    static const std::vector<ActionName> names = [] {
++        std::vector<ActionName> list = { { "Nothing", "none" }, { "Cross", "cross" }, { "Circle", "circle" }, { "Square", "square" },
++            { "Triangle", "triangle" }, { "Up", "up" }, { "Down", "down" }, { "Left", "left" }, { "Right", "right" }, { "L", "l" }, { "R", "r" },
++            { "START", "start" }, { "SELECT", "select" }, { "PS TV L2", "l2" }, { "PS TV R2", "r2" }, { "PS TV L3", "l3" }, { "PS TV R3", "r3" } };
++        for (int i = 0; i < 9; i++)
++            list.push_back({ std::string("Front touch, ") + PLACE_NAMES[i], std::string("front-") + PLACE_KEYS[i] });
++        for (int i = 0; i < 9; i++)
++            list.push_back({ std::string("Rear touch, ") + PLACE_NAMES[i], std::string("back-") + PLACE_KEYS[i] });
++        return list;
++    }();
++    return names;
++}
++
++std::recursive_mutex mutex;
++// the sets read, by app ("" all games'): the menus ask on every frame
++std::map<std::string, Controls> cache;
++std::string running_app;
++Controls running_controls = defaults();
++
++std::string file_of(const std::string &app_path) {
++    return std::string(DIR) + "/" + (app_path.empty() ? std::string("all") : app_path) + ".cfg";
++}
++
++bool exists(const std::string &path) {
++    struct stat st {};
++    return ::stat(path.c_str(), &st) == 0;
++}
++
++std::string trim(std::string s) {
++    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t'))
++        s.pop_back();
++    size_t start = 0;
++    while (start < s.size() && (s[start] == ' ' || s[start] == '\t'))
++        start++;
++    return s.substr(start);
++}
++
++// Reads a set, over the defaults; false if there is no file
++bool load(const std::string &path, Controls &controls) {
++    FILE *f = std::fopen(path.c_str(), "r");
++    if (!f)
++        return false;
++    char line[256];
++    while (std::fgets(line, sizeof(line), f)) {
++        const std::string text = line;
++        const size_t eq = text.find('=');
++        if (eq == std::string::npos || text[0] == '#')
++            continue;
++        const std::string key = trim(text.substr(0, eq));
++        const std::string value = trim(text.substr(eq + 1));
++        if (key == "touchpad") {
++            for (int i = 0; i < TouchpadUseCount; i++)
++                if (value == TOUCHPAD_KEYS[i])
++                    controls.touchpad = static_cast<uint8_t>(i);
++            continue;
++        }
++        for (int b = 0; b < PadButtonCount; b++) {
++            if (key != PAD_KEYS[b])
++                continue;
++            const auto &names = action_names();
++            for (size_t a = 0; a < names.size(); a++)
++                if (value == names[a].key)
++                    controls.button[b] = static_cast<uint8_t>(a);
++        }
++    }
++    std::fclose(f);
++    return true;
++}
++
++void save(const std::string &path, const Controls &controls) {
++    ::mkdir(DIR, 0777);
++    FILE *f = std::fopen(path.c_str(), "w");
++    if (!f) {
++        LOG_WARN("PS4: couldn't write {}", path);
++        return;
++    }
++    std::fprintf(f, "# HENkaku: the DualShock 4 button = what the game gets (HENkaku > Controls)\n");
++    std::fprintf(f, "touchpad = %s\n", TOUCHPAD_KEYS[std::min<int>(controls.touchpad, TouchpadUseCount - 1)]);
++    const auto &names = action_names();
++    for (int b = 0; b < PadButtonCount; b++)
++        std::fprintf(f, "%s = %s\n", PAD_KEYS[b], names[std::min<size_t>(controls.button[b], names.size() - 1)].key.c_str());
++    std::fclose(f);
++}
++
++Controls global_controls() {
++    Controls controls = defaults();
++    load(file_of({}), controls);
++    return controls;
++}
++
++// The set a change to app_path's controls goes to: its own when it has one, else all games'
++std::string target_of(const std::string &app_path) {
++    return !app_path.empty() && exists(file_of(app_path)) ? file_of(app_path) : file_of({});
++}
++
++void reload_running() {
++    cache.clear();
++    running_controls = effective(running_app);
++}
++
++// Changes one thing in the set app_path plays with
++void change(const std::string &app_path, const std::function<void(Controls &)> &edit) {
++    const std::lock_guard<std::recursive_mutex> lock(mutex);
++    Controls controls = effective(app_path);
++    edit(controls);
++    save(target_of(app_path), controls);
++    reload_running();
++}
++
++Item choice(std::string name, std::vector<std::string> values, std::function<int()> get, std::function<void(int)> set, std::string note = {}) {
++    Item item;
++    item.type = Item::kind::choice;
++    item.name = std::move(name);
++    item.values = std::move(values);
++    item.get = std::move(get);
++    item.set = std::move(set);
++    item.note = std::move(note);
++    return item;
++}
++
++Item section(std::string name) {
++    Item item;
++    item.type = Item::kind::section;
++    item.name = std::move(name);
++    return item;
++}
++
++} // namespace
++
++uint32_t pad_bit(PadButton button) {
++    return PAD_BITS[button];
++}
++
++void touch_place(int place, float &x, float &y) {
++    place = std::clamp(place, 0, 8);
++    x = PLACES[place][0];
++    y = PLACES[place][1];
++}
++
++Controls defaults() {
++    Controls controls{};
++    const uint8_t layout[PadButtonCount] = { ActCross, ActCircle, ActSquare, ActTriangle, ActUp, ActDown, ActLeft, ActRight, ActL, ActR, ActL2, ActR2,
++        ActL3, ActR3, ActStart, ActSelect };
++    std::copy(std::begin(layout), std::end(layout), controls.button);
++    controls.touchpad = TouchpadFront;
++    return controls;
++}
++
++Controls effective(const std::string &app_path) {
++    const std::lock_guard<std::recursive_mutex> lock(mutex);
++    const auto known = cache.find(app_path);
++    if (known != cache.end())
++        return known->second;
++    Controls controls = global_controls();
++    if (!app_path.empty())
++        load(file_of(app_path), controls);
++    cache[app_path] = controls;
++    return controls;
++}
++
++void set_running_app(const std::string &app_path) {
++    const std::lock_guard<std::recursive_mutex> lock(mutex);
++    running_app = app_path;
++    reload_running();
++    LOG_INFO("PS4 controls: {}", !app_path.empty() && exists(file_of(app_path)) ? "the game's own (" + file_of(app_path) + ")" : "all games' (" + file_of({}) + ")");
++}
++
++Controls running() {
++    const std::lock_guard<std::recursive_mutex> lock(mutex);
++    return running_controls;
++}
++
++std::vector<Item> items(const std::string &app_path) {
++    std::vector<Item> list;
++    if (!app_path.empty()) {
++        list.push_back(choice("Controls used", { "All games' controls", "This game's own" },
++            [app_path] {
++                const std::lock_guard<std::recursive_mutex> lock(mutex);
++                static std::map<std::string, bool> own;
++                if (!cache.contains(app_path) || !own.contains(app_path))
++                    own[app_path] = exists(file_of(app_path));
++                effective(app_path); // (fills the cache, which a change clears)
++                return own[app_path] ? 1 : 0;
++            },
++            [app_path](int value) {
++                const std::lock_guard<std::recursive_mutex> lock(mutex);
++                if (value == 1 && !exists(file_of(app_path)))
++                    save(file_of(app_path), global_controls()); // starting from all games'
++                else if (value == 0)
++                    std::remove(file_of(app_path).c_str());
++                reload_running();
++            },
++            "changes below go to the controls used"));
++    }
++
++    std::vector<std::string> touchpad_names(std::begin(TOUCHPAD_NAMES), std::end(TOUCHPAD_NAMES));
++    list.push_back(section("Touch pad"));
++    list.push_back(choice("Touch pad surface", touchpad_names,
++        [app_path] { return static_cast<int>(effective(app_path).touchpad); },
++        [app_path](int value) { change(app_path, [value](Controls &c) { c.touchpad = static_cast<uint8_t>(value); }); },
++        "the Vita's front screen or rear touch pad"));
++
++    std::vector<std::string> action_labels;
++    for (const ActionName &name : action_names())
++        action_labels.push_back(name.label);
++    list.push_back(section("Buttons (L3 + R3 together still opens this menu)"));
++    for (int b = 0; b < PadButtonCount; b++) {
++        list.push_back(choice(PAD_NAMES[b], action_labels,
++            [app_path, b] { return static_cast<int>(effective(app_path).button[b]); },
++            [app_path, b](int value) { change(app_path, [b, value](Controls &c) { c.button[b] = static_cast<uint8_t>(value); }); }));
++    }
++    Item reset;
++    reset.type = Item::kind::action;
++    reset.name = "Back to HENkaku's layout";
++    reset.run = [app_path] {
++        change(app_path, [](Controls &c) { c = defaults(); });
++    };
++    list.push_back(section("Touch: a button held = a finger on that place"));
++    list.push_back(reset);
++    return list;
++}
++
++} // namespace ps4controls
+diff --git a/vita3k/ps4/ps4_controls.h b/vita3k/ps4/ps4_controls.h
+new file mode 100644
+index 00000000..0470cd19
+--- /dev/null
++++ b/vita3k/ps4/ps4_controls.h
+@@ -0,0 +1,109 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// PS4: the controls (HENkaku > Controls, a game's own Controls, and Controls in the quick menu).
++// Each DualShock 4 button gives a Vita button, a PS TV button, a touch at one of nine places of the
++// front screen or of the rear touch pad, or nothing; the DS4's touch pad is the front screen, the
++// rear pad, both (left half and right half) or nothing. All games share one set, and a game can
++// have its own (/data/Vita3K/controls/all.cfg and <app>.cfg).
++
++#pragma once
++
++#include <overlay/pause_overlay.h>
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace ps4controls {
++
++// The DS4's buttons, in the menus' order
++enum PadButton : uint8_t {
++    PadCross,
++    PadCircle,
++    PadSquare,
++    PadTriangle,
++    PadUp,
++    PadDown,
++    PadLeft,
++    PadRight,
++    PadL1,
++    PadR1,
++    PadL2,
++    PadR2,
++    PadL3,
++    PadR3,
++    PadOptions,
++    PadTouchClick,
++    PadButtonCount
++};
++
++// What a button gives
++enum Action : uint8_t {
++    ActNone,
++    ActCross,
++    ActCircle,
++    ActSquare,
++    ActTriangle,
++    ActUp,
++    ActDown,
++    ActLeft,
++    ActRight,
++    ActL,
++    ActR,
++    ActStart,
++    ActSelect,
++    ActL2, // the PS TV's
++    ActR2,
++    ActL3,
++    ActR3,
++    ActFrontTouch, // + one of the nine places
++    ActBackTouch = ActFrontTouch + 9,
++    ActionCount = ActBackTouch + 9
++};
++
++// The DS4's touch pad
++enum TouchpadUse : uint8_t {
++    TouchpadFront,
++    TouchpadBack,
++    TouchpadSplit, // left half the front screen, right half the rear pad
++    TouchpadOff,
++    TouchpadUseCount
++};
++
++struct Controls {
++    uint8_t button[PadButtonCount];
++    uint8_t touchpad = TouchpadFront;
++};
++
++// The DS4 button's ORBIS_PAD_BUTTON_* bit
++uint32_t pad_bit(PadButton button);
++// The nine places, in tenths of the panel (x, y)
++void touch_place(int place, float &x, float &y);
++
++// HENkaku's own: the PS4 layout as on a PS TV
++Controls defaults();
++// The controls a game plays with (its own, else all games'), and those of all games
++Controls effective(const std::string &app_path);
++// Which game's controls the pad uses now ("" while no game runs), read again after each change
++void set_running_app(const std::string &app_path);
++Controls running();
++
++// The Controls page: for app_path "" all games', else that game's (with the choice of its own set)
++std::vector<overlay::pause_menu_item> items(const std::string &app_path);
++
++} // namespace ps4controls
 diff --git a/vita3k/ps4/ps4_download.cpp b/vita3k/ps4/ps4_download.cpp
 new file mode 100644
 index 00000000..923d1127
@@ -6286,10 +6695,10 @@ index 00000000..0210098f
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..8024f03b
+index 00000000..4590e9a1
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
-@@ -0,0 +1,597 @@
+@@ -0,0 +1,599 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -6323,6 +6732,7 @@ index 00000000..8024f03b
 +
 +#include "ps4_canvas.h"
 +#include "ps4_launcher.h"
++#include "ps4_controls.h"
 +#include "ps4_pad.h"
 +#include "ps4_perf.h"
 +#include "ps4_settings.h"
@@ -6717,6 +7127,7 @@ index 00000000..8024f03b
 +    // L3 + R3: the HENkaku menu, with what can change now and this game's own settings
 +    overlay::set_pause_menu({ "HENkaku", ps4settings::icon_path(), ps4settings::quick_menu(emuenv) });
 +    LOG_INFO("Game started: {} ({})", emuenv.current_app_title, request.app_path);
++    ps4controls::set_running_app(request.app_path);
 +
 +    std::optional<AppLaunchRequest> pending = emuenv.take_app_launch_request();
 +    app::LaunchRuntimeMetrics metrics{};
@@ -6725,7 +7136,7 @@ index 00000000..8024f03b
 +    auto next_flush = std::chrono::steady_clock::now();
 +    while (running) {
 +        const ps4pad::Snapshot pad = ps4pad::read();
-+        if (ps4pad::feed(emuenv, pad)) {
++        if (ps4pad::feed(emuenv, pad, session.is_paused())) {
 +            // L3 + R3: Vita3K's pause menu (Resume / Exit), or back from it
 +            if (session.is_paused())
 +                session.set_pause_reason(app::AppSessionPauseReason::All, false);
@@ -6889,10 +7300,10 @@ index 00000000..8024f03b
 +}
 diff --git a/vita3k/ps4/ps4_pad.cpp b/vita3k/ps4/ps4_pad.cpp
 new file mode 100644
-index 00000000..fcc5014c
+index 00000000..5ef89053
 --- /dev/null
 +++ b/vita3k/ps4/ps4_pad.cpp
-@@ -0,0 +1,264 @@
+@@ -0,0 +1,278 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -6914,9 +7325,12 @@ index 00000000..fcc5014c
 +//
 +// While a game runs the pad goes into Vita3K's virtual keyboard state (ctrl/state.h), which both
 +// the game's sceCtrl reads and Vita3K's own menus (overlay) merge in:
-+//   Cross/Circle/Square/Triangle, D-pad, sticks = the Vita's, L1/R1 = L/R, OPTIONS = START,
-+//   touchpad click = SELECT, touchpad = the front touch screen, L2/R2/L3/R3 = the PS TV's,
-+//   L3 + R3 together = Vita3K's pause menu (Resume / Exit).
++//   by default Cross/Circle/Square/Triangle, D-pad, sticks = the Vita's, L1/R1 = L/R, OPTIONS =
++//   START, touchpad click = SELECT, touchpad = the front touch screen, L2/R2/L3/R3 = the PS TV's;
++//   each button and the touchpad can be set otherwise (ps4_controls.h: Vita buttons, touches on the
++//   front screen or the rear touch pad), L3 + R3 together = the HENkaku menu.
++
++#include "ps4_controls.h"
 +
 +#include "ps4_pad.h"
 +
@@ -6926,6 +7340,7 @@ index 00000000..fcc5014c
 +#include <emuenv/state.h>
 +#include <motion/event_handler.h>
 +#include <touch/functions.h>
++#include <touch/state.h>
 +#include <touch/touch.h>
 +#include <util/log.h>
 +
@@ -6946,31 +7361,6 @@ index 00000000..fcc5014c
 +constexpr uint32_t MENU_COMBO = ORBIS_PAD_BUTTON_L3 | ORBIS_PAD_BUTTON_R3;
 +constexpr float STANDARD_GRAVITY = 9.80665f;
 +
-+struct ButtonMap {
-+    uint32_t pad;
-+    uint32_t vita;
-+    uint32_t vita_ext;
-+};
-+
-+const ButtonMap BUTTONS[] = {
-+    { ORBIS_PAD_BUTTON_CROSS, SCE_CTRL_CROSS, SCE_CTRL_CROSS },
-+    { ORBIS_PAD_BUTTON_CIRCLE, SCE_CTRL_CIRCLE, SCE_CTRL_CIRCLE },
-+    { ORBIS_PAD_BUTTON_SQUARE, SCE_CTRL_SQUARE, SCE_CTRL_SQUARE },
-+    { ORBIS_PAD_BUTTON_TRIANGLE, SCE_CTRL_TRIANGLE, SCE_CTRL_TRIANGLE },
-+    { ORBIS_PAD_BUTTON_UP, SCE_CTRL_UP, SCE_CTRL_UP },
-+    { ORBIS_PAD_BUTTON_DOWN, SCE_CTRL_DOWN, SCE_CTRL_DOWN },
-+    { ORBIS_PAD_BUTTON_LEFT, SCE_CTRL_LEFT, SCE_CTRL_LEFT },
-+    { ORBIS_PAD_BUTTON_RIGHT, SCE_CTRL_RIGHT, SCE_CTRL_RIGHT },
-+    { ORBIS_PAD_BUTTON_L1, SCE_CTRL_L, SCE_CTRL_L1 },
-+    { ORBIS_PAD_BUTTON_R1, SCE_CTRL_R, SCE_CTRL_R1 },
-+    { ORBIS_PAD_BUTTON_OPTIONS, SCE_CTRL_START, SCE_CTRL_START },
-+    { ORBIS_PAD_BUTTON_TOUCH_PAD, SCE_CTRL_SELECT, SCE_CTRL_SELECT },
-+    { ORBIS_PAD_BUTTON_L2, 0, SCE_CTRL_L2 },
-+    { ORBIS_PAD_BUTTON_R2, 0, SCE_CTRL_R2 },
-+    { ORBIS_PAD_BUTTON_L3, 0, SCE_CTRL_L3 },
-+    { ORBIS_PAD_BUTTON_R3, 0, SCE_CTRL_R3 },
-+};
-+
 +std::mutex lock;
 +int user = -1;
 +int handle = -1;
@@ -6979,8 +7369,6 @@ index 00000000..fcc5014c
 +// While a game runs
 +bool combo_held = false;
 +bool menu_suppress = false; // L3/R3 stay out of the game until both are released
-+Touch fingers[2];
-+uint8_t finger_count = 0;
 +
 +float stick(uint8_t v) {
 +    return std::clamp((static_cast<int>(v) - 128) / 127.f, -1.f, 1.f);
@@ -7016,35 +7404,69 @@ index 00000000..fcc5014c
 +    LOG_INFO("PS4 pad: user {:08X} on handle {}", static_cast<uint32_t>(user), handle);
 +}
 +
-+void send_touch(EmuEnvState &emuenv, Uint32 type, const Touch &t) {
-+    SDL_GamepadTouchpadEvent ev{};
-+    ev.type = static_cast<SDL_EventType>(type);
-+    ev.touchpad = 0;
-+    ev.finger = t.id;
-+    ev.x = std::clamp(t.x / TOUCHPAD_WIDTH, 0.f, 1.f);
-+    ev.y = std::clamp(t.y / TOUCHPAD_HEIGHT, 0.f, 1.f);
-+    ev.pressure = type == SDL_EVENT_GAMEPAD_TOUCHPAD_UP ? 0.f : 1.f;
-+    handle_touchpad_event(emuenv.touch, ev);
++// The fingers on each Vita panel: the touchpad's (where its use puts them) and the buttons set to
++// touch (held = a finger on their place). Ids: the touchpad's finger ids, the buttons' 64 and up.
++void update_touch(EmuEnvState &emuenv, const Snapshot &pad, const ps4controls::Controls &controls, uint32_t buttons) {
++    std::vector<Ps4TouchPoint> points[2];
++    for (uint8_t j = 0; j < pad.touch_count; j++) {
++        float x = std::clamp(pad.touch[j].x / TOUCHPAD_WIDTH, 0.f, 1.f);
++        const float y = std::clamp(pad.touch[j].y / TOUCHPAD_HEIGHT, 0.f, 1.f);
++        const uint8_t id = pad.touch[j].id % 64;
++        switch (controls.touchpad) {
++        case ps4controls::TouchpadFront:
++            points[0].push_back({ x, y, id });
++            break;
++        case ps4controls::TouchpadBack:
++            points[1].push_back({ x, y, id });
++            break;
++        case ps4controls::TouchpadSplit:
++            if (x < 0.5f)
++                points[0].push_back({ x * 2.f, y, id });
++            else
++                points[1].push_back({ (x - 0.5f) * 2.f, y, id });
++            break;
++        default:
++            break;
++        }
++    }
++    for (int b = 0; b < ps4controls::PadButtonCount; b++) {
++        const uint8_t action = controls.button[b];
++        if (action < ps4controls::ActFrontTouch || !(buttons & ps4controls::pad_bit(static_cast<ps4controls::PadButton>(b))))
++            continue;
++        const int port = action >= ps4controls::ActBackTouch ? 1 : 0;
++        const int place = action - (port ? ps4controls::ActBackTouch : ps4controls::ActFrontTouch);
++        float x, y;
++        ps4controls::touch_place(place, x, y);
++        points[port].push_back({ x, y, static_cast<uint8_t>(64 + b) });
++    }
++    ps4_set_touches(emuenv.touch, points);
 +}
 +
-+void update_touch(EmuEnvState &emuenv, const Snapshot &pad) {
-+    // lifted fingers
-+    for (uint8_t i = 0; i < finger_count; i++) {
-+        bool still = false;
-+        for (uint8_t j = 0; j < pad.touch_count; j++)
-+            still |= pad.touch[j].id == fingers[i].id;
-+        if (!still)
-+            send_touch(emuenv, SDL_EVENT_GAMEPAD_TOUCHPAD_UP, fingers[i]);
++// The Vita buttons an action gives (sceCtrl's, and the PS TV's extended set)
++void action_buttons(uint8_t action, uint32_t &vita, uint32_t &vita_ext) {
++    static const uint32_t BUTTONS[][2] = {
++        { 0, 0 }, // nothing
++        { SCE_CTRL_CROSS, SCE_CTRL_CROSS },
++        { SCE_CTRL_CIRCLE, SCE_CTRL_CIRCLE },
++        { SCE_CTRL_SQUARE, SCE_CTRL_SQUARE },
++        { SCE_CTRL_TRIANGLE, SCE_CTRL_TRIANGLE },
++        { SCE_CTRL_UP, SCE_CTRL_UP },
++        { SCE_CTRL_DOWN, SCE_CTRL_DOWN },
++        { SCE_CTRL_LEFT, SCE_CTRL_LEFT },
++        { SCE_CTRL_RIGHT, SCE_CTRL_RIGHT },
++        { SCE_CTRL_L, SCE_CTRL_L1 },
++        { SCE_CTRL_R, SCE_CTRL_R1 },
++        { SCE_CTRL_START, SCE_CTRL_START },
++        { SCE_CTRL_SELECT, SCE_CTRL_SELECT },
++        { 0, SCE_CTRL_L2 },
++        { 0, SCE_CTRL_R2 },
++        { 0, SCE_CTRL_L3 },
++        { 0, SCE_CTRL_R3 },
++    };
++    if (action < std::size(BUTTONS)) {
++        vita |= BUTTONS[action][0];
++        vita_ext |= BUTTONS[action][1];
 +    }
-+    // new and moved fingers
-+    for (uint8_t j = 0; j < pad.touch_count; j++) {
-+        bool known = false;
-+        for (uint8_t i = 0; i < finger_count; i++)
-+            known |= pad.touch[j].id == fingers[i].id;
-+        send_touch(emuenv, known ? SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION : SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN, pad.touch[j]);
-+    }
-+    finger_count = pad.touch_count;
-+    std::copy_n(pad.touch, pad.touch_count, fingers);
 +}
 +
 +void update_motion(EmuEnvState &emuenv, const Snapshot &pad) {
@@ -7110,7 +7532,7 @@ index 00000000..fcc5014c
 +    return snap;
 +}
 +
-+bool feed(EmuEnvState &emuenv, const Snapshot &pad) {
++bool feed(EmuEnvState &emuenv, const Snapshot &pad, bool menu_open) {
 +    // L3 + R3: the pause menu, and neither reaches the game until both are up again
 +    const bool combo = (pad.buttons & MENU_COMBO) == MENU_COMBO;
 +    const bool menu = combo && !combo_held;
@@ -7121,13 +7543,13 @@ index 00000000..fcc5014c
 +        menu_suppress = false;
 +    const uint32_t buttons = menu_suppress ? pad.buttons & ~MENU_COMBO : pad.buttons;
 +
++    // the menu is worked with the buttons as they are, and gets no touches
++    const ps4controls::Controls controls = menu_open ? ps4controls::defaults() : ps4controls::running();
 +    uint32_t vita = 0;
 +    uint32_t vita_ext = 0;
-+    for (const ButtonMap &b : BUTTONS) {
-+        if (buttons & b.pad) {
-+            vita |= b.vita;
-+            vita_ext |= b.vita_ext;
-+        }
++    for (int b = 0; b < ps4controls::PadButtonCount; b++) {
++        if (buttons & ps4controls::pad_bit(static_cast<ps4controls::PadButton>(b)))
++            action_buttons(controls.button[b], vita, vita_ext);
 +    }
 +    {
 +        const std::lock_guard<std::mutex> guard(emuenv.ctrl.mutex);
@@ -7140,7 +7562,10 @@ index 00000000..fcc5014c
 +        kb.axes[2] = std::clamp(stick(pad.rx) * mult, -1.f, 1.f);
 +        kb.axes[3] = std::clamp(stick(pad.ry) * mult, -1.f, 1.f);
 +    }
-+    update_touch(emuenv, pad);
++    if (menu_open)
++        update_touch(emuenv, Snapshot{}, controls, 0);
++    else
++        update_touch(emuenv, pad, controls, buttons);
 +    if (pad.connected)
 +        update_motion(emuenv, pad);
 +    return menu;
@@ -7151,7 +7576,7 @@ index 00000000..fcc5014c
 +        const std::lock_guard<std::mutex> guard(emuenv.ctrl.mutex);
 +        emuenv.ctrl.keyboard_state = {};
 +    }
-+    update_touch(emuenv, Snapshot{});
++    update_touch(emuenv, Snapshot{}, ps4controls::defaults(), 0);
 +    combo_held = false;
 +    menu_suppress = false;
 +}
@@ -7159,10 +7584,10 @@ index 00000000..fcc5014c
 +} // namespace ps4pad
 diff --git a/vita3k/ps4/ps4_pad.h b/vita3k/ps4/ps4_pad.h
 new file mode 100644
-index 00000000..ff30f0d3
+index 00000000..eac30bd6
 --- /dev/null
 +++ b/vita3k/ps4/ps4_pad.h
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,61 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -7216,9 +7641,10 @@ index 00000000..ff30f0d3
 +void init();
 +Snapshot read();
 +
-+// While a game runs: buttons, sticks, the touchpad (the Vita's front touch screen) and motion into
-+// Vita3K's input state. Returns true once each time L3 + R3 are pressed together.
-+bool feed(EmuEnvState &emuenv, const Snapshot &pad);
++// While a game runs: buttons, sticks, the touchpad and motion into Vita3K's input state, through the
++// controls (ps4_controls.h); with its menu open, the buttons as they are and no touches. Returns
++// true once each time L3 + R3 are pressed together.
++bool feed(EmuEnvState &emuenv, const Snapshot &pad, bool menu_open = false);
 +// Releases everything feed() holds (before the launcher takes over again)
 +void release(EmuEnvState &emuenv);
 +
@@ -7723,10 +8149,10 @@ index 00000000..4291971e
 +} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_settings.cpp b/vita3k/ps4/ps4_settings.cpp
 new file mode 100644
-index 00000000..ed9170d4
+index 00000000..e0ab7eef
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.cpp
-@@ -0,0 +1,642 @@
+@@ -0,0 +1,647 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -7758,6 +8184,8 @@ index 00000000..ed9170d4
 +//   from (its custom config, else the global ones).
 +
 +#include "ps4_settings.h"
++
++#include "ps4_controls.h"
 +
 +#include <app/functions.h>
 +#include <config/functions.h>
@@ -8292,6 +8720,7 @@ index 00000000..ed9170d4
 +    pages.push_back(page("Graphics", graphics_items(emuenv, scope, true, next_start), "resolution, accuracy"));
 +    pages.push_back(page("Audio", audio_items(scope, next_start), "volume"));
 +    pages.push_back(page("CPU", cpu_items(scope, true, next_start), "dynarmic, cores"));
++    pages.push_back(page("Controls", ps4controls::items({}), "buttons, touch pad, rear touch"));
 +
 +    std::vector<Item> system;
 +    system.push_back(section("Home screen"));
@@ -8319,6 +8748,7 @@ index 00000000..ed9170d4
 +    pages.push_back(page("Graphics", graphics_items(emuenv, scope, false, next_start), "resolution, accuracy"));
 +    pages.push_back(page("Audio", audio_items(scope, next_start), "volume"));
 +    pages.push_back(page("CPU", cpu_items(scope, false, next_start), "dynarmic"));
++    pages.push_back(page("Controls", ps4controls::items(app_path), "buttons, touch pad, rear touch"));
 +    pages.push_back(section("Saved in config/config_" + app_path + ".xml"));
 +    pages.push_back(action("Use the settings of all games", [scope] {
 +        const std::lock_guard<std::mutex> lock(settings_mutex);
@@ -8359,6 +8789,7 @@ index 00000000..ed9170d4
 +    items.push_back(page("Display", std::move(display), "FPS, filters, FSR 1"));
 +    items.push_back(page("Audio", std::move(sound), "volume"));
 +    items.push_back(page("Speed", std::move(speed), "shaders, FPS hack"));
++    items.push_back(page("Controls", ps4controls::items(emuenv.io.app_path), "buttons, touch pad, rear touch"));
 +    items.push_back(section("From the next start"));
 +    if (!emuenv.io.app_path.empty())
 +        items.push_back(page("This game", game_pages(emuenv, emuenv.io.app_path), "its own settings"));
@@ -10672,6 +11103,95 @@ O&CKJmIk$RTYySs3e2P^7
 literal 0
 HcmV?d00001
 
+diff --git a/vita3k/touch/include/touch/functions.h b/vita3k/touch/include/touch/functions.h
+index 043c2c78..ffc8d726 100644
+--- a/vita3k/touch/include/touch/functions.h
++++ b/vita3k/touch/include/touch/functions.h
+@@ -2,6 +2,7 @@
+ 
+ #include <touch/touch.h>
+ 
++#include <cstdint>
+ #include <vector>
+ 
+ struct EmuEnvState;
+@@ -20,3 +21,12 @@ void touch_set_force_mode(TouchState &state, int port, bool mode);
+ #ifdef __ANDROID__
+ void set_rear_touchscreen(TouchState &state, bool is_back);
+ #endif
++#ifdef __PS4__
++// PS4: the fingers on each panel (0 front, 1 rear), each at x, y from 0 to 1 of the panel, which
++// the next vsync reports (vita3k/ps4/ps4_pad.cpp: the touch pad and the buttons set to touch)
++struct Ps4TouchPoint {
++    float x, y;
++    uint8_t id;
++};
++void ps4_set_touches(TouchState &state, const std::vector<Ps4TouchPoint> (&points)[2]);
++#endif
+diff --git a/vita3k/touch/src/touch.cpp b/vita3k/touch/src/touch.cpp
+index ec982f49..5526466f 100644
+--- a/vita3k/touch/src/touch.cpp
++++ b/vita3k/touch/src/touch.cpp
+@@ -27,7 +27,9 @@
+ 
+ #include <SDL3/SDL_events.h>
+ 
++#include <algorithm>
+ #include <cstring>
++#include <mutex>
+ 
+ void set_rear_touchscreen(TouchState &state, bool is_back) {
+     state.touchscreen_port = static_cast<SceTouchPortType>(is_back);
+@@ -89,10 +91,49 @@ static SceTouchData recover_touchpad_events(const EmuEnvState &emuenv) {
+     return touch_data;
+ }
+ 
++#ifdef __PS4__
++namespace {
++std::mutex ps4_touch_mutex;
++std::vector<Ps4TouchPoint> ps4_touch_points[2];
++} // namespace
++
++void ps4_set_touches(TouchState &state, const std::vector<Ps4TouchPoint> (&points)[2]) {
++    const std::lock_guard<std::mutex> lock(ps4_touch_mutex);
++    ps4_touch_points[0] = points[0];
++    ps4_touch_points[1] = points[1];
++}
++#endif
++
+ void touch_vsync_update(EmuEnvState &emuenv) {
+     auto &touch = emuenv.touch;
+     std::chrono::time_point<std::chrono::steady_clock> ts = std::chrono::steady_clock::now();
+     uint64_t timestamp = std::chrono::duration_cast<std::chrono::microseconds>(ts.time_since_epoch()).count();
++#ifdef __PS4__
++    {
++        // both panels from the pad, as on a Vita: the front screen's 1920x1088, the rear pad's
++        // 1920 by 781 from y 108
++        const std::lock_guard<std::mutex> lock(ps4_touch_mutex);
++        SceTouchData *buffers = touch.touch_buffers[(touch.touch_buffer_idx + 1) % MAX_TOUCH_BUFFER_SAVED];
++        for (int port = 0; port < 2; port++) {
++            SceTouchData &data = buffers[port];
++            memset(&data, 0, sizeof(SceTouchData));
++            data.timeStamp = timestamp;
++            for (const Ps4TouchPoint &point : ps4_touch_points[port]) {
++                if (data.reportNum >= SCE_TOUCH_MAX_REPORT)
++                    break;
++                SceTouchReport &report = data.report[data.reportNum++];
++                report.id = point.id % 128;
++                report.force = touch.force_touch_enabled[port] ? 128 : 0;
++                report.x = static_cast<SceInt16>(std::clamp(point.x, 0.f, 1.f) * 1919);
++                report.y = port == SCE_TOUCH_PORT_FRONT ? static_cast<SceInt16>(std::clamp(point.y, 0.f, 1.f) * 1087)
++                                                        : static_cast<SceInt16>(108 + std::clamp(point.y, 0.f, 1.f) * 780);
++            }
++        }
++        touch.touch_buffer_idx++;
++        touch.touch_buffer_idx %= MAX_TOUCH_BUFFER_SAVED;
++        return;
++    }
++#endif
+ 
+     // disable mouse support on android because the touchscreen is considered as a mouse, and this creates a mess
+ #ifdef __ANDROID__
 diff --git a/vita3k/util/src/logging.cpp b/vita3k/util/src/logging.cpp
 index 816c6297..9115c351 100644
 --- a/vita3k/util/src/logging.cpp
