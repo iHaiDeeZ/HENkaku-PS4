@@ -15,6 +15,8 @@ git checkout -q "$BASE"
 git submodule update --init --recursive
 git checkout -q -B ps4
 git apply "$REPO/patches/vita3k-ps4.patch"
+# the patch moves submodules too (psvpfstools for the save data manager): check them out there
+git submodule update --init --recursive -- external/psvpfstools
 git -C external/dynarmic apply "$REPO/patches/dynarmic-ps4.patch"
 git add -A -- . ':!external/dynarmic'
 git commit -q -m "PS4 port" || true

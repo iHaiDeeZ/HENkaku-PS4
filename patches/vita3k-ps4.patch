@@ -1,5 +1,28 @@
+diff --git a/android/app/src/main/java/org/vita3k/emulator/Emulator.java b/android/app/src/main/java/org/vita3k/emulator/Emulator.java
+index 5a5fb989..b5040ade 100644
+--- a/android/app/src/main/java/org/vita3k/emulator/Emulator.java
++++ b/android/app/src/main/java/org/vita3k/emulator/Emulator.java
+@@ -573,9 +573,6 @@ public class Emulator extends SDLActivity
+                 mSurface.requestFocus();
+             }
+ 
+-            NativeImeState imeState = sessionViewModel != null ? sessionViewModel.getImeState() : null;
+-            boolean dialogActive = imeState != null && imeState.getDialogActive();
+-
+             boolean dismissedInNative = false;
+             try {
+                 dismissedInNative = NativeLib.INSTANCE.dismissIme();
+@@ -585,7 +582,7 @@ public class Emulator extends SDLActivity
+             restoreImeAfterPauseMenu = false;
+             suppressImeHiddenHandler = true;
+ 
+-            if (dismissedInNative && dialogActive) {
++            if (dismissedInNative) {
+                 imeDismissedByUser = true;
+                 applyKeyboardOverlayState(false);
+                 return;
 diff --git a/external/CMakeLists.txt b/external/CMakeLists.txt
-index 794f8368..bf2d7c72 100644
+index 794f8368..767b6e27 100644
 --- a/external/CMakeLists.txt
 +++ b/external/CMakeLists.txt
 @@ -1,5 +1,10 @@
@@ -110,7 +133,18 @@ index 794f8368..bf2d7c72 100644
  
  if(APPLE OR NOT FORCE_BUILD_OPENSSL_MAC)
  	execute_process(
-@@ -464,7 +509,7 @@ endif()
+@@ -361,6 +406,10 @@ target_link_libraries(crypto INTERFACE OpenSSL::Crypto)
+ 
+ # Must be after openssl
+ add_subdirectory(psvpfstools)
++if(PS4 AND TARGET psvpfsparser)
++	# the OpenOrbis limits.h PAGE_SIZE macro against psvpfstools' constant of that name
++	target_compile_options(psvpfsparser PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/ps4/no_page_size.h)
++endif()
+ 
+ find_package(CURL QUIET)
+ if(NOT CURL_FOUND)
+@@ -464,7 +513,7 @@ endif()
  # Use XDG desktop portals on Linux
  set(NFD_PORTAL ON)
  
@@ -119,6 +153,25 @@ index 794f8368..bf2d7c72 100644
  	# nativefiledialog-extended
  	add_subdirectory(nativefiledialog-extended)
  
+diff --git a/external/ps4/no_page_size.h b/external/ps4/no_page_size.h
+new file mode 100644
+index 00000000..ec5cbb1b
+--- /dev/null
++++ b/external/ps4/no_page_size.h
+@@ -0,0 +1,6 @@
++// PS4: the OpenOrbis limits.h defines PAGE_SIZE (and PAGESIZE), which psvpfstools names a constant
++// of its own (PfsSaveData.cpp). Included before each of its files: limits.h once, without them.
++#pragma once
++#include <limits.h>
++#undef PAGE_SIZE
++#undef PAGESIZE
+diff --git a/external/psvpfstools b/external/psvpfstools
+index e21df9a7..e9c5c7c4 160000
+--- a/external/psvpfstools
++++ b/external/psvpfstools
+@@ -1 +1 @@
+-Subproject commit e21df9a74852433f48d6593b8ef203dc7c424e05
++Subproject commit e9c5c7c4489a20ce2cb1a8b517caf00556594a12
 diff --git a/tools/gen-modules/CMakeLists.txt b/tools/gen-modules/CMakeLists.txt
 index cb1481f2..8dbb054c 100644
 --- a/tools/gen-modules/CMakeLists.txt
@@ -600,6 +653,25 @@ index 00000000..4a6f7930
 +        port.cond_var.notify_all();
 +    }
 +}
+diff --git a/vita3k/codec/src/atrac9.cpp b/vita3k/codec/src/atrac9.cpp
+index cea885af..d13e7fdc 100644
+--- a/vita3k/codec/src/atrac9.cpp
++++ b/vita3k/codec/src/atrac9.cpp
+@@ -43,7 +43,13 @@ uint32_t Atrac9DecoderState::get(DecoderQuery query) {
+     switch (query) {
+     case DecoderQuery::CHANNELS: return info->channels;
+     // The bit rate is the size of a superframe times the number of superframes per second (times 8)
+-    case DecoderQuery::BIT_RATE: return static_cast<uint32_t>((info->superframeSize * 8ULL * info->samplingRate) / (info->frameSamples * info->framesInSuperframe));
++    case DecoderQuery::BIT_RATE: {
++        // (no stream info yet: no bit rate, rather than a division by zero, #3323)
++        const uint64_t samples_per_superframe = static_cast<uint64_t>(info->frameSamples) * info->framesInSuperframe;
++        if (samples_per_superframe == 0)
++            return 0;
++        return static_cast<uint32_t>((info->superframeSize * 8ULL * info->samplingRate) / samples_per_superframe);
++    }
+     case DecoderQuery::SAMPLE_RATE: return info->samplingRate;
+     case DecoderQuery::AT9_SAMPLE_PER_FRAME: return info->frameSamples;
+     case DecoderQuery::AT9_SAMPLE_PER_SUPERFRAME: return info->frameSamples * info->framesInSuperframe;
 diff --git a/vita3k/cpu/src/dynarmic_cpu.cpp b/vita3k/cpu/src/dynarmic_cpu.cpp
 index 54e89f88..e3308cfc 100644
 --- a/vita3k/cpu/src/dynarmic_cpu.cpp
@@ -673,6 +745,1043 @@ index 6e673d1c..f84a9a8a 100644
  }
  
  static void reset_swapchain_cycle(DisplayState &display, Address sync_object) {
+diff --git a/vita3k/emuenv/include/emuenv/app_util.h b/vita3k/emuenv/include/emuenv/app_util.h
+index e701e78d..218cb05b 100644
+--- a/vita3k/emuenv/include/emuenv/app_util.h
++++ b/vita3k/emuenv/include/emuenv/app_util.h
+@@ -175,3 +175,6 @@ enum SceAppUtilErrorCode : uint32_t {
+ 
+ std::string construct_savedata0_path(const std::string &data, const char *ext = "");
+ std::string construct_slotparam_path(const unsigned int data);
++
++struct EmuEnvState;
++bool sdslot_read_slot_param(EmuEnvState &emuenv, uint32_t slot_id, SceAppUtilSaveDataSlotParam *param, const char *export_name);
+diff --git a/vita3k/gui-qt/CMakeLists.txt b/vita3k/gui-qt/CMakeLists.txt
+index c8b44e48..16502f1e 100644
+--- a/vita3k/gui-qt/CMakeLists.txt
++++ b/vita3k/gui-qt/CMakeLists.txt
+@@ -29,6 +29,7 @@ add_library(gui-qt STATIC
+     src/theme_surface.cpp
+     src/vita_theme.cpp
+     src/vita_themes_dialog.cpp
++    src/save_data_manager_dialog.cpp
+     src/trophy_collection_dialog.cpp
+     src/update_manager.cpp
+     src/gui_language.cpp
+@@ -75,6 +76,7 @@ add_library(gui-qt STATIC
+     include/gui-qt/theme_surface.h
+     include/gui-qt/vita_theme.h
+     include/gui-qt/vita_themes_dialog.h
++    include/gui-qt/save_data_manager_dialog.h
+     include/gui-qt/trophy_collection_dialog.h
+     include/gui-qt/update_manager.h
+     include/gui-qt/gui_language.h
+diff --git a/vita3k/gui-qt/include/gui-qt/main_window.h b/vita3k/gui-qt/include/gui-qt/main_window.h
+index 88dea665..a62c94ba 100644
+--- a/vita3k/gui-qt/include/gui-qt/main_window.h
++++ b/vita3k/gui-qt/include/gui-qt/main_window.h
+@@ -50,6 +50,7 @@ class QSlider;
+ class QToolBar;
+ class QVariantAnimation;
+ class TrophyCollectionDialog;
++class SaveDataManagerDialog;
+ class CtrlKeyboardFilter;
+ class DebugWidget;
+ class LiveAreaWidget;
+@@ -97,6 +98,7 @@ private slots:
+     void restart_running_app();
+     void pump_sdl_events();
+     void open_trophy_collection();
++    void open_save_data_manager();
+     void open_user_management();
+     void open_vita_themes();
+     void show_live_area(const std::string &title_id);
+@@ -186,6 +188,7 @@ private:
+     QTimer *m_sdl_pump_timer = nullptr;
+ 
+     QPointer<TrophyCollectionDialog> m_trophy_dialog;
++    QPointer<SaveDataManagerDialog> m_save_data_dialog;
+     QPointer<UserManagementDialog> m_user_mgmt_dialog;
+     CtrlKeyboardFilter *m_kb_filter = nullptr;
+     QPointer<DebugWidget> m_debug_widget;
+diff --git a/vita3k/gui-qt/include/gui-qt/save_data_manager_dialog.h b/vita3k/gui-qt/include/gui-qt/save_data_manager_dialog.h
+new file mode 100644
+index 00000000..6a45cd11
+--- /dev/null
++++ b/vita3k/gui-qt/include/gui-qt/save_data_manager_dialog.h
+@@ -0,0 +1,93 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#pragma once
++
++#include <emuenv/state.h>
++
++#include <QDialog>
++
++#include <functional>
++#include <memory>
++
++class GuiSettings;
++class QLabel;
++class QLineEdit;
++class QPushButton;
++class QSlider;
++class QSortFilterProxyModel;
++class QStandardItem;
++class QStandardItemModel;
++class QTableView;
++
++class SaveDataManagerDialog : public QDialog {
++    Q_OBJECT
++
++public:
++    SaveDataManagerDialog(EmuEnvState &emuenv, std::shared_ptr<GuiSettings> gui_settings,
++        std::function<bool()> is_app_running, QWidget *parent = nullptr);
++    ~SaveDataManagerDialog() override;
++
++public Q_SLOTS:
++    void reload();
++
++protected:
++    void closeEvent(QCloseEvent *event) override;
++    void reject() override;
++
++private:
++    enum Column {
++        Icon = 0,
++        Title,
++        Modified,
++        SaveId,
++        Notes,
++        ColumnCount
++    };
++
++    fs::path savedata_root() const;
++    fs::path selected_save_path() const;
++    QString selected_save_id() const;
++
++    void update_details();
++    void update_icon_size(int slider_value);
++    void import_from_vita();
++    void export_for_vita();
++    void delete_selected();
++    bool run_with_progress(const QString &title, const std::function<bool(const std::function<void(float)> &)> &job);
++    bool refuse_while_running();
++    void select_save(const QString &save_id);
++
++    EmuEnvState &m_emuenv;
++    std::shared_ptr<GuiSettings> m_gui_settings;
++    std::function<bool()> m_is_app_running;
++
++    QStandardItemModel *m_model = nullptr;
++    QSortFilterProxyModel *m_proxy = nullptr;
++    QTableView *m_table = nullptr;
++    QLineEdit *m_search = nullptr;
++    QSlider *m_icon_slider = nullptr;
++
++    QLabel *m_detail_icon = nullptr;
++    QLabel *m_detail_text = nullptr;
++    QPushButton *m_export_button = nullptr;
++    QPushButton *m_delete_button = nullptr;
++    QPushButton *m_open_button = nullptr;
++
++    int m_icon_size = 64;
++    bool m_busy = false;
++};
+diff --git a/vita3k/gui-qt/src/ime_keyboard_filter.cpp b/vita3k/gui-qt/src/ime_keyboard_filter.cpp
+index 1d35a787..94c6a94d 100644
+--- a/vita3k/gui-qt/src/ime_keyboard_filter.cpp
++++ b/vita3k/gui-qt/src/ime_keyboard_filter.cpp
+@@ -104,12 +104,12 @@ bool ImeKeyboardFilter::eventFilter(QObject *watched, QEvent *event) {
+ 
+                 const std::string utf8 = string_utils::utf16_to_utf8(ime.str);
+                 snprintf(dialog.ime.text, sizeof(dialog.ime.text), "%s", utf8.c_str());
+-                ime.event_id = SCE_IME_EVENT_PRESS_ENTER;
++                ime.queue_event(SCE_IME_EVENT_PRESS_ENTER);
+                 dialog.ime.status = SCE_IME_DIALOG_BUTTON_ENTER;
+                 dialog.status = SCE_COMMON_DIALOG_STATUS_FINISHED;
+                 dialog.result = SCE_COMMON_DIALOG_RESULT_OK;
+             } else {
+-                ime.event_id = SCE_IME_EVENT_PRESS_ENTER;
++                ime.queue_submit_events();
+             }
+             return true;
+ 
+@@ -118,13 +118,13 @@ bool ImeKeyboardFilter::eventFilter(QObject *watched, QEvent *event) {
+                 if (dialog.ime.cancelable) {
+                     std::lock_guard<std::recursive_mutex> dlock(dialog.mutex);
+                     std::lock_guard lock(ime.mutex);
+-                    ime.event_id = SCE_IME_EVENT_PRESS_CLOSE;
++                    ime.queue_event(SCE_IME_EVENT_PRESS_CLOSE);
+                     dialog.ime.status = SCE_IME_DIALOG_BUTTON_CLOSE;
+                     dialog.status = SCE_COMMON_DIALOG_STATUS_FINISHED;
+                     dialog.result = SCE_COMMON_DIALOG_RESULT_USER_CANCELED;
+                 }
+             } else {
+-                ime.event_id = SCE_IME_EVENT_PRESS_CLOSE;
++                ime.queue_event(SCE_IME_EVENT_PRESS_CLOSE);
+             }
+             return true;
+ 
+diff --git a/vita3k/gui-qt/src/main_window.cpp b/vita3k/gui-qt/src/main_window.cpp
+index cb2fe018..a3c3fb60 100644
+--- a/vita3k/gui-qt/src/main_window.cpp
++++ b/vita3k/gui-qt/src/main_window.cpp
+@@ -39,6 +39,7 @@
+ #include <gui-qt/physical_key_qt.h>
+ #include <gui-qt/pkg_install_dialog.h>
+ #include <gui-qt/qt_utils.h>
++#include <gui-qt/save_data_manager_dialog.h>
+ #include <gui-qt/settings_dialog.h>
+ #include <gui-qt/settings_dialog_tooltips.h>
+ #include <gui-qt/theme_manager.h>
+@@ -446,6 +447,9 @@ void MainWindow::initialize() {
+     connect(m_ui->trophy_collection_action, &QAction::triggered,
+         this, &MainWindow::open_trophy_collection);
+ 
++    connect(m_ui->save_data_manager_action, &QAction::triggered,
++        this, &MainWindow::open_save_data_manager);
++
+     connect(m_ui->vita_themes_action, &QAction::triggered,
+         this, &MainWindow::open_vita_themes);
+ 
+@@ -1432,6 +1436,14 @@ void MainWindow::open_trophy_collection() {
+     present_tool_window(m_trophy_dialog);
+ }
+ 
++void MainWindow::open_save_data_manager() {
++    if (!m_save_data_dialog) {
++        m_save_data_dialog = new SaveDataManagerDialog(emuenv, m_gui_settings, [this] { return m_game_window != nullptr; });
++        register_auxiliary_window(m_save_data_dialog);
++    }
++    present_tool_window(m_save_data_dialog);
++}
++
+ void MainWindow::open_vita_themes() {
+     if (!m_vita_themes_dialog) {
+         m_vita_themes_dialog = new VitaThemesDialog(m_gui_settings, *m_theme_manager, this);
+@@ -1454,6 +1466,8 @@ void MainWindow::open_user_management() {
+             this, [this] {
+                 if (m_trophy_dialog)
+                     m_trophy_dialog->reload();
++                if (m_save_data_dialog)
++                    m_save_data_dialog->reload();
+             });
+     }
+     present_tool_window(m_user_mgmt_dialog);
+diff --git a/vita3k/gui-qt/src/main_window.ui b/vita3k/gui-qt/src/main_window.ui
+index 651e335d..c5741f71 100644
+--- a/vita3k/gui-qt/src/main_window.ui
++++ b/vita3k/gui-qt/src/main_window.ui
+@@ -76,6 +76,7 @@
+     <addaction name="vita_themes_action"/>
+     <addaction name="trophy_collection_action"/>
+     <addaction name="patch_manager_action"/>
++    <addaction name="save_data_manager_action"/>
+     <addaction name="user_management_action"/>
+    </widget>
+    <widget class="QMenu" name="menuView">
+@@ -252,6 +253,11 @@
+     <string>Trophy Collection</string>
+    </property>
+   </action>
++  <action name="save_data_manager_action">
++   <property name="text">
++    <string>Save Data Manager</string>
++   </property>
++  </action>
+   <action name="vita_themes_action">
+    <property name="text">
+     <string>Vita Themes</string>
+diff --git a/vita3k/gui-qt/src/save_data_manager_dialog.cpp b/vita3k/gui-qt/src/save_data_manager_dialog.cpp
+new file mode 100644
+index 00000000..93fadac5
+--- /dev/null
++++ b/vita3k/gui-qt/src/save_data_manager_dialog.cpp
+@@ -0,0 +1,547 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#include <gui-qt/save_data_manager_dialog.h>
++
++#include <gui-qt/gui_settings.h>
++#include <gui-qt/qt_utils.h>
++
++#include <app/functions.h>
++#include <io/state.h>
++#include <packages/savedata.h>
++
++#include <QApplication>
++#include <QCloseEvent>
++#include <QDateTime>
++#include <QDir>
++#include <QEventLoop>
++#include <QFileDialog>
++#include <QFutureWatcher>
++#include <QHBoxLayout>
++#include <QHeaderView>
++#include <QImage>
++#include <QLabel>
++#include <QLineEdit>
++#include <QMessageBox>
++#include <QPointer>
++#include <QProgressDialog>
++#include <QPushButton>
++#include <QScrollArea>
++#include <QSlider>
++#include <QSortFilterProxyModel>
++#include <QStandardItemModel>
++#include <QTableView>
++#include <QVBoxLayout>
++#include <QtConcurrent>
++
++#include <algorithm>
++#include <map>
++
++static constexpr int RoleSort = Qt::UserRole + 1;
++static constexpr int RoleOriginalPixmap = Qt::UserRole + 2;
++static constexpr int RoleDetails = Qt::UserRole + 3;
++static constexpr int RoleAppTitle = Qt::UserRole + 4;
++static constexpr int RoleSavePath = Qt::UserRole + 5;
++
++static const QString notes_section = QStringLiteral("SaveDataNotes");
++static const GuiSave sm_geometry = GuiSave(QStringLiteral("SaveDataManager"), QStringLiteral("geometry"), QByteArray());
++static const GuiSave sm_headerState = GuiSave(QStringLiteral("SaveDataManager"), QStringLiteral("headerState"), QByteArray());
++static const GuiSave sm_iconSize = GuiSave(QStringLiteral("SaveDataManager"), QStringLiteral("iconSize"), 30);
++
++namespace {
++
++// Closing the progress dialog would lift the modal lock while the job keeps running
++class LockedProgressDialog : public QProgressDialog {
++public:
++    using QProgressDialog::QProgressDialog;
++
++protected:
++    void closeEvent(QCloseEvent *event) override { event->ignore(); }
++    void reject() override {}
++};
++
++QString format_date_time(const SceDateTime &t) {
++    return QString::asprintf("%04u-%02u-%02u %02u:%02u:%02u", t.year, t.month, t.day, t.hour, t.minute, t.second);
++}
++
++uint64_t date_time_key(const SceDateTime &t) {
++    return ((((static_cast<uint64_t>(t.year) * 13 + t.month) * 32 + t.day) * 24 + t.hour) * 60 + t.minute) * 60 + t.second;
++}
++
++QDateTime last_modified(const fs::path &dir) {
++    std::time_t newest = 0;
++    boost::system::error_code ec;
++    for (fs::recursive_directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
++        if (fs::is_regular_file(it->status()))
++            newest = std::max(newest, fs::last_write_time(it->path(), ec));
++    }
++    return QDateTime::fromSecsSinceEpoch(newest);
++}
++
++QString escape(const std::string &s) {
++    return QString::fromStdString(s).toHtmlEscaped();
++}
++
++bool is_same_or_inside(const fs::path &path, const fs::path &base) {
++    const auto canonical = [](const fs::path &p) {
++        boost::system::error_code ec;
++        const fs::path result = fs::weakly_canonical(p, ec);
++        return ec ? fs::absolute(p) : result;
++    };
++    const fs::path p = canonical(path);
++    const fs::path b = canonical(base);
++    return std::mismatch(b.begin(), b.end(), p.begin(), p.end()).first == b.end();
++}
++
++} // namespace
++
++SaveDataManagerDialog::SaveDataManagerDialog(EmuEnvState &emuenv, std::shared_ptr<GuiSettings> gui_settings,
++    std::function<bool()> is_app_running, QWidget *parent)
++    : QDialog(parent, Qt::Window)
++    , m_emuenv(emuenv)
++    , m_gui_settings(std::move(gui_settings))
++    , m_is_app_running(std::move(is_app_running)) {
++    setWindowTitle(tr("Save Data Manager"));
++    setObjectName(QStringLiteral("save_data_manager_dialog"));
++    setWindowFlag(Qt::WindowMinMaxButtonsHint, true);
++    setWindowFlag(Qt::WindowContextHelpButtonHint, false);
++    setAttribute(Qt::WA_DeleteOnClose);
++
++    m_model = new QStandardItemModel(0, ColumnCount, this);
++    m_model->setHorizontalHeaderLabels({ tr("Icon"), tr("Title & Subtitle"), tr("Last Modified"), tr("Save ID"), tr("Notes") });
++
++    m_proxy = new QSortFilterProxyModel(this);
++    m_proxy->setSourceModel(m_model);
++    m_proxy->setSortRole(RoleSort);
++    m_proxy->setFilterKeyColumn(-1);
++    m_proxy->setFilterCaseSensitivity(Qt::CaseInsensitive);
++
++    m_table = new QTableView(this);
++    m_table->setModel(m_proxy);
++    m_table->setSelectionBehavior(QAbstractItemView::SelectRows);
++    m_table->setSelectionMode(QAbstractItemView::SingleSelection);
++    m_table->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed);
++    m_table->setSortingEnabled(true);
++    m_table->setShowGrid(false);
++    m_table->setWordWrap(true);
++    m_table->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
++    m_table->verticalHeader()->setVisible(false);
++    m_table->verticalHeader()->setSectionResizeMode(QHeaderView::Fixed);
++    m_table->horizontalHeader()->setSectionResizeMode(Icon, QHeaderView::Fixed);
++    m_table->horizontalHeader()->setSectionResizeMode(Title, QHeaderView::Stretch);
++    m_table->horizontalHeader()->setSectionResizeMode(Modified, QHeaderView::ResizeToContents);
++    m_table->horizontalHeader()->setSectionResizeMode(SaveId, QHeaderView::ResizeToContents);
++    m_table->horizontalHeader()->setSectionResizeMode(Notes, QHeaderView::Interactive);
++    m_table->sortByColumn(Title, Qt::AscendingOrder);
++
++    m_detail_icon = new QLabel(this);
++    m_detail_icon->setAlignment(Qt::AlignCenter);
++    m_detail_icon->setMinimumHeight(160);
++    m_detail_text = new QLabel(this);
++    m_detail_text->setWordWrap(true);
++    m_detail_text->setTextFormat(Qt::RichText);
++    m_detail_text->setAlignment(Qt::AlignTop | Qt::AlignLeft);
++    m_detail_text->setTextInteractionFlags(Qt::TextSelectableByMouse);
++    auto *detail_scroll = new QScrollArea(this);
++    detail_scroll->setWidget(m_detail_text);
++    detail_scroll->setWidgetResizable(true);
++    detail_scroll->setFrameShape(QFrame::NoFrame);
++
++    auto *import_button = new QPushButton(tr("Import from PS Vita (Decrypt)..."), this);
++    import_button->setToolTip(tr("Decrypts a savedata folder copied from ux0:user/00/savedata on a PS Vita and adds it here."));
++    m_export_button = new QPushButton(tr("Export for PS Vita (Encrypt)..."), this);
++    m_export_button->setToolTip(tr("Encrypts the selected savedata so it can be copied back to ux0:user/00/savedata on a PS Vita."));
++    m_delete_button = new QPushButton(tr("Delete Selection"), this);
++    m_open_button = new QPushButton(tr("View Folder"), this);
++
++    auto *detail_layout = new QVBoxLayout;
++    detail_layout->addWidget(m_detail_icon);
++    detail_layout->addWidget(detail_scroll, 1);
++    detail_layout->addWidget(import_button);
++    detail_layout->addWidget(m_export_button);
++    detail_layout->addSpacing(8);
++    detail_layout->addWidget(m_delete_button);
++    detail_layout->addWidget(m_open_button);
++    auto *detail_widget = new QWidget(this);
++    detail_widget->setLayout(detail_layout);
++    detail_widget->setFixedWidth(360);
++
++    auto *top = new QHBoxLayout;
++    top->addWidget(m_table, 1);
++    top->addWidget(detail_widget);
++
++    m_search = new QLineEdit(this);
++    m_search->setClearButtonEnabled(true);
++    m_icon_slider = new QSlider(Qt::Horizontal, this);
++    m_icon_slider->setRange(0, 100);
++    m_icon_slider->setFixedWidth(240);
++    auto *close_button = new QPushButton(tr("Close"), this);
++
++    auto *bottom = new QHBoxLayout;
++    bottom->addWidget(new QLabel(tr("Search:"), this));
++    bottom->addWidget(m_search, 1);
++    bottom->addSpacing(12);
++    bottom->addWidget(new QLabel(tr("Icon size:"), this));
++    bottom->addWidget(m_icon_slider);
++    bottom->addStretch();
++    bottom->addWidget(close_button);
++
++    auto *root = new QVBoxLayout(this);
++    root->addLayout(top, 1);
++    root->addLayout(bottom);
++
++    connect(m_search, &QLineEdit::textChanged, m_proxy, &QSortFilterProxyModel::setFilterFixedString);
++    connect(m_icon_slider, &QSlider::valueChanged, this, &SaveDataManagerDialog::update_icon_size);
++    connect(m_table->selectionModel(), &QItemSelectionModel::currentRowChanged, this, &SaveDataManagerDialog::update_details);
++    connect(m_model, &QStandardItemModel::itemChanged, this, [this](QStandardItem *item) {
++        if (item->column() != Notes || item->data(RoleSort).toString() == item->text())
++            return;
++        const QString save_id = m_model->item(item->row(), SaveId)->text();
++        m_gui_settings->set_value(notes_section, save_id, item->text());
++        item->setData(item->text(), RoleSort);
++        update_details();
++    });
++    connect(import_button, &QPushButton::clicked, this, &SaveDataManagerDialog::import_from_vita);
++    connect(m_export_button, &QPushButton::clicked, this, &SaveDataManagerDialog::export_for_vita);
++    connect(m_delete_button, &QPushButton::clicked, this, &SaveDataManagerDialog::delete_selected);
++    connect(m_open_button, &QPushButton::clicked, this, [this] {
++        if (const fs::path path = selected_save_path(); !path.empty())
++            gui::utils::open_dir(path);
++    });
++    connect(close_button, &QPushButton::clicked, this, &QDialog::close);
++
++    resize(1280, 720);
++    restoreGeometry(m_gui_settings->get_value(sm_geometry).toByteArray());
++    m_icon_slider->setValue(m_gui_settings->get_value(sm_iconSize).toInt());
++    update_icon_size(m_icon_slider->value());
++
++    reload();
++    m_table->horizontalHeader()->restoreState(m_gui_settings->get_value(sm_headerState).toByteArray());
++}
++
++SaveDataManagerDialog::~SaveDataManagerDialog() {
++    m_gui_settings->set_value(sm_geometry, saveGeometry(), false);
++    m_gui_settings->set_value(sm_headerState, m_table->horizontalHeader()->saveState(), false);
++    m_gui_settings->set_value(sm_iconSize, m_icon_slider->value());
++}
++
++fs::path SaveDataManagerDialog::savedata_root() const {
++    return m_emuenv.vita_fs_path / "ux0/user" / m_emuenv.io.user_id / "savedata";
++}
++
++QString SaveDataManagerDialog::selected_save_id() const {
++    const QModelIndex current = m_table->currentIndex();
++    if (!current.isValid())
++        return {};
++    return m_proxy->index(current.row(), SaveId).data().toString();
++}
++
++fs::path SaveDataManagerDialog::selected_save_path() const {
++    const QModelIndex current = m_table->currentIndex();
++    if (!current.isValid())
++        return {};
++    return gui::utils::to_fs_path(m_proxy->index(current.row(), SaveId).data(RoleSavePath).toString());
++}
++
++void SaveDataManagerDialog::reload() {
++    const QString selected = selected_save_id();
++
++    std::map<std::string, app::AppEntry> apps;
++    for (auto &app : app::get_apps(m_emuenv))
++        apps.emplace(app.savedata, app);
++
++    m_model->removeRows(0, m_model->rowCount());
++
++    boost::system::error_code ec;
++    for (fs::directory_iterator it(savedata_root(), ec), end; !ec && it != end; it.increment(ec)) {
++        if (!fs::is_directory(it->status()))
++            continue;
++        const fs::path path = it->path();
++        const std::string save_id = path.filename().string();
++        if (save_id.starts_with('.') || path.extension() == ".tmp" || path.extension() == ".bak")
++            continue;
++        if (save_id.starts_with("NPXS") && save_id != "NPXS10007")
++            continue;
++
++        const auto app = apps.find(save_id);
++        const std::string app_title = app != apps.end() ? app->second.title : save_id;
++        auto slot_list = savedata::read_slots(path);
++        std::sort(slot_list.begin(), slot_list.end(), [](const auto &a, const auto &b) { return date_time_key(a.modified) > date_time_key(b.modified); });
++
++        QString title = QString::fromStdString(app_title);
++        if (!slot_list.empty())
++            title += QStringLiteral("\n") + QString::fromStdString(slot_list.front().title + " " + slot_list.front().subtitle).trimmed();
++
++        const bool encrypted = savedata::is_encrypted(path);
++        const bool exportable = savedata::can_export(path);
++        QString details = QStringLiteral("<b>%1</b><br>").arg(escape(app_title));
++        details += tr("Save ID: %1").arg(QString::fromStdString(save_id)) + QStringLiteral("<br>");
++        QString export_state = tr("unavailable, not created on a PS Vita");
++        if (encrypted)
++            export_state = tr("still encrypted, import it first");
++        else if (exportable)
++            export_state = tr("available");
++        details += tr("PS Vita export: %1").arg(export_state) + QStringLiteral("<br>");
++        for (const auto &entry : slot_list) {
++            details += QStringLiteral("<br><b>") + tr("Slot %1").arg(entry.id) + QStringLiteral("</b> ") + format_date_time(entry.modified).toHtmlEscaped();
++            details += QStringLiteral("<br>") + escape(entry.title);
++            if (!entry.subtitle.empty())
++                details += QStringLiteral("<br>") + escape(entry.subtitle);
++            if (!entry.detail.empty())
++                details += QStringLiteral("<br><small>") + escape(entry.detail).replace('\n', QStringLiteral("<br>")) + QStringLiteral("</small>");
++        }
++
++        // Slot times survive importing and exporting, unlike file times
++        QDateTime modified = last_modified(path);
++        if (!slot_list.empty()) {
++            const SceDateTime &t = slot_list.front().modified;
++            const QDateTime slot_time(QDate(t.year, t.month, t.day), QTime(t.hour, t.minute, t.second));
++            if (slot_time.isValid())
++                modified = slot_time;
++        }
++        const QString note = m_gui_settings->get_value(notes_section, QString::fromStdString(save_id), QString()).toString();
++
++        auto *icon_item = new QStandardItem;
++        icon_item->setEditable(false);
++        icon_item->setData(QString::fromStdString(app_title), RoleSort);
++        icon_item->setData(details, RoleDetails);
++        icon_item->setData(QString::fromStdString(app_title), RoleAppTitle);
++        auto *title_item = new QStandardItem(title);
++        title_item->setEditable(false);
++        title_item->setData(title.toLower(), RoleSort);
++        auto *modified_item = new QStandardItem(modified.toSecsSinceEpoch() > 0 ? modified.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")) : QStringLiteral("-"));
++        modified_item->setEditable(false);
++        modified_item->setData(modified, RoleSort);
++        auto *id_item = new QStandardItem(QString::fromStdString(save_id));
++        id_item->setEditable(false);
++        id_item->setData(id_item->text(), RoleSort);
++        id_item->setData(gui::utils::to_qt_path(path), RoleSavePath);
++        auto *note_item = new QStandardItem(note);
++        note_item->setData(note, RoleSort);
++        m_model->appendRow({ icon_item, title_item, modified_item, id_item, note_item });
++
++        if (app == apps.end() || app->second.icon_path.empty())
++            continue;
++        const fs::path icon_path = fs::path(app->second.icon_path).is_absolute() ? fs::path(app->second.icon_path) : m_emuenv.vita_fs_path / app->second.icon_path;
++        const QPersistentModelIndex index = m_model->indexFromItem(icon_item);
++        auto *watcher = new QFutureWatcher<QImage>(this);
++        connect(watcher, &QFutureWatcher<QImage>::finished, this, [this, watcher, index] {
++            if (index.isValid()) {
++                const QPixmap pixmap = QPixmap::fromImage(watcher->result());
++                m_model->setData(index, pixmap, RoleOriginalPixmap);
++                m_model->setData(index, pixmap.scaled(m_icon_size, m_icon_size, Qt::KeepAspectRatio, Qt::SmoothTransformation), Qt::DecorationRole);
++                if (m_table->currentIndex().isValid() && m_proxy->mapToSource(m_table->currentIndex()).row() == index.row())
++                    update_details();
++            }
++            watcher->deleteLater();
++        });
++        watcher->setFuture(QtConcurrent::run([path = gui::utils::to_qt_path(icon_path)] { return QImage(path); }));
++    }
++
++    select_save(selected);
++    update_details();
++}
++
++void SaveDataManagerDialog::select_save(const QString &save_id) {
++    for (int row = 0; row < m_proxy->rowCount(); row++) {
++        if (m_proxy->index(row, SaveId).data().toString() == save_id) {
++            m_table->selectRow(row);
++            m_table->scrollTo(m_proxy->index(row, SaveId));
++            return;
++        }
++    }
++}
++
++void SaveDataManagerDialog::update_icon_size(int slider_value) {
++    m_icon_size = 32 + slider_value * (160 - 32) / 100;
++    m_table->verticalHeader()->setDefaultSectionSize(m_icon_size + 4);
++    m_table->horizontalHeader()->resizeSection(Icon, m_icon_size + 8);
++    for (int row = 0; row < m_model->rowCount(); row++) {
++        QStandardItem *item = m_model->item(row, Icon);
++        const QPixmap pixmap = item->data(RoleOriginalPixmap).value<QPixmap>();
++        if (!pixmap.isNull())
++            item->setData(pixmap.scaled(m_icon_size, m_icon_size, Qt::KeepAspectRatio, Qt::SmoothTransformation), Qt::DecorationRole);
++    }
++}
++
++void SaveDataManagerDialog::update_details() {
++    const QModelIndex current = m_table->currentIndex();
++    const bool has_selection = current.isValid();
++    m_export_button->setEnabled(has_selection);
++    m_delete_button->setEnabled(has_selection);
++    m_open_button->setEnabled(has_selection);
++    if (!has_selection) {
++        m_detail_icon->clear();
++        m_detail_text->clear();
++        return;
++    }
++
++    const QModelIndex icon_index = m_proxy->index(current.row(), Icon);
++    const QPixmap pixmap = icon_index.data(RoleOriginalPixmap).value<QPixmap>();
++    m_detail_icon->setPixmap(pixmap.isNull() ? QPixmap() : pixmap.scaled(256, 256, Qt::KeepAspectRatio, Qt::SmoothTransformation));
++
++    QString text = icon_index.data(RoleDetails).toString();
++    text += QStringLiteral("<br>") + tr("Last modified: %1").arg(m_proxy->index(current.row(), Modified).data().toString());
++    const QString note = m_proxy->index(current.row(), Notes).data().toString();
++    if (!note.isEmpty())
++        text += QStringLiteral("<br>") + tr("Note: %1").arg(note.toHtmlEscaped());
++    m_detail_text->setText(text);
++}
++
++void SaveDataManagerDialog::closeEvent(QCloseEvent *event) {
++    if (m_busy) {
++        event->ignore();
++        return;
++    }
++    QDialog::closeEvent(event);
++}
++
++void SaveDataManagerDialog::reject() {
++    if (!m_busy)
++        QDialog::reject();
++}
++
++bool SaveDataManagerDialog::refuse_while_running() {
++    if (!m_is_app_running || !m_is_app_running())
++        return false;
++    QMessageBox::warning(this, windowTitle(), tr("Stop the running application before changing save data."));
++    return true;
++}
++
++bool SaveDataManagerDialog::run_with_progress(const QString &title, const std::function<bool(const std::function<void(float)> &)> &job) {
++    LockedProgressDialog progress(title, QString(), 0, 1000, this);
++    // Keeps the main window from launching an app or switching users mid conversion
++    progress.setWindowModality(Qt::ApplicationModal);
++    // Reaching the maximum would otherwise hide the dialog before the job returns
++    progress.setAutoReset(false);
++    progress.setAutoClose(false);
++    progress.setMinimumDuration(0);
++    progress.setValue(0);
++
++    const QPointer<QProgressDialog> guard(&progress);
++    const auto report = [guard](float value) {
++        QMetaObject::invokeMethod(qApp, [guard, value] {
++            if (guard)
++                guard->setValue(static_cast<int>(value * 1000));
++        });
++    };
++
++    QFutureWatcher<bool> watcher;
++    QEventLoop loop;
++    connect(&watcher, &QFutureWatcher<bool>::finished, &loop, &QEventLoop::quit);
++    watcher.setFuture(QtConcurrent::run([job, report] { return job(report); }));
++    m_busy = true;
++    loop.exec();
++    m_busy = false;
++    return watcher.result();
++}
++
++void SaveDataManagerDialog::import_from_vita() {
++    if (refuse_while_running())
++        return;
++
++    const QString dir = QFileDialog::getExistingDirectory(this, tr("Select a savedata folder copied from a PS Vita (ux0:user/00/savedata/<ID>)"));
++    if (dir.isEmpty())
++        return;
++
++    const fs::path src = gui::utils::to_fs_path(dir);
++    if (!savedata::is_encrypted(src)) {
++        QMessageBox::warning(this, windowTitle(), tr("This folder has no sce_pfs/files.db, so it is not an encrypted PS Vita savedata folder.\n\nCopy the whole ux0:user/00/savedata/<ID> folder from the PS Vita without opening it."));
++        return;
++    }
++
++    const QString save_id = QString::fromStdWString(src.filename().wstring());
++    const fs::path dst = savedata_root() / save_id.toStdString();
++    if (fs::exists(dst)
++        && QMessageBox::question(this, windowTitle(), tr("Save data %1 already exists. Replace it with the imported one?").arg(save_id), QMessageBox::Yes | QMessageBox::No, QMessageBox::No)
++            != QMessageBox::Yes)
++        return;
++
++    std::string error;
++    const bool ok = run_with_progress(tr("Decrypting %1...").arg(save_id), [&](const auto &progress) {
++        return savedata::import_encrypted(src, dst, progress, error);
++    });
++    if (!ok) {
++        QMessageBox::critical(this, windowTitle(), tr("Failed to decrypt the save data.\n\n%1").arg(QString::fromStdString(error)));
++        return;
++    }
++
++    reload();
++    select_save(save_id);
++}
++
++void SaveDataManagerDialog::export_for_vita() {
++    if (refuse_while_running())
++        return;
++
++    const fs::path src = selected_save_path();
++    const QString save_id = selected_save_id();
++    if (src.empty())
++        return;
++
++    if (!savedata::can_export(src)) {
++        QMessageBox::warning(this, windowTitle(), tr("This save data cannot be encrypted for a PS Vita.\n\n"
++                                                     "Only save data that was imported from a PS Vita has the sce_sys/sealedkey, keystone and param.sfo the console needs. "
++                                                     "Import the game's save data from your PS Vita once, play with it here, then export it."));
++        return;
++    }
++
++    const QString dir = QFileDialog::getExistingDirectory(this, tr("Select where to write the encrypted save data"));
++    if (dir.isEmpty())
++        return;
++
++    const fs::path dst = gui::utils::to_fs_path(dir) / save_id.toStdString();
++    if (is_same_or_inside(dst, src) || is_same_or_inside(src, dst) || is_same_or_inside(dst, m_emuenv.vita_fs_path / "ux0/user")) {
++        QMessageBox::warning(this, windowTitle(), tr("Choose a folder outside Vita3K's save data. Writing the encrypted copy there would replace the save data Vita3K uses."));
++        return;
++    }
++    if (fs::exists(dst)
++        && QMessageBox::question(this, windowTitle(), tr("%1 already exists. Overwrite it?").arg(QDir::toNativeSeparators(gui::utils::to_qt_path(dst))), QMessageBox::Yes | QMessageBox::No, QMessageBox::No)
++            != QMessageBox::Yes)
++        return;
++
++    std::string error;
++    const bool ok = run_with_progress(tr("Encrypting %1...").arg(save_id), [&](const auto &progress) {
++        return savedata::export_encrypted(src, dst, progress, error);
++    });
++    if (!ok) {
++        QMessageBox::critical(this, windowTitle(), tr("Failed to encrypt the save data.\n\n%1").arg(QString::fromStdString(error)));
++        return;
++    }
++
++    QMessageBox::information(this, windowTitle(), tr("Encrypted save data was written to:\n%1\n\nCopy this folder to ux0:user/00/savedata/ on your PS Vita, replacing the existing one.").arg(QDir::toNativeSeparators(gui::utils::to_qt_path(dst))));
++}
++
++void SaveDataManagerDialog::delete_selected() {
++    if (refuse_while_running())
++        return;
++
++    const fs::path path = selected_save_path();
++    if (path.empty())
++        return;
++
++    const QString title = m_proxy->index(m_table->currentIndex().row(), Icon).data(RoleAppTitle).toString();
++    if (QMessageBox::question(this, windowTitle(), tr("Delete the save data of %1 (%2)?\n\nThis action cannot be undone.").arg(title, selected_save_id()), QMessageBox::Yes | QMessageBox::No, QMessageBox::No)
++        != QMessageBox::Yes)
++        return;
++
++    boost::system::error_code ec;
++    fs::remove_all(path, ec);
++    if (ec)
++        QMessageBox::critical(this, windowTitle(), tr("Failed to delete the save data.\n\n%1").arg(QString::fromStdString(ec.message())));
++    reload();
++}
+diff --git a/vita3k/gxm/src/textures.cpp b/vita3k/gxm/src/textures.cpp
+index 419c360d..d9afb20c 100644
+--- a/vita3k/gxm/src/textures.cpp
++++ b/vita3k/gxm/src/textures.cpp
+@@ -362,7 +362,9 @@ bool convert_color_format_to_texture_format(SceGxmColorFormat format, SceGxmText
+         { SCE_GXM_COLOR_FORMAT_U10U10U10U2_RGBA, SCE_GXM_TEXTURE_FORMAT_U10U10U10U2_RGBA },
+         { SCE_GXM_COLOR_FORMAT_U10U10U10U2_BGRA, SCE_GXM_TEXTURE_FORMAT_U10U10U10U2_BGRA },
+         { SCE_GXM_COLOR_FORMAT_U8_R, SCE_GXM_TEXTURE_FORMAT_U8_R },
++        { SCE_GXM_COLOR_FORMAT_U8_A, SCE_GXM_TEXTURE_FORMAT_U8_R000 },
+         { SCE_GXM_COLOR_FORMAT_S8_R, SCE_GXM_TEXTURE_FORMAT_S8_R },
++        { SCE_GXM_COLOR_FORMAT_S8_A, SCE_GXM_TEXTURE_FORMAT_S8_R000 },
+         { SCE_GXM_COLOR_FORMAT_S5S5U6_RGB, SCE_GXM_TEXTURE_FORMAT_S5S5U6_RGB },
+         { SCE_GXM_COLOR_FORMAT_U8U8_GR, SCE_GXM_TEXTURE_FORMAT_U8U8_GR },
+         { SCE_GXM_COLOR_FORMAT_S8S8_GR, SCE_GXM_TEXTURE_FORMAT_S8S8_GR },
+diff --git a/vita3k/ime/include/ime/state.h b/vita3k/ime/include/ime/state.h
+index bab5499e..21310cbb 100644
+--- a/vita3k/ime/include/ime/state.h
++++ b/vita3k/ime/include/ime/state.h
+@@ -19,6 +19,7 @@
+ 
+ #include <ime/types.h>
+ 
++#include <deque>
+ #include <mutex>
+ #include <string>
+ #include <vector>
+@@ -50,7 +51,35 @@ struct Ime {
+     std::u16string str;
+     uint32_t caps_level = 0;
+     uint32_t caretIndex = 0;
+-    uint32_t event_id = SCE_IME_EVENT_OPEN;
++    std::deque<uint32_t> pending_events;
++    bool terminal_event_pending = false;
++
++    static bool is_terminal_event(uint32_t id) {
++        return id == SCE_IME_EVENT_PRESS_ENTER || id == SCE_IME_EVENT_PRESS_CLOSE;
++    }
++
++    bool queue_event(uint32_t id) {
++        if (terminal_event_pending)
++            return false;
++        if (!is_terminal_event(id) && !pending_events.empty() && pending_events.back() == id)
++            return true;
++        pending_events.push_back(id);
++        terminal_event_pending = is_terminal_event(id);
++        return true;
++    }
++
++    void queue_submit_events() {
++        if (terminal_event_pending)
++            return;
++        pending_events.push_back(SCE_IME_EVENT_PRESS_ENTER);
++        pending_events.push_back(SCE_IME_EVENT_PRESS_CLOSE);
++        terminal_event_pending = true;
++    }
++
++    void clear_pending_event() {
++        pending_events.clear();
++        terminal_event_pending = false;
++    }
+ 
+     void deinit() {
+         state = false;
+@@ -60,6 +89,6 @@ struct Ime {
+         str.clear();
+         caps_level = 0;
+         caretIndex = 0;
+-        event_id = SCE_IME_EVENT_OPEN;
++        clear_pending_event();
+     }
+ };
+\ No newline at end of file
+diff --git a/vita3k/ime/src/active_ime.cpp b/vita3k/ime/src/active_ime.cpp
+index b2f42dc3..ebc529dc 100644
+--- a/vita3k/ime/src/active_ime.cpp
++++ b/vita3k/ime/src/active_ime.cpp
+@@ -74,7 +74,7 @@ bool submit_current_ime(EmuEnvState &emuenv) {
+         finish_ime_dialog(emuenv);
+     } else {
+         std::lock_guard<std::mutex> lock(emuenv.ime.mutex);
+-        emuenv.ime.event_id = SCE_IME_EVENT_PRESS_ENTER;
++        emuenv.ime.queue_submit_events();
+     }
+ 
+     return true;
+@@ -90,7 +90,7 @@ bool dismiss_current_ime(EmuEnvState &emuenv) {
+             return false;
+     } else {
+         std::lock_guard<std::mutex> lock(emuenv.ime.mutex);
+-        emuenv.ime.event_id = SCE_IME_EVENT_PRESS_CLOSE;
++        emuenv.ime.queue_event(SCE_IME_EVENT_PRESS_CLOSE);
+     }
+ 
+     return true;
+diff --git a/vita3k/ime/src/ime.cpp b/vita3k/ime/src/ime.cpp
+index b7fb911a..15a5ca7c 100644
+--- a/vita3k/ime/src/ime.cpp
++++ b/vita3k/ime/src/ime.cpp
+@@ -20,7 +20,7 @@
+ #include <algorithm>
+ 
+ void ime_commit_text(Ime &ime, const std::u16string &text) {
+-    if (text.empty())
++    if (text.empty() || ime.terminal_event_pending)
+         return;
+ 
+     if (ime.edit_text.preeditLength > 0) {
+@@ -44,10 +44,13 @@ void ime_commit_text(Ime &ime, const std::u16string &text) {
+     ime.edit_text.preeditLength = 0;
+     ime.edit_text.editLengthChange = 0;
+ 
+-    ime.event_id = SCE_IME_EVENT_UPDATE_TEXT;
++    ime.queue_event(SCE_IME_EVENT_UPDATE_TEXT);
+ }
+ 
+ void ime_set_preedit(Ime &ime, const std::u16string &preedit) {
++    if (ime.terminal_event_pending)
++        return;
++
+     if (ime.edit_text.preeditLength > 0) {
+         ime.str.erase(ime.edit_text.preeditIndex, ime.edit_text.preeditLength);
+         ime.edit_text.caretIndex = ime.edit_text.preeditIndex;
+@@ -57,7 +60,7 @@ void ime_set_preedit(Ime &ime, const std::u16string &preedit) {
+     if (preedit.empty()) {
+         ime.edit_text.editLengthChange = 0;
+         ime.caretIndex = ime.edit_text.caretIndex;
+-        ime.event_id = SCE_IME_EVENT_UPDATE_TEXT;
++        ime.queue_event(SCE_IME_EVENT_UPDATE_TEXT);
+         return;
+     }
+ 
+@@ -73,10 +76,13 @@ void ime_set_preedit(Ime &ime, const std::u16string &preedit) {
+     ime.edit_text.editLengthChange = static_cast<int32_t>(preedit_len);
+     ime.edit_text.caretIndex += preedit_len;
+ 
+-    ime.event_id = SCE_IME_EVENT_UPDATE_TEXT;
++    ime.queue_event(SCE_IME_EVENT_UPDATE_TEXT);
+ }
+ 
+ void ime_cursor_left(Ime &ime) {
++    if (ime.terminal_event_pending)
++        return;
++
+     if (ime.edit_text.preeditLength > 0) {
+         ime.str.erase(ime.edit_text.preeditIndex, ime.edit_text.preeditLength);
+         ime.edit_text.caretIndex = ime.edit_text.preeditIndex;
+@@ -89,10 +95,13 @@ void ime_cursor_left(Ime &ime) {
+         --ime.edit_text.caretIndex;
+     ime.caretIndex = ime.edit_text.caretIndex;
+     ime.edit_text.preeditIndex = ime.edit_text.caretIndex;
+-    ime.event_id = SCE_IME_EVENT_UPDATE_CARET;
++    ime.queue_event(SCE_IME_EVENT_UPDATE_CARET);
+ }
+ 
+ void ime_cursor_right(Ime &ime) {
++    if (ime.terminal_event_pending)
++        return;
++
+     if (ime.edit_text.preeditLength > 0) {
+         ime.str.erase(ime.edit_text.preeditIndex, ime.edit_text.preeditLength);
+         ime.edit_text.caretIndex = ime.edit_text.preeditIndex;
+@@ -105,17 +114,20 @@ void ime_cursor_right(Ime &ime) {
+         ++ime.edit_text.caretIndex;
+     ime.caretIndex = ime.edit_text.caretIndex;
+     ime.edit_text.preeditIndex = ime.edit_text.caretIndex;
+-    ime.event_id = SCE_IME_EVENT_UPDATE_CARET;
++    ime.queue_event(SCE_IME_EVENT_UPDATE_CARET);
+ }
+ 
+ void ime_backspace(Ime &ime) {
++    if (ime.terminal_event_pending)
++        return;
++
+     if (ime.edit_text.preeditLength > 0) {
+         ime.str.erase(ime.edit_text.preeditIndex, ime.edit_text.preeditLength);
+         ime.edit_text.caretIndex = ime.edit_text.preeditIndex;
+         ime.edit_text.preeditLength = 0;
+         ime.edit_text.editLengthChange = 0;
+         ime.caretIndex = ime.edit_text.caretIndex;
+-        ime.event_id = SCE_IME_EVENT_UPDATE_TEXT;
++        ime.queue_event(SCE_IME_EVENT_UPDATE_TEXT);
+         return;
+     }
+ 
+@@ -127,7 +139,7 @@ void ime_backspace(Ime &ime) {
+     --ime.edit_text.caretIndex;
+     ime.caretIndex = ime.edit_text.caretIndex;
+     ime.edit_text.preeditIndex = ime.edit_text.caretIndex;
+-    ime.event_id = SCE_IME_EVENT_UPDATE_TEXT;
++    ime.queue_event(SCE_IME_EVENT_UPDATE_TEXT);
+ }
+ 
+ std::vector<std::pair<SceImeLanguage, std::string>>::const_iterator
+diff --git a/vita3k/interface.cpp b/vita3k/interface.cpp
+index 453f2d9a..133abedf 100644
+--- a/vita3k/interface.cpp
++++ b/vita3k/interface.cpp
+@@ -181,7 +181,10 @@ static bool install_archive_content(EmuEnvState &emuenv, const ZipPtr &zip, cons
+ 
+     auto output_path{ emuenv.vita_fs_path / "ux0" };
+     if (mz_zip_reader_extract_file_to_callback(zip.get(), (content_path + sfo_path).c_str(), &write_to_buffer, &buffer, 0)) {
+-        sfo::get_param_info(emuenv.app_info, buffer, emuenv.cfg.sys_lang);
++        if (!sfo::get_param_info(emuenv.app_info, buffer, emuenv.cfg.sys_lang)) {
++            LOG_ERROR("{}{} is not a readable param.sfo, not installing it", content_path, sfo_path);
++            return false;
++        }
+         if (!set_content_path(emuenv, is_theme, output_path))
+             return false;
+     } else if (is_theme) {
+@@ -370,7 +373,10 @@ static bool install_content(EmuEnvState &emuenv, const fs::path &content_path) {
+     const auto is_theme = fs::exists(theme_path);
+     auto dst_path{ emuenv.vita_fs_path / "ux0" };
+     if (fs_utils::read_data(sfo_path, buffer)) {
+-        sfo::get_param_info(emuenv.app_info, buffer, emuenv.cfg.sys_lang);
++        if (!sfo::get_param_info(emuenv.app_info, buffer, emuenv.cfg.sys_lang)) {
++            LOG_ERROR("{} is not a readable param.sfo, not installing it", fs_utils::path_to_utf8(sfo_path));
++            return false;
++        }
+         if (!set_content_path(emuenv, is_theme, dst_path))
+             return false;
+ 
 diff --git a/vita3k/io/include/io/vfs.h b/vita3k/io/include/io/vfs.h
 index 1222b690..6697043c 100644
 --- a/vita3k/io/include/io/vfs.h
@@ -1090,6 +2199,32 @@ index 2e2bd287..659ab47a 100644
  	add_executable(
  		mem-tests
  		tests/allocator_tests.cpp
+diff --git a/vita3k/mem/src/allocator.cpp b/vita3k/mem/src/allocator.cpp
+index b6b9d5b9..04562b1f 100644
+--- a/vita3k/mem/src/allocator.cpp
++++ b/vita3k/mem/src/allocator.cpp
+@@ -102,7 +102,10 @@ int BitmapAllocator::allocate_from(const std::uint32_t start_offset, std::uint32
+         return -1;
+     }
+ 
++    if ((start_offset >> 5) >= words.size())
++        return -1;
+     std::uint32_t *word = &words[0] + (start_offset >> 5);
++    std::uint32_t *const first_word = word;
+ 
+     // We have arrived at le word that still have free position (bit 1)
+     std::uint32_t *word_end = &words[words.size() - 1];
+@@ -121,7 +124,9 @@ int BitmapAllocator::allocate_from(const std::uint32_t start_offset, std::uint32
+             int boff = 0;
+             std::uint32_t *bword = nullptr;
+ 
+-            int cursor = 31;
++            // (slot n is bit 31 - n of its word: in the first word, the slots before start_offset
++            // aren't looked at, #4282)
++            int cursor = word == first_word ? 31 - static_cast<int>(start_offset & 31) : 31;
+ 
+             while (cursor >= 0) {
+                 if (((wv >> cursor) & 1) == 1) {
 diff --git a/vita3k/mem/src/mem.cpp b/vita3k/mem/src/mem.cpp
 index 28bc81bf..e125fbc6 100644
 --- a/vita3k/mem/src/mem.cpp
@@ -1487,6 +2622,356 @@ index 515edbf3..7c862e08 100644
          std::vector<std::string> exec_argv;
          if (argv && argv->get(emuenv.mem)) {
              size_t args = 0;
+diff --git a/vita3k/modules/SceAppUtil/SceAppUtil.cpp b/vita3k/modules/SceAppUtil/SceAppUtil.cpp
+index 46f4c9d7..380a2227 100644
+--- a/vita3k/modules/SceAppUtil/SceAppUtil.cpp
++++ b/vita3k/modules/SceAppUtil/SceAppUtil.cpp
+@@ -38,6 +38,7 @@
+ 
+ #include <algorithm>
+ #include <cstring>
++#include <vector>
+ 
+ TRACY_MODULE_NAME(SceAppUtil);
+ 
+@@ -247,6 +248,131 @@ std::string construct_slotparam_path(const unsigned int data) {
+     return construct_savedata0_path("SlotParam_" + std::to_string(data), "bin");
+ }
+ 
++// sdslot.dat: magic at 0x0, per-slot flag at 0x200 + id, slot param at 0x400 + id * 0x400
++static constexpr uint32_t SDSLOT_MAX_SLOTS = 256;
++static constexpr uint32_t SDSLOT_FLAG_BASE = 0x200;
++static constexpr uint32_t SDSLOT_DATA_BASE = 0x400;
++static constexpr uint32_t SDSLOT_BLOCK_SIZE = 0x400;
++static constexpr uint32_t SDSLOT_PARAM_SIZE = sizeof(SceAppUtilSaveDataSlotParam);
++static constexpr size_t SDSLOT_TOTAL_SIZE = SDSLOT_DATA_BASE + static_cast<size_t>(SDSLOT_MAX_SLOTS) * SDSLOT_BLOCK_SIZE;
++
++static constexpr uint8_t SDSLOT_MAGIC[10] = { 'S', 'D', 'S', 'L', 0, 0, 0, 0, 0, 1 };
++
++static_assert(SDSLOT_PARAM_SIZE == 844);
++
++static std::string construct_sdslot_path() {
++    return construct_savedata0_path("sce_sys/sdslot", "dat");
++}
++
++static SceOff sdslot_flag_offset(uint32_t slot_id) {
++    return static_cast<SceOff>(SDSLOT_FLAG_BASE) + slot_id;
++}
++
++static SceOff sdslot_data_offset(uint32_t slot_id) {
++    return static_cast<SceOff>(SDSLOT_DATA_BASE) + static_cast<SceOff>(slot_id) * SDSLOT_BLOCK_SIZE;
++}
++
++static void sdslot_load_existing(EmuEnvState &emuenv, std::vector<uint8_t> &buf, const char *export_name) {
++    const auto fd = open_file(emuenv.io, construct_sdslot_path().c_str(), SCE_O_RDONLY, emuenv.vita_fs_path, export_name);
++    const SceOff size = seek_file(fd, 0, SCE_SEEK_END, emuenv.io, export_name);
++    seek_file(fd, 0, SCE_SEEK_SET, emuenv.io, export_name);
++    read_file(buf.data(), emuenv.io, fd, static_cast<SceSize>(std::clamp<SceOff>(size, 0, SDSLOT_TOTAL_SIZE)), export_name);
++    close_file(emuenv.io, fd, export_name);
++}
++
++static void sdslot_import_legacy(EmuEnvState &emuenv, std::vector<uint8_t> &buf, const char *export_name) {
++    for (uint32_t i = 0; i < SDSLOT_MAX_SLOTS; i++) {
++        const auto fd = open_file(emuenv.io, construct_slotparam_path(i).c_str(), SCE_O_RDONLY, emuenv.vita_fs_path, export_name);
++        if (fd < 0)
++            continue;
++        if (read_file(buf.data() + sdslot_data_offset(i), emuenv.io, fd, SDSLOT_PARAM_SIZE, export_name) == static_cast<int>(SDSLOT_PARAM_SIZE))
++            buf[sdslot_flag_offset(i)] = 1;
++        close_file(emuenv.io, fd, export_name);
++    }
++}
++
++// The VFS ignores SCE_O_TRUNC, so a file of the wrong size is removed before being rewritten.
++static bool sdslot_ensure_file(EmuEnvState &emuenv, const char *export_name) {
++    const auto path = construct_sdslot_path();
++    const auto fd = open_file(emuenv.io, path.c_str(), SCE_O_RDONLY, emuenv.vita_fs_path, export_name);
++    const bool exists = fd >= 0;
++    if (exists) {
++        const SceOff size = seek_file(fd, 0, SCE_SEEK_END, emuenv.io, export_name);
++        close_file(emuenv.io, fd, export_name);
++        if (size == static_cast<SceOff>(SDSLOT_TOTAL_SIZE))
++            return true;
++    }
++
++    std::vector<uint8_t> buf(SDSLOT_TOTAL_SIZE, 0);
++    if (exists) {
++        sdslot_load_existing(emuenv, buf, export_name);
++        remove_file(emuenv.io, path.c_str(), emuenv.vita_fs_path, export_name);
++    } else {
++        sdslot_import_legacy(emuenv, buf, export_name);
++    }
++    std::memcpy(buf.data(), SDSLOT_MAGIC, sizeof(SDSLOT_MAGIC));
++
++    const auto out = open_file(emuenv.io, path.c_str(), SCE_O_WRONLY | SCE_O_CREAT, emuenv.vita_fs_path, export_name);
++    if (out < 0)
++        return false;
++    const int written = write_file(out, buf.data(), static_cast<SceSize>(buf.size()), emuenv.io, export_name);
++    close_file(emuenv.io, out, export_name);
++    return written == static_cast<int>(buf.size());
++}
++
++bool sdslot_read_slot_param(EmuEnvState &emuenv, uint32_t slot_id, SceAppUtilSaveDataSlotParam *param, const char *export_name) {
++    if (slot_id >= SDSLOT_MAX_SLOTS)
++        return false;
++
++    const auto fd = open_file(emuenv.io, construct_sdslot_path().c_str(), SCE_O_RDONLY, emuenv.vita_fs_path, export_name);
++    if (fd < 0) {
++        const auto legacy_fd = open_file(emuenv.io, construct_slotparam_path(slot_id).c_str(), SCE_O_RDONLY, emuenv.vita_fs_path, export_name);
++        if (legacy_fd < 0)
++            return false;
++        const int n = read_file(param, emuenv.io, legacy_fd, SDSLOT_PARAM_SIZE, export_name);
++        close_file(emuenv.io, legacy_fd, export_name);
++        return n == static_cast<int>(SDSLOT_PARAM_SIZE);
++    }
++
++    uint8_t flag = 0;
++    seek_file(fd, sdslot_flag_offset(slot_id), SCE_SEEK_SET, emuenv.io, export_name);
++    read_file(&flag, emuenv.io, fd, sizeof(flag), export_name);
++    int n = 0;
++    if (flag != 0) {
++        seek_file(fd, sdslot_data_offset(slot_id), SCE_SEEK_SET, emuenv.io, export_name);
++        n = read_file(param, emuenv.io, fd, SDSLOT_PARAM_SIZE, export_name);
++    }
++    close_file(emuenv.io, fd, export_name);
++    return n == static_cast<int>(SDSLOT_PARAM_SIZE);
++}
++
++static bool sdslot_write_slot(EmuEnvState &emuenv, uint32_t slot_id, const void *data, const char *export_name) {
++    if (slot_id >= SDSLOT_MAX_SLOTS || !sdslot_ensure_file(emuenv, export_name))
++        return false;
++
++    const auto fd = open_file(emuenv.io, construct_sdslot_path().c_str(), SCE_O_WRONLY, emuenv.vita_fs_path, export_name);
++    if (fd < 0)
++        return false;
++    std::vector<uint8_t> block(SDSLOT_BLOCK_SIZE, 0);
++    if (data)
++        std::memcpy(block.data(), data, SDSLOT_PARAM_SIZE);
++    const uint8_t flag = data ? 1 : 0;
++    seek_file(fd, sdslot_flag_offset(slot_id), SCE_SEEK_SET, emuenv.io, export_name);
++    bool ok = write_file(fd, &flag, sizeof(flag), emuenv.io, export_name) == sizeof(flag);
++    seek_file(fd, sdslot_data_offset(slot_id), SCE_SEEK_SET, emuenv.io, export_name);
++    ok &= write_file(fd, block.data(), SDSLOT_BLOCK_SIZE, emuenv.io, export_name) == static_cast<int>(SDSLOT_BLOCK_SIZE);
++    close_file(emuenv.io, fd, export_name);
++    return ok;
++}
++
++static bool sdslot_write_slot_param(EmuEnvState &emuenv, uint32_t slot_id, const SceAppUtilSaveDataSlotParam *param, const char *export_name) {
++    return sdslot_write_slot(emuenv, slot_id, param, export_name);
++}
++
++static bool sdslot_delete_slot(EmuEnvState &emuenv, uint32_t slot_id, const char *export_name) {
++    return sdslot_write_slot(emuenv, slot_id, nullptr, export_name);
++}
++
+ EXPORT(int, sceAppUtilSaveDataDataRemove, SceAppUtilSaveDataFileSlot *slot, SceAppUtilSaveDataRemoveItem *files, unsigned int fileNum, SceAppUtilMountPoint *mountPoint) {
+     TRACY_FUNC(sceAppUtilSaveDataDataRemove, slot, files, fileNum, mountPoint);
+ 
+@@ -262,7 +388,7 @@ EXPORT(int, sceAppUtilSaveDataDataRemove, SceAppUtilSaveDataFileSlot *slot, SceA
+     }
+ 
+     if (slot && files[0].mode == SCE_APPUTIL_SAVEDATA_DATA_REMOVE_MODE_DEFAULT) {
+-        remove_file(emuenv.io, construct_slotparam_path(slot->id).c_str(), emuenv.vita_fs_path, export_name);
++        sdslot_delete_slot(emuenv, slot->id, export_name);
+     }
+ 
+     return 0;
+@@ -314,11 +440,8 @@ EXPORT(int, sceAppUtilSaveDataDataSave, SceAppUtilSaveDataFileSlot *slot, SceApp
+         tm local = {};
+ 
+         if (!slot->slotParam) {
+-            fd = open_file(emuenv.io, construct_slotparam_path(slot->id).c_str(), SCE_O_RDONLY, emuenv.vita_fs_path, export_name);
+-            if (fd < 0)
++            if (!sdslot_read_slot_param(emuenv, slot->id, slot_param, export_name))
+                 return 0;
+-            read_file(slot_param, emuenv.io, fd, sizeof(SceAppUtilSaveDataSlotParam), export_name);
+-            close_file(emuenv.io, fd, export_name);
+         }
+ 
+         SAFE_LOCALTIME(&time, &local);
+@@ -329,9 +452,8 @@ EXPORT(int, sceAppUtilSaveDataDataSave, SceAppUtilSaveDataFileSlot *slot, SceApp
+         modified_time.minute = local.tm_min;
+         modified_time.second = local.tm_sec;
+         slot_param->modifiedTime = modified_time;
+-        fd = open_file(emuenv.io, construct_slotparam_path(slot->id).c_str(), SCE_O_WRONLY | SCE_O_CREAT, emuenv.vita_fs_path, export_name);
+-        write_file(fd, slot_param, sizeof(SceAppUtilSaveDataSlotParam), emuenv.io, export_name);
+-        close_file(emuenv.io, fd, export_name);
++        if (!sdslot_write_slot_param(emuenv, slot->id, slot_param, export_name))
++            return RET_ERROR(SCE_APPUTIL_ERROR_SAVEDATA_NO_SPACE_FS);
+     }
+ 
+     return 0;
+@@ -372,25 +494,21 @@ EXPORT(int, sceAppUtilSaveDataMount) {
+ 
+ EXPORT(int, sceAppUtilSaveDataSlotCreate, unsigned int slotId, SceAppUtilSaveDataSlotParam *param, SceAppUtilMountPoint *mountPoint) {
+     TRACY_FUNC(sceAppUtilSaveDataSlotCreate, slotId, param, mountPoint);
+-    const auto fd = open_file(emuenv.io, construct_slotparam_path(slotId).c_str(), SCE_O_WRONLY | SCE_O_CREAT, emuenv.vita_fs_path, export_name);
+-    write_file(fd, param, sizeof(SceAppUtilSaveDataSlotParam), emuenv.io, export_name);
+-    close_file(emuenv.io, fd, export_name);
++    if (!sdslot_write_slot_param(emuenv, slotId, param, export_name))
++        return RET_ERROR(SCE_APPUTIL_ERROR_SAVEDATA_NO_SPACE_FS);
+     return 0;
+ }
+ 
+ EXPORT(int, sceAppUtilSaveDataSlotDelete, unsigned int slotId, SceAppUtilMountPoint *mountPoint) {
+     TRACY_FUNC(sceAppUtilSaveDataSlotDelete, slotId, mountPoint);
+-    remove_file(emuenv.io, construct_slotparam_path(slotId).c_str(), emuenv.vita_fs_path, export_name);
++    sdslot_delete_slot(emuenv, slotId, export_name);
+     return 0;
+ }
+ 
+ EXPORT(int, sceAppUtilSaveDataSlotGetParam, unsigned int slotId, SceAppUtilSaveDataSlotParam *param, SceAppUtilMountPoint *mountPoint) {
+     TRACY_FUNC(sceAppUtilSaveDataSlotGetParam, slotId, param, mountPoint);
+-    const auto fd = open_file(emuenv.io, construct_slotparam_path(slotId).c_str(), SCE_O_RDONLY, emuenv.vita_fs_path, export_name);
+-    if (fd < 0)
++    if (!sdslot_read_slot_param(emuenv, slotId, param, export_name))
+         return RET_ERROR(SCE_APPUTIL_ERROR_SAVEDATA_SLOT_NOT_FOUND);
+-    read_file(param, emuenv.io, fd, sizeof(SceAppUtilSaveDataSlotParam), export_name);
+-    close_file(emuenv.io, fd, export_name);
+     param->status = 0;
+     return 0;
+ }
+@@ -416,13 +534,12 @@ EXPORT(SceInt32, sceAppUtilSaveDataSlotSearch, SceAppUtilWorkBuffer *workBuf, co
+             slotList[i].emptyParam = Ptr<SceAppUtilSaveDataSlotEmptyParam>(0);
+         }
+ 
+-        const auto fd = open_file(emuenv.io, construct_slotparam_path(i).c_str(), SCE_O_RDONLY, emuenv.vita_fs_path, export_name);
++        SceAppUtilSaveDataSlotParam param{};
++        const bool exist = sdslot_read_slot_param(emuenv, i, &param, export_name);
+         switch (cond->type) {
+         case SCE_APPUTIL_SAVEDATA_SLOT_SEARCH_TYPE_EXIST_SLOT:
+-            if (fd > 0) {
++            if (exist) {
+                 if (slotList) {
+-                    SceAppUtilSaveDataSlotParam param{};
+-                    read_file(&param, emuenv.io, fd, sizeof(SceAppUtilSaveDataSlotParam), export_name);
+                     slotList[result->hitNum].userParam = param.userParam;
+                     slotList[result->hitNum].status = param.status;
+                     slotList[result->hitNum].id = i;
+@@ -431,7 +548,7 @@ EXPORT(SceInt32, sceAppUtilSaveDataSlotSearch, SceAppUtilWorkBuffer *workBuf, co
+             }
+             break;
+         case SCE_APPUTIL_SAVEDATA_SLOT_SEARCH_TYPE_EMPTY_SLOT:
+-            if (fd < 0) {
++            if (!exist) {
+                 if (slotList)
+                     slotList[result->hitNum].id = i;
+                 result->hitNum++;
+@@ -439,9 +556,6 @@ EXPORT(SceInt32, sceAppUtilSaveDataSlotSearch, SceAppUtilWorkBuffer *workBuf, co
+             break;
+         default: break;
+         }
+-
+-        if (fd > 0)
+-            close_file(emuenv.io, fd, export_name);
+     }
+ 
+     return 0;
+@@ -449,11 +563,11 @@ EXPORT(SceInt32, sceAppUtilSaveDataSlotSearch, SceAppUtilWorkBuffer *workBuf, co
+ 
+ EXPORT(SceInt32, sceAppUtilSaveDataSlotSetParam, SceAppUtilSaveDataSlotId slotId, SceAppUtilSaveDataSlotParam *param, SceAppUtilMountPoint *mountPoint) {
+     TRACY_FUNC(sceAppUtilSaveDataSlotSetParam, slotId, param, mountPoint);
+-    const auto fd = open_file(emuenv.io, construct_slotparam_path(slotId).c_str(), SCE_O_WRONLY, emuenv.vita_fs_path, export_name);
+-    if (fd < 0)
++    SceAppUtilSaveDataSlotParam existing{};
++    if (!sdslot_read_slot_param(emuenv, slotId, &existing, export_name))
+         return RET_ERROR(SCE_APPUTIL_ERROR_SAVEDATA_SLOT_NOT_FOUND);
+-    write_file(fd, param, sizeof(SceAppUtilSaveDataSlotParam), emuenv.io, export_name);
+-    close_file(emuenv.io, fd, export_name);
++    if (!sdslot_write_slot_param(emuenv, slotId, param, export_name))
++        return RET_ERROR(SCE_APPUTIL_ERROR_SAVEDATA_NO_SPACE_FS);
+     return 0;
+ }
+ 
+diff --git a/vita3k/modules/SceAudiodec/SceAudiodecUser.cpp b/vita3k/modules/SceAudiodec/SceAudiodecUser.cpp
+index 1d7fb1ed..12a8b966 100644
+--- a/vita3k/modules/SceAudiodec/SceAudiodecUser.cpp
++++ b/vita3k/modules/SceAudiodec/SceAudiodecUser.cpp
+@@ -434,7 +434,9 @@ EXPORT(int, sceAudiodecPartlyDecode, SceAudiodecCtrl *ctrl, SceUInt32 samples_of
+         decoder->receive(temp_storage.data() + old_size, &size);
+     }
+ 
+-    memcpy(pcm_data + samples_offset * bytes_per_sample, temp_storage.data() + samples_offset * bytes_per_sample, samples_to_decode * bytes_per_sample);
++    // the skipped samples are left out of the decoded ones; the caller's pointer is already where the
++    // wanted ones go (skipping there too wrote past its PCM buffer into the next heap block, #4218)
++    memcpy(pcm_data, temp_storage.data() + samples_offset * bytes_per_sample, samples_to_decode * bytes_per_sample);
+ 
+     return 0;
+ }
+diff --git a/vita3k/modules/SceCommonDialog/SceCommonDialog.cpp b/vita3k/modules/SceCommonDialog/SceCommonDialog.cpp
+index 4a4eedfd..d00cdc39 100644
+--- a/vita3k/modules/SceCommonDialog/SceCommonDialog.cpp
++++ b/vita3k/modules/SceCommonDialog/SceCommonDialog.cpp
+@@ -241,6 +241,7 @@ EXPORT(int, sceImeDialogInit, const Ptr<SceImeDialogParam> param) {
+         emuenv.ime.edit_text.caretIndex = emuenv.ime.caretIndex;
+         emuenv.ime.edit_text.preeditIndex = emuenv.ime.caretIndex;
+         emuenv.ime.param.maxTextLength = p->maxTextLength;
++        emuenv.ime.clear_pending_event();
+     }
+     emuenv.common_dialog.active_ime = &emuenv.ime;
+ 
+@@ -270,7 +271,7 @@ EXPORT(int, sceImeDialogTerm) {
+         emuenv.ime.str.clear();
+         emuenv.ime.caretIndex = 0;
+         emuenv.ime.edit_text = {};
+-        emuenv.ime.event_id = SCE_IME_EVENT_OPEN;
++        emuenv.ime.clear_pending_event();
+     }
+ 
+ #ifdef __ANDROID__
+@@ -947,8 +948,9 @@ static void check_save_file(const uint32_t index, EmuEnvState &emuenv, const cha
+     auto &icon_buf_tmp = emuenv.common_dialog.savedata.icon_buffer[index];
+     icon_buf_tmp.clear();
+ 
+-    SceUID fd = open_file(emuenv.io, construct_slotparam_path(emuenv.common_dialog.savedata.slot_id[index]).c_str(), SCE_O_RDONLY, emuenv.vita_fs_path, export_name);
+-    if (fd < 0) {
++    SceAppUtilSaveDataSlotParam slot_param{};
++    const bool slot_exists = sdslot_read_slot_param(emuenv, emuenv.common_dialog.savedata.slot_id[index], &slot_param, export_name);
++    if (!slot_exists) {
+         auto empty_param = emuenv.common_dialog.savedata.list_empty_param[index];
+         if (empty_param) {
+             emuenv.common_dialog.savedata.title[index] = empty_param->title ? empty_param->title.get(emuenv.mem) : lang::get(lang::str::new_saved_data);
+@@ -965,9 +967,6 @@ static void check_save_file(const uint32_t index, EmuEnvState &emuenv, const cha
+         }
+     } else {
+         vfs::FileBuffer thumbnail_buffer;
+-        SceAppUtilSaveDataSlotParam slot_param{};
+-        read_file(&slot_param, emuenv.io, fd, sizeof(SceAppUtilSaveDataSlotParam), export_name);
+-        close_file(emuenv.io, fd, export_name);
+         emuenv.common_dialog.savedata.slot_info[index].isExist = 1;
+         emuenv.common_dialog.savedata.title[index] = slot_param.title;
+         emuenv.common_dialog.savedata.subtitle[index] = slot_param.subTitle;
+@@ -1238,6 +1237,8 @@ EXPORT(int, sceSaveDataDialogContinue, const SceSaveDataDialogParam *p) {
+             for (std::uint32_t i = 0; i < emuenv.common_dialog.savedata.slot_list_size; i++) {
+                 slot_list[i] = list_param->slotList.get(emuenv.mem)[i];
+                 emuenv.common_dialog.savedata.slot_id[i] = slot_list[i].id;
++                if (slot_list[i].id >= SCE_APPUTIL_SAVEDATA_SLOT_MAX)
++                    continue;
+                 emuenv.common_dialog.savedata.list_empty_param[i] = slot_list[i].emptyParam.get(emuenv.mem);
+                 check_save_file(i, emuenv, export_name);
+             }
+@@ -1386,11 +1387,11 @@ EXPORT(int, sceSaveDataDialogInit, const SceSaveDataDialogParam *p) {
+         }
+ 
+         const std::span slots(list_param->slotList.get(emuenv.mem), slot_list_size);
+-        const bool has_invalid_id = std::ranges::any_of(slots, [](const SceAppUtilSaveDataSlot &slot) {
++        const bool all_ids_invalid = !slots.empty() && std::ranges::all_of(slots, [](const SceAppUtilSaveDataSlot &slot) {
+             return slot.id >= SCE_APPUTIL_SAVEDATA_SLOT_MAX;
+         });
+ 
+-        if (has_invalid_id) {
++        if (all_ids_invalid) {
+             // Hardware finishes the sub status with this error and slot id -1
+             emuenv.common_dialog.savedata.slot_id[0] = 0xFFFFFFFF;
+             emuenv.common_dialog.result = (SceCommonDialogResult)SCE_SAVEDATA_DIALOG_ERROR_PARAM;
+@@ -1401,6 +1402,8 @@ EXPORT(int, sceSaveDataDialogInit, const SceSaveDataDialogParam *p) {
+         for (SceUInt i = 0; i < slot_list_size; i++) {
+             slot_list[i] = list_param->slotList.get(emuenv.mem)[i];
+             emuenv.common_dialog.savedata.slot_id[i] = slot_list[i].id;
++            if (slot_list[i].id >= SCE_APPUTIL_SAVEDATA_SLOT_MAX)
++                continue;
+             emuenv.common_dialog.savedata.list_empty_param[i] = slot_list[i].emptyParam.get(emuenv.mem);
+             check_save_file(i, emuenv, export_name);
+         }
 diff --git a/vita3k/modules/SceDisplay/SceDisplay.cpp b/vita3k/modules/SceDisplay/SceDisplay.cpp
 index 5ce4c807..59ac584a 100644
 --- a/vita3k/modules/SceDisplay/SceDisplay.cpp
@@ -1519,7 +3004,7 @@ index 5ce4c807..59ac584a 100644
      if (emuenv.display.abort.load())
          return SCE_DISPLAY_ERROR_NO_PIXEL_DATA;
 diff --git a/vita3k/modules/SceGxm/SceGxm.cpp b/vita3k/modules/SceGxm/SceGxm.cpp
-index 4c864368..3c301676 100644
+index 4c864368..9e792861 100644
 --- a/vita3k/modules/SceGxm/SceGxm.cpp
 +++ b/vita3k/modules/SceGxm/SceGxm.cpp
 @@ -48,6 +48,11 @@
@@ -1563,17 +3048,53 @@ index 4c864368..3c301676 100644
          // sceGxmDisplayQueueAddEntry waits for both buffers to complete
          if (renderer::wishlist(old_sync, display_callback->old_sync_timestamp) == renderer::SyncWaitResult::Shutdown) {
              return;
-@@ -918,6 +937,9 @@ static void display_entry_thread(EmuEnvState &emuenv) {
+@@ -918,11 +937,16 @@ static void display_entry_thread(EmuEnvState &emuenv) {
                  return;
              }
          }
 +#ifdef __PS4__
 +        ps4_wait_add(4, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_start).count());
 +#endif
++
++        // now we can remove the thread from the display queue
++        display_queue.pop();
  
          // check if we're shutting down before calling run_guest_function to avoid deadlock
          if (emuenv.display.abort.load()) {
-@@ -2282,7 +2304,13 @@ EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<Sce
+             LOG_DEBUG("Abort detected, removing display callback data and exiting");
+-            display_queue.pop();
+             free(emuenv.mem, display_callback->data);
+             break;
+         }
+@@ -941,7 +965,6 @@ static void display_entry_thread(EmuEnvState &emuenv) {
+             renderer::subject_done(new_sync, display_callback->new_sync_timestamp + 1);
+ 
+         free(emuenv.mem, display_callback->data);
+-        display_queue.pop();
+     }
+ }
+ 
+@@ -1859,7 +1882,8 @@ EXPORT(int, sceGxmColorSurfaceInit, SceGxmColorSurface *surface, SceGxmColorForm
+     surface->surfaceType = surfaceType;
+     surface->outputRegisterSize = outputRegisterSize;
+ 
+-    SceGxmTextureFormat tex_format;
++    // use a valid format for the background texture even if the conversion fails
++    SceGxmTextureFormat tex_format = SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR;
+     if (!gxm::convert_color_format_to_texture_format(colorFormat, tex_format)) {
+         LOG_WARN("Unable to convert color surface type 0x{:X} to texture format enum for background texture of color surface!", static_cast<std::uint32_t>(colorFormat));
+     }
+@@ -1936,7 +1960,8 @@ EXPORT(int, sceGxmColorSurfaceSetFormat, SceGxmColorSurface *surface, SceGxmColo
+ 
+     surface->colorFormat = format;
+ 
+-    SceGxmTextureFormat tex_format;
++    // use a valid format for the background texture even if the conversion fails
++    SceGxmTextureFormat tex_format = SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR;
+     if (!gxm::convert_color_format_to_texture_format(format, tex_format)) {
+         LOG_WARN("Unable to convert color surface type 0x{:X} to texture format enum for background texture of color surface!", static_cast<std::uint32_t>(format));
+     }
+@@ -2282,7 +2307,13 @@ EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<Sce
  
      renderer::send_single_command(*emuenv.renderer, nullptr, renderer::CommandOpcode::NewFrame, false, frame, &emuenv.display, active_renderer_context);
  
@@ -1588,7 +3109,7 @@ index 4c864368..3c301676 100644
          // double buffering, not handled by the queue configuration
          emuenv.gxm.display_queue.wait_empty();
  
-@@ -2296,6 +2324,16 @@ EXPORT(int, sceGxmDisplayQueueFinish) {
+@@ -2296,6 +2327,16 @@ EXPORT(int, sceGxmDisplayQueueFinish) {
      return 0;
  }
  
@@ -1605,7 +3126,7 @@ index 4c864368..3c301676 100644
  static void gxmSetUniformBuffers(renderer::State &state, GxmState &gxm, SceGxmContext *context, const SceGxmProgram &program, std::span<UniformBuffer> buffers, const UniformBufferSizes &sizes, const MemState &mem) {
      for (size_t i = 0; i < buffers.size(); i++) {
          if (!buffers[i] || sizes.at(i) == 0) {
-@@ -2391,10 +2429,10 @@ static int gxmDrawElementGeneral(EmuEnvState &emuenv, const char *export_name, c
+@@ -2391,10 +2432,10 @@ static int gxmDrawElementGeneral(EmuEnvState &emuenv, const char *export_name, c
          // we don't need to get the vertex buffer size with memory mapping
          if (indexType == SCE_GXM_INDEX_FORMAT_U16) {
              const uint16_t *const data = static_cast<const uint16_t *>(indices_ptr);
@@ -1618,7 +3139,7 @@ index 4c864368..3c301676 100644
          }
      }
  
-@@ -2513,10 +2551,10 @@ EXPORT(int, sceGxmDrawPrecomputed, SceGxmContext *context, SceGxmPrecomputedDraw
+@@ -2513,10 +2554,10 @@ EXPORT(int, sceGxmDrawPrecomputed, SceGxmContext *context, SceGxmPrecomputedDraw
          // we don't need to get the vertex buffer size with memory mapping
          if (draw->index_format == SCE_GXM_INDEX_FORMAT_U16) {
              const uint16_t *const data = draw->index_data.cast<const uint16_t>().get(emuenv.mem);
@@ -1631,7 +3152,7 @@ index 4c864368..3c301676 100644
          }
      }
  
-@@ -2884,6 +2922,8 @@ EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params) {
+@@ -2884,6 +2925,8 @@ EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params) {
      // the case where displayQueueMaxPendingCount is 1 handled in sceGxmDisplayQueueAddEntry
      const uint32_t max_queue_size = std::max(std::min(params->displayQueueMaxPendingCount, 3U) - 1, 1U);
      emuenv.gxm.display_queue.maxPendingCount_ = max_queue_size;
@@ -1640,6 +3161,255 @@ index 4c864368..3c301676 100644
  
      const ThreadStatePtr main_thread = emuenv.kernel.get_thread(thread_id);
      const ThreadStatePtr display_queue_thread = emuenv.kernel.create_thread(emuenv.mem, "SceGxmDisplayQueue", Ptr<void>(0), SCE_KERNEL_HIGHEST_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_DEFAULT, 0, nullptr);
+diff --git a/vita3k/modules/SceIme/SceIme.cpp b/vita3k/modules/SceIme/SceIme.cpp
+index 426a3db7..b153c347 100644
+--- a/vita3k/modules/SceIme/SceIme.cpp
++++ b/vita3k/modules/SceIme/SceIme.cpp
+@@ -45,6 +45,11 @@ EXPORT(SceInt32, sceImeClose) {
+     TRACY_FUNC(sceImeClose);
+     emuenv.ime.state = false;
+ 
++    {
++        std::lock_guard lock(emuenv.ime.mutex);
++        emuenv.ime.clear_pending_event();
++    }
++
+     if (emuenv.ime.param.inputTextBuffer.address())
+         free(emuenv.mem, emuenv.ime.param.inputTextBuffer.address());
+     emuenv.ime.param.inputTextBuffer = Ptr<SceWChar16>();
+@@ -89,15 +94,14 @@ EXPORT(SceInt32, sceImeOpen, SceImeParam *param) {
+     else
+         emuenv.ime.caps_level = 1;
+ 
+-    emuenv.ime.event_id = SCE_IME_EVENT_OPEN;
++    emuenv.ime.clear_pending_event();
+     emuenv.ime.state = true;
+ 
+ #ifdef __ANDROID__
+     ime::set_keyboard_active(true);
+ #endif
+ 
+-    SceImeEvent e{};
+-    memset(&e, 0, sizeof(e));
++    emuenv.ime.queue_event(SCE_IME_EVENT_OPEN);
+ 
+     return 0;
+ }
+@@ -109,7 +113,10 @@ EXPORT(SceInt32, sceImeSetCaret, const SceImeCaret *caret) {
+ 
+     Ptr<SceImeEvent> event = Ptr<SceImeEvent>(alloc(emuenv.mem, sizeof(SceImeEvent), "ime_event"));
+     SceImeEvent *e = event.get(emuenv.mem);
++    *e = {};
++    e->id = SCE_IME_EVENT_UPDATE_CARET;
+     e->param.caretIndex = caret->index;
++    emuenv.ime.caretIndex = emuenv.ime.edit_text.caretIndex = caret->index;
+     CALL_EXPORT(SceImeEventHandler, emuenv.ime.param.arg, e);
+     free(emuenv.mem, event.address());
+ 
+@@ -123,6 +130,8 @@ EXPORT(SceInt32, sceImeSetPreeditGeometry, const SceImePreeditGeometry *preedit)
+ 
+     Ptr<SceImeEvent> event = Ptr<SceImeEvent>(alloc(emuenv.mem, sizeof(SceImeEvent), "ime_event"));
+     SceImeEvent *e = event.get(emuenv.mem);
++    *e = {};
++    e->id = SCE_IME_EVENT_CHANGE_SIZE;
+     e->param.rect.height = preedit->height;
+     e->param.rect.x = preedit->x;
+     e->param.rect.y = preedit->y;
+@@ -142,20 +151,30 @@ EXPORT(SceInt32, sceImeUpdate) {
+     if (!emuenv.ime.state)
+         return RET_ERROR(SCE_IME_ERROR_NOT_OPENED);
+ 
+-    std::lock_guard lock(emuenv.ime.mutex);
+-
+-    if (emuenv.ime.event_id == SCE_IME_EVENT_OPEN)
+-        return 0;
++    uint32_t event_id;
++    Ptr<SceImeEvent> event;
++    {
++        std::lock_guard lock(emuenv.ime.mutex);
++
++        if (emuenv.ime.pending_events.empty())
++            return 0;
++
++        event_id = emuenv.ime.pending_events.front();
++        emuenv.ime.pending_events.pop_front();
++
++        event = Ptr<SceImeEvent>(alloc(emuenv.mem, sizeof(SceImeEvent), "ime_event"));
++        SceImeEvent *e = event.get(emuenv.mem);
++        *e = {};
++        e->id = event_id;
++        memcpy(emuenv.ime.edit_text.str.get(emuenv.mem), emuenv.ime.str.c_str(), (emuenv.ime.str.length() + 1) * sizeof(SceWChar16));
++        if (event_id == SCE_IME_EVENT_UPDATE_CARET)
++            e->param.caretIndex = emuenv.ime.caretIndex;
++        else
++            e->param.text = emuenv.ime.edit_text;
++    }
+ 
+-    Ptr<SceImeEvent> event = Ptr<SceImeEvent>(alloc(emuenv.mem, sizeof(SceImeEvent), "ime_event"));
+-    SceImeEvent *e = event.get(emuenv.mem);
+-    e->id = emuenv.ime.event_id;
+-    memcpy(emuenv.ime.edit_text.str.get(emuenv.mem), emuenv.ime.str.c_str(), (emuenv.ime.str.length() + 1) * sizeof(SceWChar16));
+-    e->param.text = emuenv.ime.edit_text;
+-    e->param.caretIndex = emuenv.ime.caretIndex;
+-    CALL_EXPORT(SceImeEventHandler, emuenv.ime.param.arg, e);
++    CALL_EXPORT(SceImeEventHandler, emuenv.ime.param.arg, event.get(emuenv.mem));
+     free(emuenv.mem, event.address());
+-    emuenv.ime.event_id = SCE_IME_EVENT_OPEN;
+ 
+     return 0;
+ }
+diff --git a/vita3k/ngs/include/ngs/modules/player.h b/vita3k/ngs/include/ngs/modules/player.h
+index 0eb48f99..c187aae3 100644
+--- a/vita3k/ngs/include/ngs/modules/player.h
++++ b/vita3k/ngs/include/ngs/modules/player.h
+@@ -81,6 +81,7 @@ struct PlayerLogicalState : public ModuleLogicalState {
+     std::vector<uint8_t> adpcm_buffer;
+     // INTERNAL
+     int8_t current_loop_count = 0;
++    bool requested_initial_buffer = false;
+     // preserve HE-ADPCM predictor history so the runtime decoder can be rebuilt
+     ADPCMHistory adpcm_history[SCE_NGS_PLAYER_MAX_PCM_CHANNELS] = {};
+ };
+diff --git a/vita3k/ngs/src/modules/player.cpp b/vita3k/ngs/src/modules/player.cpp
+index 6403d07e..8d030b92 100644
+--- a/vita3k/ngs/src/modules/player.cpp
++++ b/vita3k/ngs/src/modules/player.cpp
+@@ -46,6 +46,7 @@ void PlayerModule::on_state_change(const MemState &mem, ModuleData &data, const
+         logical->decoded_pcm.clear();
+         logical->rate_resampler.reset();
+         logical->adpcm_buffer.clear();
++        logical->requested_initial_buffer = false;
+ 
+         std::memset(&logical->adpcm_history, 0, sizeof(logical->adpcm_history));
+     } else if (data.parent->is_keyed_off) {
+@@ -111,9 +112,11 @@ bool PlayerModule::process(KernelState &kern, const MemState &mem, const SceUID
+     const int32_t granularity = data.parent->rack->system->granularity;
+ 
+     // fix right now because it might be set by default in SceNgsVoiceInit, which we do not support
+-    if (params->channels == 0) {
+-        params->channels = 2;
+-    }
++    const auto normalize_channels = [&]() {
++        if (params->channels == 0)
++            params->channels = 2;
++    };
++    normalize_channels();
+ 
+     // If decoder hasn't been initialized
+     if (!runtime->decoder) {
+@@ -123,10 +126,112 @@ bool PlayerModule::process(KernelState &kern, const MemState &mem, const SceUID
+ 
+     logical->decoded_pcm.compact();
+ 
++    const auto prefer_live_params_before_first_consume = [&]() {
++        if (!(data.flags & ModuleData::PARAMS_LOCK) || state->bytes_consumed_since_key_on != 0)
++            return;
++
++        SceNgsPlayerParams *live = data.info.data.cast<SceNgsPlayerParams>().get(mem);
++        const int buffer_index = state->current_buffer;
++        if (!live || buffer_index < 0 || buffer_index >= SCE_NGS_PLAYER_MAX_BUFFERS)
++            return;
++
++        auto &snapshot_buffer = params->buffer_params[buffer_index];
++        const auto &live_buffer = live->buffer_params[buffer_index];
++        if ((!snapshot_buffer.buffer || snapshot_buffer.bytes_count <= 0) && live_buffer.buffer && live_buffer.bytes_count > 0) {
++            std::memcpy(&snapshot_buffer, &live_buffer, sizeof(snapshot_buffer));
++            params = live;
++            normalize_channels();
++        }
++    };
++
++    const auto adopt_pre_written_pcm = [&](const int buffer_index) {
++        if (buffer_index < 0 || buffer_index >= SCE_NGS_PLAYER_MAX_BUFFERS)
++            return false;
++
++        auto &buffer = params->buffer_params[buffer_index];
++        if (!buffer.buffer || buffer.bytes_count > 0)
++            return false;
++
++        const Address buffer_address = buffer.buffer.address();
++        int raw_peak = -1;
++        constexpr uint32_t probe_frames = 4096;
++        const uint32_t probe_channels = static_cast<uint32_t>(std::clamp<int>(params->channels, 1, SCE_NGS_PLAYER_MAX_PCM_CHANNELS));
++        const uint32_t probe_samples = probe_frames * probe_channels;
++        const uint32_t probe_bytes = probe_samples * sizeof(int16_t);
++        const bool probe_address_valid = buffer_address
++            && buffer_address <= std::numeric_limits<Address>::max() - probe_bytes
++            && is_valid_addr_range(mem, buffer_address, buffer_address + probe_bytes);
++        if (params->type == ParameterAudioTypePCM && probe_address_valid) {
++            const int16_t *samples = Ptr<int16_t>(buffer_address).get(mem);
++            if (samples) {
++                raw_peak = 0;
++                for (uint32_t i = 0; i < probe_samples; ++i)
++                    raw_peak = std::max(raw_peak, std::abs(static_cast<int>(samples[i])));
++            }
++        }
++
++        if (raw_peak <= 8)
++            return false;
++
++        buffer.bytes_count = static_cast<SceInt32>(probe_bytes);
++        if (data.flags & ModuleData::PARAMS_LOCK) {
++            auto *snapshot = data.get_parameters<SceNgsPlayerParams>(mem);
++            auto &snapshot_buffer = snapshot->buffer_params[buffer_index];
++            if (&snapshot_buffer != &buffer)
++                std::memcpy(&snapshot_buffer, &buffer, sizeof(snapshot_buffer));
++        }
++        return true;
++    };
++
++    const auto request_initial_buffer = [&]() {
++        if (state->bytes_consumed_since_key_on != 0 || logical->requested_initial_buffer)
++            return false;
++
++        logical->requested_initial_buffer = true;
++        const int buffer_index = state->current_buffer;
++        if (adopt_pre_written_pcm(buffer_index))
++            return true;
++
++        if (buffer_index < 0 || buffer_index >= SCE_NGS_PLAYER_MAX_BUFFERS)
++            return false;
++
++        const Address buffer_address = params->buffer_params[buffer_index].buffer.address();
++
++        if (!data.callback || !buffer_address)
++            return false;
++
++        voice_lock.unlock();
++        scheduler_lock.unlock();
++        data.invoke_callback(kern, mem, thread_id, SCE_NGS_PLAYER_SWAPPED_BUFFER, buffer_index, buffer_address);
++        scheduler_lock.lock();
++        voice_lock.lock();
++
++        params = data.get_parameters<SceNgsPlayerParams>(mem);
++        normalize_channels();
++        prefer_live_params_before_first_consume();
++        adopt_pre_written_pcm(buffer_index);
++        return true;
++    };
++
++    prefer_live_params_before_first_consume();
++
+     while (static_cast<int>(logical->decoded_pcm.available_frames()) < granularity) {
+         if ((state->current_buffer == -1)
+             || !params->buffer_params[state->current_buffer].buffer
+             || (params->buffer_params[state->current_buffer].bytes_count == 0)) {
++            if (state->bytes_consumed_since_key_on == 0) {
++                if (request_initial_buffer()
++                    && state->current_buffer != -1
++                    && params->buffer_params[state->current_buffer].buffer
++                    && params->buffer_params[state->current_buffer].bytes_count > 0)
++                    continue;
++
++                if (!data.callback || state->current_buffer == -1
++                    || !params->buffer_params[state->current_buffer].buffer)
++                    finished = true;
++                break;
++            }
++
+             // Stop processing if no valid buffer is available or if the buffer is empty
+             finished = true;
+             break;
 diff --git a/vita3k/overlay/include/overlay/pause_overlay.h b/vita3k/overlay/include/overlay/pause_overlay.h
 index 6c5147b7..a87f7cbd 100644
 --- a/vita3k/overlay/include/overlay/pause_overlay.h
@@ -1813,6 +3583,28 @@ index 6c5147b7..a87f7cbd 100644
      static constexpr color4f k_color_focus_ring{ 0.180f, 0.765f, 0.878f, 1.f };
      static constexpr uint8_t k_focus_ring_thickness = 2;
  };
+diff --git a/vita3k/overlay/src/common_dialog.cpp b/vita3k/overlay/src/common_dialog.cpp
+index 9490418e..83cb3b59 100644
+--- a/vita3k/overlay/src/common_dialog.cpp
++++ b/vita3k/overlay/src/common_dialog.cpp
+@@ -68,7 +68,7 @@ void submit_ime_dialog(DialogState &dialog) {
+ 
+         const std::string utf8 = string_utils::utf16_to_utf8(dialog.active_ime->str);
+         snprintf(dialog.ime.text, sizeof(dialog.ime.text), "%s", utf8.c_str());
+-        dialog.active_ime->event_id = SCE_IME_EVENT_PRESS_ENTER;
++        dialog.active_ime->queue_event(SCE_IME_EVENT_PRESS_ENTER);
+     }
+ 
+     dialog.ime.status = SCE_IME_DIALOG_BUTTON_ENTER;
+@@ -79,7 +79,7 @@ void submit_ime_dialog(DialogState &dialog) {
+ void cancel_ime_dialog(DialogState &dialog) {
+     if (dialog.active_ime) {
+         std::lock_guard lock(dialog.active_ime->mutex);
+-        dialog.active_ime->event_id = SCE_IME_EVENT_PRESS_CLOSE;
++        dialog.active_ime->queue_event(SCE_IME_EVENT_PRESS_CLOSE);
+     }
+ 
+     dialog.ime.status = SCE_IME_DIALOG_BUTTON_CLOSE;
 diff --git a/vita3k/overlay/src/font.cpp b/vita3k/overlay/src/font.cpp
 index 117569cf2..4c8552a5 100644
 --- a/vita3k/overlay/src/font.cpp
@@ -2424,6 +4216,390 @@ index 3e2404bb..0ca2475e 100644
      res.add(ring.get_compiled());
  }
  
+diff --git a/vita3k/packages/CMakeLists.txt b/vita3k/packages/CMakeLists.txt
+index f3985580..396d151a 100644
+--- a/vita3k/packages/CMakeLists.txt
++++ b/vita3k/packages/CMakeLists.txt
+@@ -3,6 +3,7 @@ add_library(packages STATIC
+             src/license.cpp
+             src/pkg.cpp
+             src/pup.cpp
++            src/savedata.cpp
+             src/sce_utils.cpp
+             src/sfo.cpp
+             src/vci.cpp
+@@ -10,6 +11,7 @@ add_library(packages STATIC
+             include/packages/license.h
+             include/packages/functions.h
+             include/packages/pkg.h
++            include/packages/savedata.h
+             include/packages/sce_types.h
+             include/packages/sfo.h
+             include/packages/vci.h
+diff --git a/vita3k/packages/include/packages/savedata.h b/vita3k/packages/include/packages/savedata.h
+new file mode 100644
+index 00000000..0887b385
+--- /dev/null
++++ b/vita3k/packages/include/packages/savedata.h
+@@ -0,0 +1,47 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#pragma once
++
++#include <util/fs.h>
++#include <util/types.h>
++
++#include <cstdint>
++#include <functional>
++#include <string>
++#include <vector>
++
++namespace savedata {
++
++struct SlotInfo {
++    uint32_t id;
++    std::string title;
++    std::string subtitle;
++    std::string detail;
++    SceDateTime modified;
++};
++
++// A folder copied from a PS Vita without mounting it still has its PFS layout
++bool is_encrypted(const fs::path &save_path);
++// Only savedata that came from a PS Vita has the sealedkey needed to encrypt it again
++bool can_export(const fs::path &save_path);
++std::vector<SlotInfo> read_slots(const fs::path &save_path);
++
++bool import_encrypted(const fs::path &src, const fs::path &dst, const std::function<void(float)> &progress, std::string &error);
++bool export_encrypted(const fs::path &src, const fs::path &dst, const std::function<void(float)> &progress, std::string &error);
++
++} // namespace savedata
+diff --git a/vita3k/packages/include/packages/sfo.h b/vita3k/packages/include/packages/sfo.h
+index a2e1a30f..d4543455 100644
+--- a/vita3k/packages/include/packages/sfo.h
++++ b/vita3k/packages/include/packages/sfo.h
+@@ -97,5 +97,5 @@ bool load(SfoFile &sfile, const std::vector<uint8_t> &content);
+  * @param param File buffer pointing to the `param.sfo` file to parse
+  * @param sys_lang System language. It is used to get translated strings from `param.sfo`
+  */
+-void get_param_info(sfo::SfoAppInfo &app_info, const vfs::FileBuffer &param, int sys_lang);
++bool get_param_info(sfo::SfoAppInfo &app_info, const vfs::FileBuffer &param, int sys_lang);
+ } // namespace sfo
+diff --git a/vita3k/packages/src/pkg.cpp b/vita3k/packages/src/pkg.cpp
+index 1c5a5bd0..37c4fa15 100644
+--- a/vita3k/packages/src/pkg.cpp
++++ b/vita3k/packages/src/pkg.cpp
+@@ -209,7 +209,21 @@ bool install_pkg(const fs::path &pkg_path, EmuEnvState &emuenv, std::string &p_z
+     fseek(infile, sfo_offset, SEEK_SET);
+     fread(sfo_buffer.data(), sfo_buffer.size(), 1, infile);
+     sfo::load(sfo_file, sfo_buffer);
+-    sfo::get_param_info(emuenv.app_info, sfo_buffer, emuenv.cfg.sys_lang);
++    if (!sfo::get_param_info(emuenv.app_info, sfo_buffer, emuenv.cfg.sys_lang)) {
++        LOG_ERROR("The param.sfo in {} is not readable, not installing it", fs_utils::path_to_utf8(pkg_path));
++        evp_cleanup();
++        fclose(infile);
++        return false;
++    }
++
++    const bool is_theme = type == PkgType::PKG_TYPE_VITA_THEME;
++    const std::string &dest_id = is_theme ? emuenv.app_info.app_content_id : emuenv.app_info.app_title_id;
++    if (dest_id.empty() || (type == PkgType::PKG_TYPE_VITA_DLC && emuenv.app_info.app_content_id.size() <= 20)) {
++        LOG_ERROR("The param.sfo in {} has no usable title or content ID, not installing it", fs_utils::path_to_utf8(pkg_path));
++        evp_cleanup();
++        fclose(infile);
++        return false;
++    }
+ 
+     if (type == PkgType::PKG_TYPE_VITA_DLC)
+         emuenv.app_info.app_content_id = emuenv.app_info.app_content_id.substr(20);
+diff --git a/vita3k/packages/src/savedata.cpp b/vita3k/packages/src/savedata.cpp
+new file mode 100644
+index 00000000..d9e7ec26
+--- /dev/null
++++ b/vita3k/packages/src/savedata.cpp
+@@ -0,0 +1,168 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#include <packages/savedata.h>
++
++#include <emuenv/app_util.h>
++#include <util/log.h>
++
++#include <PfsSaveData.h>
++
++#include <cstring>
++#include <filesystem>
++#include <sstream>
++
++namespace savedata {
++
++static constexpr uint32_t SDSLOT_MAX_SLOTS = 256;
++static constexpr uint32_t SDSLOT_FLAG_BASE = 0x200;
++static constexpr uint32_t SDSLOT_DATA_BASE = 0x400;
++static constexpr uint32_t SDSLOT_BLOCK_SIZE = 0x400;
++
++static std::filesystem::path to_std_path(const fs::path &path) {
++    return std::filesystem::path(path.native());
++}
++
++static std::string last_line(const std::string &log) {
++    std::istringstream lines(log);
++    std::string line, last;
++    while (std::getline(lines, line))
++        if (!line.empty() && !line.starts_with("[WARNING]"))
++            last = line;
++    return last;
++}
++
++static SlotInfo to_slot_info(uint32_t id, const SceAppUtilSaveDataSlotParam &param) {
++    const auto str = [](const char *s, size_t n) { return std::string(s, strnlen(s, n)); };
++    return { id, str(param.title, sizeof(param.title)), str(param.subTitle, sizeof(param.subTitle)),
++        str(param.detail, sizeof(param.detail)), param.modifiedTime };
++}
++
++bool is_encrypted(const fs::path &save_path) {
++    return fs::exists(save_path / "sce_pfs" / "files.db");
++}
++
++bool can_export(const fs::path &save_path) {
++    const fs::path sce_sys = save_path / "sce_sys";
++    return fs::exists(sce_sys / "sealedkey") && fs::exists(sce_sys / "keystone") && fs::exists(sce_sys / "param.sfo")
++        && !is_encrypted(save_path);
++}
++
++std::vector<SlotInfo> read_slots(const fs::path &save_path) {
++    std::vector<SlotInfo> slots;
++
++    fs::ifstream sdslot(save_path / "sce_sys" / "sdslot.dat", std::ios::binary);
++    if (sdslot) {
++        std::vector<char> buf(SDSLOT_DATA_BASE + SDSLOT_MAX_SLOTS * SDSLOT_BLOCK_SIZE);
++        sdslot.read(buf.data(), buf.size());
++        buf.resize(sdslot.gcount());
++        if (buf.size() < SDSLOT_DATA_BASE || std::memcmp(buf.data(), "SDSL", 4) != 0)
++            return slots;
++        for (uint32_t i = 0; i < SDSLOT_MAX_SLOTS; i++) {
++            const size_t offset = SDSLOT_DATA_BASE + static_cast<size_t>(i) * SDSLOT_BLOCK_SIZE;
++            if (buf[SDSLOT_FLAG_BASE + i] == 0 || offset + sizeof(SceAppUtilSaveDataSlotParam) > buf.size())
++                continue;
++            SceAppUtilSaveDataSlotParam param;
++            std::memcpy(&param, buf.data() + offset, sizeof(param));
++            slots.push_back(to_slot_info(i, param));
++        }
++        return slots;
++    }
++
++    for (uint32_t i = 0; i < SDSLOT_MAX_SLOTS; i++) {
++        fs::ifstream legacy(save_path / fmt::format("SlotParam_{}.bin", i), std::ios::binary);
++        SceAppUtilSaveDataSlotParam param{};
++        if (legacy && legacy.read(reinterpret_cast<char *>(&param), sizeof(param)))
++            slots.push_back(to_slot_info(i, param));
++    }
++    return slots;
++}
++
++// Both directions write next to the destination first, so a failure never leaves a half written folder behind
++static bool run_to_temp(const fs::path &dst, const std::function<int(const std::filesystem::path &, std::ostream &)> &job, std::string &error) {
++    const auto fail = [&error](const std::string &message, const fs::path &tmp) {
++        error = message;
++        LOG_ERROR("Savedata conversion failed: {}", error);
++        boost::system::error_code ec;
++        if (!tmp.empty())
++            fs::remove_all(tmp, ec);
++        LOG_WARN_IF(ec, "Failed to remove {}: {}", tmp, ec.message());
++        return false;
++    };
++
++    boost::system::error_code ec;
++    const fs::path tmp = fs::unique_path(fs_utils::path_concat(dst, ".%%%%%%%%.tmp"), ec);
++    if (ec || !fs::create_directory(tmp, ec))
++        return fail(ec ? ec.message() : "Failed to create " + tmp.string(), {});
++
++    std::ostringstream log;
++    int result = -1;
++    try {
++        result = job(to_std_path(tmp), log);
++    } catch (const std::exception &e) {
++        log << e.what() << '\n';
++    }
++    if (result < 0)
++        return fail(last_line(log.str()), tmp);
++
++    fs::path backup;
++    if (fs::exists(dst, ec)) {
++        backup = fs::unique_path(fs_utils::path_concat(dst, ".%%%%%%%%.bak"), ec);
++        if (!ec)
++            fs::rename(dst, backup, ec);
++        if (ec)
++            return fail(fmt::format("Failed to move the existing {} aside: {}", dst, ec.message()), tmp);
++    }
++
++    fs::rename(tmp, dst, ec);
++    if (ec) {
++        const std::string message = fmt::format("Failed to move the new save data into {}: {}", dst, ec.message());
++        if (!backup.empty()) {
++            boost::system::error_code restore_ec;
++            fs::rename(backup, dst, restore_ec);
++            if (restore_ec)
++                return fail(fmt::format("{}\nThe previous save data is kept at {}", message, backup), tmp);
++        }
++        return fail(message, tmp);
++    }
++
++    if (!backup.empty()) {
++        fs::remove_all(backup, ec);
++        LOG_WARN_IF(ec, "Failed to remove {}: {}", backup, ec.message());
++    }
++    return true;
++}
++
++static PfsProgressCallback to_pfs_progress(const std::function<void(float)> &progress) {
++    if (!progress)
++        return nullptr;
++    return [progress](uint64_t done, uint64_t total, const std::string &) {
++        progress(total ? static_cast<float>(done) / static_cast<float>(total) : 1.f);
++    };
++}
++
++bool import_encrypted(const fs::path &src, const fs::path &dst, const std::function<void(float)> &progress, std::string &error) {
++    LOG_INFO("Decrypting savedata {} into {}", src, dst);
++    return run_to_temp(dst, [&](const std::filesystem::path &tmp, std::ostream &log) { return decrypt_savedata(to_std_path(src), tmp, to_pfs_progress(progress), log); }, error);
++}
++
++bool export_encrypted(const fs::path &src, const fs::path &dst, const std::function<void(float)> &progress, std::string &error) {
++    LOG_INFO("Encrypting savedata {} into {}", src, dst);
++    return run_to_temp(dst, [&](const std::filesystem::path &tmp, std::ostream &log) { return encrypt_savedata(to_std_path(src), tmp, to_pfs_progress(progress), log); }, error);
++}
++
++} // namespace savedata
+diff --git a/vita3k/packages/src/sfo.cpp b/vita3k/packages/src/sfo.cpp
+index 4aa0b062..34723fbc 100644
+--- a/vita3k/packages/src/sfo.cpp
++++ b/vita3k/packages/src/sfo.cpp
+@@ -74,9 +74,11 @@ bool get_data_by_key(std::string &out_data, SfoFile &file, const std::string &ke
+     return true;
+ }
+ 
+-void get_param_info(sfo::SfoAppInfo &app_info, const vfs::FileBuffer &param, int sys_lang) {
++bool get_param_info(sfo::SfoAppInfo &app_info, const vfs::FileBuffer &param, int sys_lang) {
++    app_info = {};
+     SfoFile sfo_handle;
+-    sfo::load(sfo_handle, param);
++    if (!sfo::load(sfo_handle, param))
++        return false;
+     sfo::get_data_by_key(app_info.app_version, sfo_handle, "APP_VER");
+     if (app_info.app_version[0] == '0')
+         app_info.app_version.erase(app_info.app_version.begin());
+@@ -94,15 +96,22 @@ void get_param_info(sfo::SfoAppInfo &app_info, const vfs::FileBuffer &param, int
+     std::replace(app_info.app_title.begin(), app_info.app_title.end(), '\n', ' ');
+     boost::trim(app_info.app_title);
+     sfo::get_data_by_key(app_info.app_title_id, sfo_handle, "TITLE_ID");
++    return true;
+ }
+ 
+ bool load(SfoFile &sfile, const std::vector<uint8_t> &content) {
+-    if (content.empty()) {
++    if (content.size() < sizeof(SfoHeader)) {
+         return false;
+     }
+ 
+     memcpy(&sfile.header, content.data(), sizeof(SfoHeader));
+ 
++    const uint64_t index_end = sizeof(SfoHeader) + static_cast<uint64_t>(sfile.header.tables_entries) * sizeof(SfoIndexTableEntry);
++    if (sfile.header.magic != 0x46535000 || index_end > sfile.header.key_table_start
++        || sfile.header.key_table_start > sfile.header.data_table_start || sfile.header.data_table_start > content.size()) {
++        return false;
++    }
++
+     sfile.entries.resize(sfile.header.tables_entries + 1);
+ 
+     for (uint32_t i = 0; i < sfile.header.tables_entries; i++) {
+@@ -114,6 +123,10 @@ bool load(SfoFile &sfile, const std::vector<uint8_t> &content) {
+     // Parse each SFO entry and extract its associated key
+     for (uint32_t i = 0; i < sfile.header.tables_entries; i++) {
+         // Calculate the size of the key for the current entry by subtracting the offsets
++        if (sfile.entries[i].entry.key_offset >= sfile.entries[i + 1].entry.key_offset
++            || static_cast<uint64_t>(sfile.header.key_table_start) + sfile.entries[i + 1].entry.key_offset > sfile.header.data_table_start) {
++            return false;
++        }
+         uint32_t keySize = sfile.entries[i + 1].entry.key_offset - sfile.entries[i].entry.key_offset;
+ 
+         // Resize the 'key' data to hold the correct amount of characters for the key
+@@ -122,14 +135,17 @@ bool load(SfoFile &sfile, const std::vector<uint8_t> &content) {
+         // Calculate the starting address of the key data in the content buffer
+         const auto key_begin = content.begin() + sfile.header.key_table_start + sfile.entries[i].entry.key_offset;
+ 
+-        // Extract the key data from the content buffer and assign it to 'key' as a string
+-        // Subtract 1 from keySize to avoid including the null terminator
+-        sfile.entries[i].data.first = std::string(key_begin, key_begin + keySize - 1);
++        sfile.entries[i].data.first = std::string(key_begin, std::find(key_begin, key_begin + keySize, '\0'));
+     }
+ 
+     // Parse each SFO entry and extract its associated data
+     for (uint32_t i = 0; i < sfile.header.tables_entries; i++) {
+         const uint32_t dataSize = sfile.entries[i].entry.data_len;
++        if (static_cast<uint64_t>(sfile.header.data_table_start) + sfile.entries[i].entry.data_offset + dataSize > content.size()
++            || (sfile.entries[i].entry.data_fmt == SfoDataFormat::UINT32_T && dataSize < sizeof(uint32_t))
++            || (sfile.entries[i].entry.data_fmt == SfoDataFormat::UTF8_NULL && dataSize == 0)) {
++            return false;
++        }
+ 
+         // Resize the destination string to match the data size
+         sfile.entries[i].data.second.resize(dataSize);
+@@ -153,7 +169,7 @@ bool load(SfoFile &sfile, const std::vector<uint8_t> &content) {
+             break;
+         case SfoDataFormat::UTF8_NULL:
+             // Interpret the data as a null-terminated UTF-8 string (exclude the null byte)
+-            sfile.entries[i].data.second = std::string(data.begin(), data.end() - 1);
++            sfile.entries[i].data.second = std::string(data.begin(), std::find(data.begin(), data.end(), '\0'));
+             break;
+         default:
+             // Unknown or unsupported data format
+diff --git a/vita3k/packages/src/vci.cpp b/vita3k/packages/src/vci.cpp
+index 4eb1f4f0..bd26315a 100644
+--- a/vita3k/packages/src/vci.cpp
++++ b/vita3k/packages/src/vci.cpp
+@@ -220,7 +220,10 @@ bool install_vci(const fs::path &vci_path, EmuEnvState &emuenv, const std::funct
+     }
+     vfs::FileBuffer param;
+     fs_utils::read_data(param_sfo, param);
+-    sfo::get_param_info(emuenv.app_info, param, emuenv.cfg.sys_lang);
++    if (!sfo::get_param_info(emuenv.app_info, param, emuenv.cfg.sys_lang) || emuenv.app_info.app_title_id.empty()) {
++        LOG_ERROR("VCI: param.sfo at {} is not readable or has no title ID", fs_utils::path_to_utf8(param_sfo));
++        return false;
++    }
+     LOG_INFO("Found {} [{}], category: {}, content id: {}", emuenv.app_info.app_title, emuenv.app_info.app_title_id, emuenv.app_info.app_category, emuenv.app_info.app_content_id);
+ 
+     // 8) Choose the ux0 destination (a cart image is always a full app)
 diff --git a/vita3k/ps4/ps4.cmake b/vita3k/ps4/ps4.cmake
 new file mode 100644
 index 00000000..ee872066
@@ -9622,6 +11798,18 @@ index 00000000..ced3b207
 +int ps4wsi_video_handle();
 +// Flips submitted by swapchains so far
 +unsigned long long ps4wsi_flip_count();
+diff --git a/vita3k/renderer/include/renderer/functions.h b/vita3k/renderer/include/renderer/functions.h
+index c45a74c4..502fcc60 100644
+--- a/vita3k/renderer/include/renderer/functions.h
++++ b/vita3k/renderer/include/renderer/functions.h
+@@ -176,6 +176,7 @@ namespace texture {
+ void palette_texture_to_rgba_4(uint32_t *dst, const uint8_t *src, uint32_t width, uint32_t height, const uint32_t *palette);
+ void palette_texture_to_rgba_8(uint32_t *dst, const uint8_t *src, uint32_t width, uint32_t height, const uint32_t *palette);
+ void yuv420_texture_to_rgb(YUVConversionCache &cache, uint8_t *dst, const uint8_t *src, uint32_t width, uint32_t height, uint32_t layout_width, uint32_t layout_height, bool is_p3);
++void yuv422_texture_to_rgba(uint8_t *dst, const uint8_t *src, uint32_t width, uint32_t height, SceGxmTextureFormat fmt);
+ const uint32_t *get_texture_palette(const SceGxmTexture &texture, const MemState &mem);
+ 
+ // Assume fmt is a bcn format
 diff --git a/vita3k/renderer/include/renderer/ps4_render_stats.h b/vita3k/renderer/include/renderer/ps4_render_stats.h
 new file mode 100644
 index 00000000..ac02fed2
@@ -9882,6 +12070,40 @@ index 1a5bc612..b18966ea 100644
      // support for the VK_KHR_uniform_buffer_standard_layout extension, needed for memory mapping and texture viewport
      bool support_standard_layout = false;
      bool support_rasterized_order_access = false;
+diff --git a/vita3k/renderer/include/renderer/vulkan/surface_cache.h b/vita3k/renderer/include/renderer/vulkan/surface_cache.h
+index 9da36e2e..3d4b37eb 100644
+--- a/vita3k/renderer/include/renderer/vulkan/surface_cache.h
++++ b/vita3k/renderer/include/renderer/vulkan/surface_cache.h
+@@ -60,6 +60,8 @@ struct Framebuffer {
+     vk::Framebuffer shader_interlock;
+     // base color image used by the framebuffer
+     vkutil::Image *base_image;
++    uint32_t width;
++    uint32_t height;
+ };
+ 
+ struct CastedTexture {
+diff --git a/vita3k/renderer/include/renderer/vulkan/types.h b/vita3k/renderer/include/renderer/vulkan/types.h
+index 4adf5464..0a20c6f1 100644
+--- a/vita3k/renderer/include/renderer/vulkan/types.h
++++ b/vita3k/renderer/include/renderer/vulkan/types.h
+@@ -312,6 +312,8 @@ struct VKContext : public renderer::Context {
+ 
+     vk::Framebuffer current_framebuffer;
+     vk::Framebuffer current_shader_interlock_framebuffer = nullptr;
++    uint32_t current_framebuffer_width = 0;
++    uint32_t current_framebuffer_height = 0;
+     // we need the format or image for some cases
+     vkutil::Image *current_color_base_image;
+     vk::Format current_color_format;
+@@ -373,6 +375,7 @@ struct VKRenderTarget : public renderer::RenderTarget {
+     vk::Device device;
+     uint16_t width;
+     uint16_t height;
++    bool msaa_no_downscale_active = false;
+     vkutil::Image color;
+     vkutil::Image depthstencil;
+     vkutil::Image mask;
 diff --git a/vita3k/renderer/src/batch.cpp b/vita3k/renderer/src/batch.cpp
 index 87e5a8e1..6f2ddf72 100644
 --- a/vita3k/renderer/src/batch.cpp
@@ -9992,8 +12214,99 @@ index 87e5a8e1..6f2ddf72 100644
          state.async_flip_requested.store(false, std::memory_order_relaxed);
  
  #ifdef TRACY_ENABLE
+diff --git a/vita3k/renderer/src/gl/renderer.cpp b/vita3k/renderer/src/gl/renderer.cpp
+index 58600751..39a8516a 100644
+--- a/vita3k/renderer/src/gl/renderer.cpp
++++ b/vita3k/renderer/src/gl/renderer.cpp
+@@ -404,6 +404,10 @@ void set_context(GLState &state, GLContext &context, const MemState &mem, const
+     sync_stencil_func(context.record.back_stencil_state_op, context.record.back_stencil_state_values, mem, true);
+     sync_stencil_func(context.record.front_stencil_state_op, context.record.front_stencil_state_values, mem, false);
+ 
++#if defined(GL_PROGRAM_POINT_SIZE) && !defined(__ANDROID__)
++    glEnable(GL_PROGRAM_POINT_SIZE);
++#endif
++
+     if (context.record.region_clip_mode != SCE_GXM_REGION_CLIP_NONE) {
+         glEnable(GL_SCISSOR_TEST);
+     }
+diff --git a/vita3k/renderer/src/gl/surface_cache.cpp b/vita3k/renderer/src/gl/surface_cache.cpp
+index c92e2983..42bd7c26 100644
+--- a/vita3k/renderer/src/gl/surface_cache.cpp
++++ b/vita3k/renderer/src/gl/surface_cache.cpp
+@@ -189,6 +189,8 @@ GLuint GLSurfaceCache::retrieve_color_surface_texture_handle(const State &state,
+                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                     }
++                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                     glCopyImageSubData(bind_texture_id, GL_TEXTURE_2D, 0, 0, 0, 0, temp_texture, GL_TEXTURE_2D, 0, 0, 0, 0, prev_width, prev_height, 1);
+ 
+                     glBindTexture(GL_TEXTURE_2D, bind_texture_id);
+@@ -201,6 +203,8 @@ GLuint GLSurfaceCache::retrieve_color_surface_texture_handle(const State &state,
+                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                     }
++                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                     glCopyImageSubData(temp_texture, GL_TEXTURE_2D, 0, 0, 0, 0, bind_texture_id, GL_TEXTURE_2D, 0, 0, 0, 0, prev_width, prev_height, 1);
+ 
+                     glDeleteTextures(1, &temp_texture);
+@@ -215,6 +219,8 @@ GLuint GLSurfaceCache::retrieve_color_surface_texture_handle(const State &state,
+                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                     }
++                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                 }
+             };
+ 
+@@ -361,6 +367,8 @@ GLuint GLSurfaceCache::retrieve_color_surface_texture_handle(const State &state,
+                         // Make it a complete texture (what kind of requirement is this)?
+                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+ 
+                         glCopyImageSubData(info.gl_texture[0], GL_TEXTURE_2D, 0, static_cast<GLint>(start_x), static_cast<GLint>(start_sourced_line), 0, casted_info.texture[0], GL_TEXTURE_2D,
+                             0, 0, 0, 0, width, height, 1);
+@@ -373,6 +381,8 @@ GLuint GLSurfaceCache::retrieve_color_surface_texture_handle(const State &state,
+ 
+                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                     }
+ 
+                     casted_info.format = base_format;
+@@ -397,6 +407,8 @@ GLuint GLSurfaceCache::retrieve_color_surface_texture_handle(const State &state,
+                             glTexImage2D(GL_TEXTURE_2D, 0, surface_internal_format, width, height, 0, surface_upload_format, surface_data_type, nullptr);
+                             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                         }
+ 
+                         glCopyImageSubData(info.gl_texture[0], GL_TEXTURE_2D, 0, 0, 0, 0, info.gl_expected_read_texture_view[0], GL_TEXTURE_2D,
+@@ -469,6 +481,8 @@ GLuint GLSurfaceCache::retrieve_color_surface_texture_handle(const State &state,
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+     }
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+ 
+     if (color_surface_textures.contains(key)) {
+         LOG_WARN_ONCE("Two different surfaces have the same base address, this is not handled, an openGL error will happen.");
+@@ -532,6 +546,8 @@ GLuint GLSurfaceCache::retrieve_ping_pong_color_surface_texture_handle(Ptr<void>
+         glTexImage2D(GL_TEXTURE_2D, 0, surface_internal_format, info.width, info.height, 0, surface_upload_format, surface_data_type, nullptr);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+     } else {
+         glBindTexture(GL_TEXTURE_2D, info.gl_ping_pong_texture[0]);
+     }
 diff --git a/vita3k/renderer/src/state_set.cpp b/vita3k/renderer/src/state_set.cpp
-index e983487e..760ab826 100644
+index e983487e..6ebbcc23 100644
 --- a/vita3k/renderer/src/state_set.cpp
 +++ b/vita3k/renderer/src/state_set.cpp
 @@ -15,6 +15,9 @@
@@ -10006,6 +12319,41 @@ index e983487e..760ab826 100644
  #include <gxm/types.h>
  #include <renderer/commands.h>
  #include <renderer/driver_functions.h>
+@@ -41,18 +44,18 @@ COMMAND_SET_STATE(region_clip) {
+     render_context->record.region_clip_mode = helper.pop<SceGxmRegionClipMode>();
+ 
+     // see COMMAND_SET_STATE(viewport) for an explanation
+-    uint32_t factor = 1;
++    float factor = 1.0f;
+     const bool has_msaa = (render_context->current_render_target && render_context->current_render_target->multisample_mode);
+     const bool has_downscale = render_context->record.color_surface.downscale;
+     if (has_msaa && !has_downscale)
+-        factor = 2;
++        factor = 2.0f;
+     else if (!has_msaa && has_downscale)
+-        factor = 1;
++        factor = 0.5f;
+ 
+-    const uint32_t xMin = helper.pop<uint32_t>() * factor;
+-    const uint32_t xMax = helper.pop<uint32_t>() * factor;
+-    const uint32_t yMin = helper.pop<uint32_t>() * factor;
+-    const uint32_t yMax = helper.pop<uint32_t>() * factor;
++    const uint32_t xMin = static_cast<uint32_t>(helper.pop<uint32_t>() * factor);
++    const uint32_t xMax = static_cast<uint32_t>(helper.pop<uint32_t>() * factor);
++    const uint32_t yMin = static_cast<uint32_t>(helper.pop<uint32_t>() * factor);
++    const uint32_t yMax = static_cast<uint32_t>(helper.pop<uint32_t>() * factor);
+ 
+     render_context->record.region_clip_min.x = static_cast<SceInt>(align_down(xMin, SCE_GXM_TILE_SIZEX));
+     render_context->record.region_clip_min.y = static_cast<SceInt>(align_down(yMin, SCE_GXM_TILE_SIZEY));
+@@ -157,7 +160,7 @@ COMMAND_SET_STATE(viewport) {
+         if (has_msaa && !has_downscale)
+             factor = 2.0f;
+         else if (!has_msaa && has_downscale)
+-            factor = 1.0f;
++            factor = 0.5f;
+ 
+         const float xOffset = helper.pop<float>() * factor;
+         const float yOffset = helper.pop<float>() * factor;
 @@ -562,6 +565,11 @@ COMMAND(handle_set_state) {
  
      if (result != handlers.end()) {
@@ -10018,8 +12366,108 @@ index e983487e..760ab826 100644
          result->second(renderer, mem, config, helper, render_context);
      } else {
          LOG_ERROR("Unknown state set command {}", static_cast<uint16_t>(gxm_state_to_set));
+diff --git a/vita3k/renderer/src/texture/cache.cpp b/vita3k/renderer/src/texture/cache.cpp
+index 955648eb..015829a5 100644
+--- a/vita3k/renderer/src/texture/cache.cpp
++++ b/vita3k/renderer/src/texture/cache.cpp
+@@ -325,8 +325,8 @@ void TextureCache::upload_texture(const SceGxmTexture &gxm_texture, MemState &me
+     const SceGxmTextureFormat fmt = gxm::get_format(gxm_texture);
+     const SceGxmTextureBaseFormat base_format = gxm::get_base_format(fmt);
+ 
+-    if (base_format == SCE_GXM_TEXTURE_BASE_FORMAT_YUV422) {
+-        LOG_ERROR_ONCE("Unimplemented YUV format 0x{:0X}, please report it to the developers.", fmt::underlying(base_format));
++    if (base_format == SCE_GXM_TEXTURE_BASE_FORMAT_YUV422 && gxm_texture.texture_type() != SCE_GXM_TEXTURE_LINEAR && gxm_texture.texture_type() != SCE_GXM_TEXTURE_LINEAR_STRIDED) {
++        LOG_ERROR_ONCE("Unimplemented non-linear YUV422 texture (type 0x{:0X}), please report it to the developers.", fmt::underlying(gxm_texture.texture_type()));
+         return;
+     }
+ 
+@@ -535,6 +535,14 @@ void TextureCache::upload_texture(const SceGxmTexture &gxm_texture, MemState &me
+             bpp = 32;
+             upload_format = SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8;
+             break;
++        case SCE_GXM_TEXTURE_BASE_FORMAT_YUV422:
++            texture_data_decompressed.resize(pixels_per_stride * memory_height * 4);
++            yuv422_texture_to_rgba(texture_data_decompressed.data(), static_cast<const uint8_t *>(pixels), pixels_per_stride, memory_height, fmt);
++            pixels = texture_data_decompressed.data();
++            bytes_per_pixel = 4;
++            bpp = 32;
++            upload_format = SCE_GXM_TEXTURE_BASE_FORMAT_U8U8U8U8;
++            break;
+         default:
+             break;
+         }
+diff --git a/vita3k/renderer/src/texture/yuv.cpp b/vita3k/renderer/src/texture/yuv.cpp
+index fe04180a..3af3fe76 100644
+--- a/vita3k/renderer/src/texture/yuv.cpp
++++ b/vita3k/renderer/src/texture/yuv.cpp
+@@ -18,6 +18,8 @@
+ #include <renderer/functions.h>
+ #include <renderer/texture_cache.h>
+ 
++#include <algorithm>
++
+ extern "C" {
+ #include <libswscale/swscale.h>
+ }
+@@ -82,6 +84,56 @@ void yuv420_texture_to_rgb(YUVConversionCache &cache, uint8_t *dst, const uint8_
+     assert(error == height);
+ }
+ 
++// Packed 4:2:2, two pixels in 4 bytes. CSC0 is BT.601 and CSC1 BT.709, both video range (as the
++// YUV420 path above, which uses swscale's default BT.601 video range).
++void yuv422_texture_to_rgba(uint8_t *dst, const uint8_t *src, uint32_t width, uint32_t height, SceGxmTextureFormat fmt) {
++    const auto mode = static_cast<SceGxmTextureSwizzleYUV422Mode>(fmt & SCE_GXM_TEXTURE_SWIZZLE_MASK);
++    const bool bt709 = mode >= SCE_GXM_TEXTURE_SWIZZLE_YUYV_CSC1;
++    // byte offsets of Y0, Y1, U and V in each 4-byte pair
++    int y0, y1, u, v;
++    switch (mode) {
++    case SCE_GXM_TEXTURE_SWIZZLE_YUYV_CSC0:
++    case SCE_GXM_TEXTURE_SWIZZLE_YUYV_CSC1:
++        y0 = 0, u = 1, y1 = 2, v = 3;
++        break;
++    case SCE_GXM_TEXTURE_SWIZZLE_YVYU_CSC0:
++    case SCE_GXM_TEXTURE_SWIZZLE_YVYU_CSC1:
++        y0 = 0, v = 1, y1 = 2, u = 3;
++        break;
++    case SCE_GXM_TEXTURE_SWIZZLE_UYVY_CSC0:
++    case SCE_GXM_TEXTURE_SWIZZLE_UYVY_CSC1:
++        u = 0, y0 = 1, v = 2, y1 = 3;
++        break;
++    default: // VYUY
++        v = 0, y0 = 1, u = 2, y1 = 3;
++        break;
++    }
++    // 16.16 fixed point coefficients: Y scale, V->R, U->G, V->G, U->B
++    const int ky = 76309; // 255 / 219
++    const int kvr = bt709 ? 117504 : 104597;
++    const int kug = bt709 ? 13954 : 25675;
++    const int kvg = bt709 ? 34903 : 53279;
++    const int kub = bt709 ? 138453 : 132201;
++    const auto clamp8 = [](int x) { return static_cast<uint8_t>(std::clamp(x >> 16, 0, 255)); };
++    const auto pixel = [&](uint8_t *out, int y, int cu, int cv) {
++        const int luma = (y - 16) * ky + 32768;
++        out[0] = clamp8(luma + kvr * cv);
++        out[1] = clamp8(luma - kug * cu - kvg * cv);
++        out[2] = clamp8(luma + kub * cu);
++        out[3] = 255;
++    };
++    for (uint32_t row = 0; row < height; row++) {
++        const uint8_t *in = src + static_cast<size_t>(row) * width * 2;
++        uint8_t *out = dst + static_cast<size_t>(row) * width * 4;
++        for (uint32_t x = 0; x + 1 < width; x += 2, in += 4, out += 8) {
++            const int cu = in[u] - 128;
++            const int cv = in[v] - 128;
++            pixel(out, in[y0], cu, cv);
++            pixel(out + 4, in[y1], cu, cv);
++        }
++    }
++}
++
+ } // namespace renderer::texture
+ 
+ renderer::TextureCache::~TextureCache() {
 diff --git a/vita3k/renderer/src/vulkan/context.cpp b/vita3k/renderer/src/vulkan/context.cpp
-index 689060fb..11e3e88a 100644
+index 689060fb..939984bb 100644
 --- a/vita3k/renderer/src/vulkan/context.cpp
 +++ b/vita3k/renderer/src/vulkan/context.cpp
 @@ -28,6 +28,11 @@
@@ -10034,7 +12482,69 @@ index 689060fb..11e3e88a 100644
  namespace renderer::vulkan {
  
  void VKContext::wait_thread_function(const MemState &mem) {
-@@ -750,7 +755,14 @@ void new_frame(VKContext &context) {
+@@ -156,8 +161,15 @@ void set_context(VKContext &context, MemState &mem, VKRenderTarget *rt, const Fe
+ 
+     if (rt->multisample_mode && !context.record.color_surface.downscale) {
+         // using MSAA without downscaling, emulate this as best as we can by multiplying the width and height of the render target by 2
+-        rt->width *= 2;
+-        rt->height *= 2;
++        if (!rt->msaa_no_downscale_active) {
++            rt->width *= 2;
++            rt->height *= 2;
++            rt->msaa_no_downscale_active = true;
++        }
++    } else if (rt->msaa_no_downscale_active) {
++        rt->width /= 2;
++        rt->height /= 2;
++        rt->msaa_no_downscale_active = false;
+     }
+ 
+     SceGxmDepthStencilSurface *ds_surface_fin = &context.record.depth_stencil_surface;
+@@ -222,6 +234,8 @@ void set_context(VKContext &context, MemState &mem, VKRenderTarget *rt, const Fe
+     context.current_framebuffer = framebuffer.standard;
+     context.current_shader_interlock_framebuffer = framebuffer.shader_interlock;
+     context.current_color_base_image = framebuffer.base_image;
++    context.current_framebuffer_width = framebuffer.width;
++    context.current_framebuffer_height = framebuffer.height;
+ 
+     // make sure we are not keeping any texture from the previous pass
+     // (textures can be still bound even though they are not used)
+@@ -393,7 +407,7 @@ void VKContext::start_render_pass(bool create_descriptor_set, bool maskupdate) {
+     } else {
+         curr_renderpass_info.renderArea = vk::Rect2D{
+             .offset = { 0, 0 },
+-            .extent = { render_target->width, render_target->height }
++            .extent = { current_framebuffer_width, current_framebuffer_height }
+         };
+     }
+ 
+@@ -640,19 +654,18 @@ void VKContext::stop_recording(const SceGxmNotification &notif1, const SceGxmNot
+     if (!submit)
+         return;
+ 
+-    if (render_target->multisample_mode && !record.color_surface.downscale) {
+-        // revert changes made in set_context
+-        render_target->width /= 2;
+-        render_target->height /= 2;
+-    }
+-
+     vk::Fence fence = next_fence;
+     next_fence = nullptr;
+ 
+     vk::SubmitInfo submit_info{};
+     submit_info.setCommandBuffers(cmdbuffers_to_submit);
+ 
+-    state.general_queue.submit(submit_info, fence);
++    try {
++        state.general_queue.submit(submit_info, fence);
++    } catch (const vk::SystemError &error) {
++        LOG_ERROR("Vulkan queue submit failed: {}", error.what());
++        throw;
++    }
+     cmdbuffers_to_submit.clear();
+     state.frame().rendered_fences.push_back(fence);
+ 
+@@ -750,7 +763,14 @@ void new_frame(VKContext &context) {
                  return context.last_frame_waited >= previous_frame_timestamp;
              });
          } else {
@@ -10397,6 +12907,19 @@ index 192dba99..4ae1b08b 100644
      };
      cmd_buffer.pushConstants(pipeline_layout_rcas, vk::ShaderStageFlagBits::eCompute, 0, sizeof(RcasConstant), &rcas_constant);
      cmd_buffer.dispatch(dispatch_x, dispatch_y, 1);
+diff --git a/vita3k/renderer/src/vulkan/surface_cache.cpp b/vita3k/renderer/src/vulkan/surface_cache.cpp
+index 84f14b6a..59999c19 100644
+--- a/vita3k/renderer/src/vulkan/surface_cache.cpp
++++ b/vita3k/renderer/src/vulkan/surface_cache.cpp
+@@ -1203,7 +1203,7 @@ Framebuffer &VKSurfaceCache::retrieve_framebuffer_handle(MemState &mem, SceGxmCo
+         fb_interlock = state.device.createFramebuffer(fb_info);
+     }
+ 
+-    return (framebuffer_array[key] = { fb_standard, fb_interlock, color_result.base_image });
++    return (framebuffer_array[key] = { fb_standard, fb_interlock, color_result.base_image, framebuffer_width, framebuffer_height });
+ }
+ 
+ bool VKSurfaceCache::check_for_surface(MemState &mem, Address source_address, CallbackRequestFunction &callback, Address target_address) {
 diff --git a/vita3k/renderer/src/vulkan/texture.cpp b/vita3k/renderer/src/vulkan/texture.cpp
 index 3a0120c1..e4d8cb35 100644
 --- a/vita3k/renderer/src/vulkan/texture.cpp
@@ -10437,7 +12960,7 @@ index 3a0120c1..e4d8cb35 100644
      current_texture->mip_count = mip_count;
      current_texture->is_cube = is_cube;
 diff --git a/vita3k/shader/include/shader/spirv_recompiler.h b/vita3k/shader/include/shader/spirv_recompiler.h
-index f93de644..cbe7d451 100644
+index f93de644..3a3fe06f 100644
 --- a/vita3k/shader/include/shader/spirv_recompiler.h
 +++ b/vita3k/shader/include/shader/spirv_recompiler.h
 @@ -31,7 +31,13 @@ namespace shader {
@@ -10447,7 +12970,7 @@ index f93de644..cbe7d451 100644
 +#ifdef __PS4__
 +// upstream's 14, then the PS4 port's translator changes (01: !p2, loop guard): shaders cached by an
 +// older translation are made again
-+static constexpr uint32_t CURRENT_VERSION = 1401;
++static constexpr uint32_t CURRENT_VERSION = 1402;
 +#else
  static constexpr uint32_t CURRENT_VERSION = 14;
 +#endif
@@ -10469,6 +12992,25 @@ index 4af0f1e3..a5e4eb6c 100644
  
  //
  // Disasm helpers
+diff --git a/vita3k/shader/include/shader/usse_translator.h b/vita3k/shader/include/shader/usse_translator.h
+index e257ff90..755f4356 100644
+--- a/vita3k/shader/include/shader/usse_translator.h
++++ b/vita3k/shader/include/shader/usse_translator.h
+@@ -153,8 +153,12 @@ private:
+                 return repeat_index * 4;
+             }
+         }
+-        if (repeat_mode == RepeatMode::EXTERNAL && bank != RegisterBank::FPINTERNAL) {
+-            return repeat_index * 4;
++        if (repeat_mode == RepeatMode::EXTERNAL) {
++            if (bank == RegisterBank::FPINTERNAL) {
++                return repeat_index;
++            } else {
++                return repeat_index * 4;
++            }
+         }
+         if (repeat_mode == RepeatMode::SLMSI) {
+             auto inc = repeat_increase[op.index][repeat_index];
 diff --git a/vita3k/shader/include/shader/usse_types.h b/vita3k/shader/include/shader/usse_types.h
 index e31942f2..42665d6d 100644
 --- a/vita3k/shader/include/shader/usse_types.h
@@ -10519,6 +13061,19 @@ index 00c041e1..19335445 100644
      default: return "invalid";
      }
  }
+diff --git a/vita3k/shader/src/usse_program_analyzer.cpp b/vita3k/shader/src/usse_program_analyzer.cpp
+index 92835a2d..d431dce0 100644
+--- a/vita3k/shader/src/usse_program_analyzer.cpp
++++ b/vita3k/shader/src/usse_program_analyzer.cpp
+@@ -586,7 +586,7 @@ void analyze(USSEBlockNode &root, USSEOffset end_offset, const AnalyzeReadFuncti
+             }
+         }
+ 
+-        if (current_code_inst) {
++        if (current_code_inst && current_code->offset <= request.end_offset) {
+             current_code->size = request.end_offset - current_code->offset + 1;
+             request.block_node->add_children(current_code_inst);
+         }
 diff --git a/vita3k/shader/src/usse_translator_entry.cpp b/vita3k/shader/src/usse_translator_entry.cpp
 index e9f0e42f..6effc570 100644
 --- a/vita3k/shader/src/usse_translator_entry.cpp
