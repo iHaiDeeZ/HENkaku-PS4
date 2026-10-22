@@ -3004,7 +3004,7 @@ index 5ce4c807..59ac584a 100644
      if (emuenv.display.abort.load())
          return SCE_DISPLAY_ERROR_NO_PIXEL_DATA;
 diff --git a/vita3k/modules/SceGxm/SceGxm.cpp b/vita3k/modules/SceGxm/SceGxm.cpp
-index 4c864368..9e792861 100644
+index 4c864368..595d3069 100644
 --- a/vita3k/modules/SceGxm/SceGxm.cpp
 +++ b/vita3k/modules/SceGxm/SceGxm.cpp
 @@ -48,6 +48,11 @@
@@ -3152,7 +3152,27 @@ index 4c864368..9e792861 100644
          }
      }
  
-@@ -2884,6 +2925,8 @@ EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params) {
+@@ -2676,17 +2717,8 @@ EXPORT(int, sceGxmExecuteCommandList, SceGxmContext *context, SceGxmCommandList
+     if (!commandList || !commandList->list)
+         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
+ 
+-    // Emit a jump to the first command of given command list
+-    // Link the deferred commands into the immediate context currently recording this scene.
+-    renderer::CommandList &imm_cmds = context->renderer->command_list;
+-
+-    if (imm_cmds.last) {
+-        imm_cmds.last->next = commandList->list->first;
+-        imm_cmds.last = commandList->list->last;
+-    } else {
+-        imm_cmds.first = commandList->list->first;
+-        imm_cmds.last = commandList->list->last;
+-    }
++    // Deferred VDM buffers may be reused before the render thread consumes them.
++    renderer::append_command_list(*context->renderer, *commandList->list);
+ 
+     // Restore back our GXM state
+     gxmContextStateRestore(*emuenv.renderer, context, true);
+@@ -2884,6 +2916,8 @@ EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params) {
      // the case where displayQueueMaxPendingCount is 1 handled in sceGxmDisplayQueueAddEntry
      const uint32_t max_queue_size = std::max(std::min(params->displayQueueMaxPendingCount, 3U) - 1, 1U);
      emuenv.gxm.display_queue.maxPendingCount_ = max_queue_size;
@@ -4602,7 +4622,7 @@ index 4eb1f4f0..bd26315a 100644
      // 8) Choose the ux0 destination (a cart image is always a full app)
 diff --git a/vita3k/ps4/ps4.cmake b/vita3k/ps4/ps4.cmake
 new file mode 100644
-index 00000000..ee872066
+index 00000000..244018b4
 --- /dev/null
 +++ b/vita3k/ps4/ps4.cmake
 @@ -0,0 +1,41 @@
@@ -4633,7 +4653,7 @@ index 00000000..ee872066
 +
 +# archive.h and the other headers next to main.cpp
 +target_include_directories(vita3k PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-+target_link_libraries(vita3k PRIVATE emuenv mem overlay stb vulkan SDL3::SDL3)
++target_link_libraries(vita3k PRIVATE camera emuenv mem overlay stb vulkan SDL3::SDL3)
 +# the launcher's firmware download (ps4_download.cpp)
 +target_link_libraries(vita3k PRIVATE libcurl)
 +
@@ -10345,10 +10365,10 @@ index 00000000..4291971e
 +} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_settings.cpp b/vita3k/ps4/ps4_settings.cpp
 new file mode 100644
-index 00000000..e0ab7eef
+index 00000000..a9d7b8f0
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.cpp
-@@ -0,0 +1,647 @@
+@@ -0,0 +1,684 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -10384,6 +10404,7 @@ index 00000000..e0ab7eef
 +#include "ps4_controls.h"
 +
 +#include <app/functions.h>
++#include <camera/state.h>
 +#include <config/functions.h>
 +#include <config/settings.h>
 +#include <config/state.h>
@@ -10687,6 +10708,32 @@ index 00000000..e0ab7eef
 +    return items;
 +}
 +
++// The Vita's cameras: the PS4 has none for them, so they see a solid colour. Dark, or bright for
++// the puzzles that want light on a camera (Uncharted: Golden Abyss, chapter 13). Changes at once.
++Item camera_choice(EmuEnvState &emuenv) {
++    constexpr uint32_t DARK = 0xFF000000, BRIGHT = 0xFFFFFFFF;
++    Item item;
++    item.type = Item::kind::choice;
++    item.name = "Camera picture";
++    item.note = "bright passes light puzzles";
++    item.values = { "Dark", "Bright" };
++    item.get = [&emuenv] {
++        const std::lock_guard<std::mutex> lock(settings_mutex);
++        return emuenv.cfg.back_camera_type == CameraType::SolidColor && emuenv.cfg.back_camera_color == BRIGHT ? 1 : 0;
++    };
++    item.set = [&emuenv](int index) {
++        const std::lock_guard<std::mutex> lock(settings_mutex);
++        const uint32_t color = index == 1 ? BRIGHT : DARK;
++        emuenv.cfg.front_camera_type = emuenv.cfg.back_camera_type = CameraType::SolidColor;
++        emuenv.cfg.front_camera_color = emuenv.cfg.back_camera_color = color;
++        config::serialize_config(emuenv.cfg, emuenv.cfg.config_path);
++        // a camera the game has open shows it from its next frame
++        emuenv.camera.front()->update_config(CameraType::SolidColor, {}, {}, color);
++        emuenv.camera.back()->update_config(CameraType::SolidColor, {}, {}, color);
++    };
++    return item;
++}
++
 +Item frame_queue_choice() {
 +    return pref_choice("Frame queue", { "Vita3K's (waits for each frame)", "As on the Vita (smoother)" },
 +        [](const Prefs &p) { return p.frame_overlap ? 1 : 0; },
@@ -10916,7 +10963,12 @@ index 00000000..e0ab7eef
 +    pages.push_back(page("Graphics", graphics_items(emuenv, scope, true, next_start), "resolution, accuracy"));
 +    pages.push_back(page("Audio", audio_items(scope, next_start), "volume"));
 +    pages.push_back(page("CPU", cpu_items(scope, true, next_start), "dynarmic, cores"));
-+    pages.push_back(page("Controls", ps4controls::items({}), "buttons, touch pad, rear touch"));
++    {
++        std::vector<Item> controls = ps4controls::items({});
++        controls.push_back(section("Camera"));
++        controls.push_back(camera_choice(emuenv));
++        pages.push_back(page("Controls", std::move(controls), "buttons, touch, camera"));
++    }
 +
 +    std::vector<Item> system;
 +    system.push_back(section("Home screen"));
@@ -10985,7 +11037,12 @@ index 00000000..e0ab7eef
 +    items.push_back(page("Display", std::move(display), "FPS, filters, FSR 1"));
 +    items.push_back(page("Audio", std::move(sound), "volume"));
 +    items.push_back(page("Speed", std::move(speed), "shaders, FPS hack"));
-+    items.push_back(page("Controls", ps4controls::items(emuenv.io.app_path), "buttons, touch pad, rear touch"));
++    {
++        std::vector<Item> controls = ps4controls::items(emuenv.io.app_path);
++        controls.push_back(section("Camera"));
++        controls.push_back(camera_choice(emuenv));
++        items.push_back(page("Controls", std::move(controls), "buttons, touch, camera"));
++    }
 +    items.push_back(section("From the next start"));
 +    if (!emuenv.io.app_path.empty())
 +        items.push_back(page("This game", game_pages(emuenv, emuenv.io.app_path), "its own settings"));
@@ -11798,11 +11855,37 @@ index 00000000..ced3b207
 +int ps4wsi_video_handle();
 +// Flips submitted by swapchains so far
 +unsigned long long ps4wsi_flip_count();
+diff --git a/vita3k/renderer/CMakeLists.txt b/vita3k/renderer/CMakeLists.txt
+index 0e409449..c92eb3d6 100644
+--- a/vita3k/renderer/CMakeLists.txt
++++ b/vita3k/renderer/CMakeLists.txt
+@@ -79,3 +79,13 @@ endif()
+ if(TRACY_ENABLE_ON_CORE_COMPONENTS)
+ 	target_link_libraries(renderer PRIVATE tracy)
+ endif()
++
++if(NOT ANDROID AND NOT PS4)
++	add_executable(
++		renderer-tests
++		tests/command_list_tests.cpp
++	)
++
++	target_link_libraries(renderer-tests PRIVATE renderer googletest)
++	add_test(NAME renderer COMMAND renderer-tests)
++endif()
 diff --git a/vita3k/renderer/include/renderer/functions.h b/vita3k/renderer/include/renderer/functions.h
-index c45a74c4..502fcc60 100644
+index c45a74c4..4fbfd672 100644
 --- a/vita3k/renderer/include/renderer/functions.h
 +++ b/vita3k/renderer/include/renderer/functions.h
-@@ -176,6 +176,7 @@ namespace texture {
+@@ -109,6 +109,7 @@ void destroy_render_target_during_shutdown(State &state, std::unique_ptr<RenderT
+ 
+ Command *generic_command_allocate();
+ void generic_command_free(Command *cmd);
++void append_command_list(Context &destination, const CommandList &source);
+ void destroy_command_payload(Command &cmd);
+ 
+ template <typename... Args>
+@@ -176,6 +177,7 @@ namespace texture {
  void palette_texture_to_rgba_4(uint32_t *dst, const uint8_t *src, uint32_t width, uint32_t height, const uint32_t *palette);
  void palette_texture_to_rgba_8(uint32_t *dst, const uint8_t *src, uint32_t width, uint32_t height, const uint32_t *palette);
  void yuv420_texture_to_rgb(YUVConversionCache &cache, uint8_t *dst, const uint8_t *src, uint32_t width, uint32_t height, uint32_t layout_width, uint32_t layout_height, bool is_p3);
@@ -11915,6 +11998,19 @@ index 65b81052..c999b5c1 100644
      bool disable_surface_sync;
      bool stretch_the_display_area;
      bool fullscreen_hd_res_pixel_perfect;
+diff --git a/vita3k/renderer/include/renderer/texture_cache.h b/vita3k/renderer/include/renderer/texture_cache.h
+index 3860cced..698329d3 100644
+--- a/vita3k/renderer/include/renderer/texture_cache.h
++++ b/vita3k/renderer/include/renderer/texture_cache.h
+@@ -156,7 +156,7 @@ public:
+     void cache_and_bind_texture(const SceGxmTexture &gxm_texture, MemState &mem);
+ 
+     // is called by cache_and_bind_texture if use_sampler_cache is set to true
+-    int cache_and_bind_sampler(const SceGxmTexture &gxm_texture, bool is_depth = false);
++    int cache_and_bind_sampler(const SceGxmTexture &gxm_texture, bool force_nearest = false);
+ 
+     // look at the texture folder and update the available imported / exported hashes
+     void refresh_available_textures();
 diff --git a/vita3k/renderer/include/renderer/vulkan/ps4_vertex_layout.h b/vita3k/renderer/include/renderer/vulkan/ps4_vertex_layout.h
 new file mode 100644
 index 00000000..dad76a8f
@@ -12084,10 +12180,54 @@ index 9da36e2e..3d4b37eb 100644
  
  struct CastedTexture {
 diff --git a/vita3k/renderer/include/renderer/vulkan/types.h b/vita3k/renderer/include/renderer/vulkan/types.h
-index 4adf5464..0a20c6f1 100644
+index 4adf5464..2f68352b 100644
 --- a/vita3k/renderer/include/renderer/vulkan/types.h
 +++ b/vita3k/renderer/include/renderer/vulkan/types.h
-@@ -312,6 +312,8 @@ struct VKContext : public renderer::Context {
+@@ -16,6 +16,8 @@
+ // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+ 
+ #pragma once
++#include <array>
++#include <deque>
+ 
+ #include <renderer/texture_cache.h>
+ #include <renderer/types.h>
+@@ -269,6 +271,34 @@ struct VKContext : public renderer::Context {
+     shader::RenderFragUniformBlockExtended curr_frag_ublock;
+ 
+     // scratch memory to contain the constructed render info uniform before copying it
++    // indices rebased on the draw's smallest index before being copied (draw, copy path)
++    std::vector<uint8_t> rebased_indices;
++
++    // RPCS3-style ring tracking: the heads of the rings at each submission, released once
++    // its fence has signaled so that the rings never overwrite data the GPU has not read yet
++    struct PendingSubmission {
++        vk::Fence fence;
++        std::array<uint64_t, 6> heads;
++    };
++    std::deque<PendingSubmission> pending_submissions;
++    std::array<vkutil::RingBuffer *, 6> rings() {
++        return { &vertex_stream_ring_buffer, &index_stream_ring_buffer, &vertex_uniform_stream_ring_buffer,
++            &fragment_uniform_stream_ring_buffer, &vertex_info_uniform_buffer, &fragment_info_uniform_buffer };
++    }
++    std::array<uint64_t, 6> ring_heads() {
++        std::array<uint64_t, 6> heads;
++        const auto all = rings();
++        for (size_t i = 0; i < all.size(); i++)
++            heads[i] = all[i]->get_head();
++        return heads;
++    }
++    void release_rings(const std::array<uint64_t, 6> &heads) {
++        const auto all = rings();
++        for (size_t i = 0; i < all.size(); i++)
++            all[i]->release_until(heads[i]);
++    }
++    // waits for the oldest pending submission and releases its ring data; false if none is pending
++    bool wait_oldest_submission();
+     uint8_t shader_info_temp[std::max(shader::RenderVertUniformBlockExtended::get_max_size(), shader::RenderFragUniformBlockExtended::get_max_size())];
+ 
+     // used to implement the Visibility Buffer
+@@ -312,6 +342,8 @@ struct VKContext : public renderer::Context {
  
      vk::Framebuffer current_framebuffer;
      vk::Framebuffer current_shader_interlock_framebuffer = nullptr;
@@ -12096,7 +12236,7 @@ index 4adf5464..0a20c6f1 100644
      // we need the format or image for some cases
      vkutil::Image *current_color_base_image;
      vk::Format current_color_format;
-@@ -373,6 +375,7 @@ struct VKRenderTarget : public renderer::RenderTarget {
+@@ -373,6 +405,7 @@ struct VKRenderTarget : public renderer::RenderTarget {
      vk::Device device;
      uint16_t width;
      uint16_t height;
@@ -12214,8 +12354,24 @@ index 87e5a8e1..6f2ddf72 100644
          state.async_flip_requested.store(false, std::memory_order_relaxed);
  
  #ifdef TRACY_ENABLE
+diff --git a/vita3k/renderer/src/gl/color_formats.cpp b/vita3k/renderer/src/gl/color_formats.cpp
+index 7b444838..2751c8c2 100644
+--- a/vita3k/renderer/src/gl/color_formats.cpp
++++ b/vita3k/renderer/src/gl/color_formats.cpp
+@@ -204,6 +204,11 @@ GLenum translate_type(SceGxmColorBaseFormat base_format) {
+ }
+ 
+ const GLint *translate_swizzle(SceGxmColorFormat fmt) {
++    // U8_A surfaces are canonicalized to the host red channel by the
++    // shader recompiler. Treat their cached storage as an ordinary R surface.
++    if (fmt == SCE_GXM_COLOR_FORMAT_U8_A)
++        return swizzle_r;
++
+     const SceGxmColorBaseFormat base_format = gxm::get_base_format(fmt);
+     const uint32_t swizzle = fmt & SCE_GXM_COLOR_SWIZZLE_MASK;
+     switch (base_format) {
 diff --git a/vita3k/renderer/src/gl/renderer.cpp b/vita3k/renderer/src/gl/renderer.cpp
-index 58600751..39a8516a 100644
+index 58600751..ef14b531 100644
 --- a/vita3k/renderer/src/gl/renderer.cpp
 +++ b/vita3k/renderer/src/gl/renderer.cpp
 @@ -404,6 +404,10 @@ void set_context(GLState &state, GLContext &context, const MemState &mem, const
@@ -12229,6 +12385,15 @@ index 58600751..39a8516a 100644
      if (context.record.region_clip_mode != SCE_GXM_REGION_CLIP_NONE) {
          glEnable(GL_SCISSOR_TEST);
      }
+@@ -417,7 +421,7 @@ static std::map<SceGxmColorFormat, std::pair<GLenum, GLenum>> GXM_COLOR_FORMAT_T
+     { SCE_GXM_COLOR_FORMAT_U8U8U8_BGR, { GL_RGB, GL_UNSIGNED_BYTE } },
+     { SCE_GXM_COLOR_FORMAT_U5U6U5_RGB, { GL_RGB, GL_UNSIGNED_SHORT_5_6_5 } },
+     { SCE_GXM_COLOR_FORMAT_U8U8_AR, { GL_RG, GL_UNSIGNED_BYTE } },
+-    { SCE_GXM_COLOR_FORMAT_U8_A, { GL_ALPHA, GL_UNSIGNED_BYTE } },
++    { SCE_GXM_COLOR_FORMAT_U8_A, { GL_RED, GL_UNSIGNED_BYTE } },
+     { SCE_GXM_COLOR_FORMAT_U8_R, { GL_RED, GL_UNSIGNED_BYTE } },
+     { SCE_GXM_COLOR_FORMAT_U2F10F10F10_ABGR, { GL_RGBA, GL_UNSIGNED_INT_2_10_10_10_REV } },
+     { SCE_GXM_COLOR_FORMAT_U2U10U10U10_ABGR, { GL_RGBA, GL_UNSIGNED_INT_2_10_10_10_REV } },
 diff --git a/vita3k/renderer/src/gl/surface_cache.cpp b/vita3k/renderer/src/gl/surface_cache.cpp
 index c92e2983..42bd7c26 100644
 --- a/vita3k/renderer/src/gl/surface_cache.cpp
@@ -12305,6 +12470,98 @@ index c92e2983..42bd7c26 100644
      } else {
          glBindTexture(GL_TEXTURE_2D, info.gl_ping_pong_texture[0]);
      }
+diff --git a/vita3k/renderer/src/scene.cpp b/vita3k/renderer/src/scene.cpp
+index f466887d..b9de221a 100644
+--- a/vita3k/renderer/src/scene.cpp
++++ b/vita3k/renderer/src/scene.cpp
+@@ -31,6 +31,8 @@
+ #include <util/log.h>
+ #include <util/tracy.h>
+ 
++#include <cstring>
++
+ #define DEBUG_FRAMEBUFFER 1
+ 
+ #if DEBUG_FRAMEBUFFER
+@@ -39,13 +41,74 @@
+ #endif
+ 
+ namespace renderer {
++template <typename T>
++static T get_command_data(const Command &command, const std::size_t offset) {
++    T value;
++    std::memcpy(&value, command.data + offset, sizeof(value));
++    return value;
++}
++
++template <typename T>
++static void set_command_data(Command &command, const std::size_t offset, const T value) {
++    std::memcpy(command.data + offset, &value, sizeof(value));
++}
++
++static Command *copy_command(Context &destination, const Command &source) {
++    Command *copy = destination.alloc_func();
++    const auto allocation_flags = copy->flags;
++
++    copy->opcode = source.opcode;
++    copy->flags = allocation_flags;
++    std::memcpy(copy->data, source.data, sizeof(copy->data));
++    copy->status = source.status;
++    copy->next = nullptr;
++
++    if (source.opcode == CommandOpcode::SetContext) {
++        constexpr std::size_t color_offset = sizeof(RenderTarget *);
++        constexpr std::size_t depth_offset = color_offset + sizeof(SceGxmColorSurface *);
++        const auto *color_surface = get_command_data<SceGxmColorSurface *>(source, color_offset);
++        const auto *depth_stencil_surface = get_command_data<SceGxmDepthStencilSurface *>(source, depth_offset);
++        auto *color_surface_copy = color_surface ? new SceGxmColorSurface(*color_surface) : nullptr;
++        auto *depth_stencil_surface_copy = depth_stencil_surface ? new SceGxmDepthStencilSurface(*depth_stencil_surface) : nullptr;
++        set_command_data(*copy, color_offset, color_surface_copy);
++        set_command_data(*copy, depth_offset, depth_stencil_surface_copy);
++    }
++
++    return copy;
++}
++
++void append_command_list(Context &destination, const CommandList &source) {
++    Command *first_copy = nullptr;
++    Command *last_copy = nullptr;
++    for (const Command *command = source.first; command; command = command->next) {
++        Command *copy = copy_command(destination, *command);
++        if (last_copy)
++            last_copy->next = copy;
++        else
++            first_copy = copy;
++        last_copy = copy;
++
++        if (command == source.last)
++            break;
++    }
++
++    if (!first_copy)
++        return;
++
++    if (destination.command_list.last)
++        destination.command_list.last->next = first_copy;
++    else
++        destination.command_list.first = first_copy;
++    destination.command_list.last = last_copy;
++}
++
+ void destroy_command_payload(Command &cmd) {
+     switch (cmd.opcode) {
+     case CommandOpcode::SetContext: {
+-        auto *color_surface = reinterpret_cast<SceGxmColorSurface **>(&cmd.data[sizeof(RenderTarget *)]);
+-        auto *depth_stencil_surface = reinterpret_cast<SceGxmDepthStencilSurface **>(&cmd.data[sizeof(RenderTarget *) + sizeof(SceGxmColorSurface *)]);
+-        delete *color_surface;
+-        delete *depth_stencil_surface;
++        const auto *color_surface = get_command_data<SceGxmColorSurface *>(cmd, sizeof(RenderTarget *));
++        const auto *depth_stencil_surface = get_command_data<SceGxmDepthStencilSurface *>(cmd, sizeof(RenderTarget *) + sizeof(SceGxmColorSurface *));
++        delete color_surface;
++        delete depth_stencil_surface;
+         break;
+     }
+ 
 diff --git a/vita3k/renderer/src/state_set.cpp b/vita3k/renderer/src/state_set.cpp
 index e983487e..6ebbcc23 100644
 --- a/vita3k/renderer/src/state_set.cpp
@@ -12367,7 +12624,7 @@ index e983487e..6ebbcc23 100644
      } else {
          LOG_ERROR("Unknown state set command {}", static_cast<uint16_t>(gxm_state_to_set));
 diff --git a/vita3k/renderer/src/texture/cache.cpp b/vita3k/renderer/src/texture/cache.cpp
-index 955648eb..015829a5 100644
+index 955648eb..9376e2fc 100644
 --- a/vita3k/renderer/src/texture/cache.cpp
 +++ b/vita3k/renderer/src/texture/cache.cpp
 @@ -325,8 +325,8 @@ void TextureCache::upload_texture(const SceGxmTexture &gxm_texture, MemState &me
@@ -12396,6 +12653,35 @@ index 955648eb..015829a5 100644
          default:
              break;
          }
+@@ -802,7 +810,7 @@ void TextureCache::cache_and_bind_texture(const SceGxmTexture &gxm_texture, MemS
+         cache_and_bind_sampler(gxm_texture);
+ }
+ 
+-int TextureCache::cache_and_bind_sampler(const SceGxmTexture &gxm_texture, bool is_depth) {
++int TextureCache::cache_and_bind_sampler(const SceGxmTexture &gxm_texture, bool force_nearest) {
+     uint32_t compact_repr = 0;
+     if (gxm_texture.texture_type() != SCE_GXM_TEXTURE_LINEAR_STRIDED) {
+         compact_repr = 0b01
+@@ -822,9 +830,7 @@ int TextureCache::cache_and_bind_sampler(const SceGxmTexture &gxm_texture, bool
+             | (gxm_texture.mag_filter << 8);
+     }
+ 
+-    // the depth part only matters if we can't apply linear filtering to it
+-    is_depth &= !support_depth_linear_filtering;
+-    compact_repr |= (static_cast<uint32_t>(is_depth) << 23);
++    compact_repr |= (static_cast<uint32_t>(force_nearest) << 23);
+ 
+     auto it = sampler_lookup.find(compact_repr);
+     if (it != sampler_lookup.end()) {
+@@ -844,7 +850,7 @@ int TextureCache::cache_and_bind_sampler(const SceGxmTexture &gxm_texture, bool
+     sampler_lookup[compact_repr] = info;
+ 
+     info->value = compact_repr;
+-    configure_sampler(info->index, gxm_texture, is_depth);
++    configure_sampler(info->index, gxm_texture, force_nearest);
+     last_bound_sampler_index = info->index;
+     return last_bound_sampler_index;
+ }
 diff --git a/vita3k/renderer/src/texture/yuv.cpp b/vita3k/renderer/src/texture/yuv.cpp
 index fe04180a..3af3fe76 100644
 --- a/vita3k/renderer/src/texture/yuv.cpp
@@ -12467,7 +12753,7 @@ index fe04180a..3af3fe76 100644
  
  renderer::TextureCache::~TextureCache() {
 diff --git a/vita3k/renderer/src/vulkan/context.cpp b/vita3k/renderer/src/vulkan/context.cpp
-index 689060fb..939984bb 100644
+index 689060fb..14229ec2 100644
 --- a/vita3k/renderer/src/vulkan/context.cpp
 +++ b/vita3k/renderer/src/vulkan/context.cpp
 @@ -28,6 +28,11 @@
@@ -12518,7 +12804,7 @@ index 689060fb..939984bb 100644
          };
      }
  
-@@ -640,19 +654,18 @@ void VKContext::stop_recording(const SceGxmNotification &notif1, const SceGxmNot
+@@ -640,21 +654,23 @@ void VKContext::stop_recording(const SceGxmNotification &notif1, const SceGxmNot
      if (!submit)
          return;
  
@@ -12543,8 +12829,31 @@ index 689060fb..939984bb 100644
 +    }
      cmdbuffers_to_submit.clear();
      state.frame().rendered_fences.push_back(fence);
++    // the ring buffers (info uniforms in every mode) release this work's data once the fence signals
++    if (fence)
++        pending_submissions.push_back({ fence, ring_heads() });
  
-@@ -750,7 +763,14 @@ void new_frame(VKContext &context) {
+     if (state.features.enable_memory_mapping) {
+         // send it to the wait queue
+@@ -721,6 +737,17 @@ void VKContext::check_for_macroblock_change(bool is_draw) {
+     }
+ }
+ 
++bool VKContext::wait_oldest_submission() {
++    if (pending_submissions.empty())
++        return false;
++    const PendingSubmission oldest = pending_submissions.front();
++    pending_submissions.pop_front();
++    if (state.device.waitForFences(oldest.fence, VK_TRUE, std::numeric_limits<uint64_t>::max()) != vk::Result::eSuccess)
++        LOG_ERROR("Could not wait for a submission fence to free ring buffer space");
++    release_rings(oldest.heads);
++    return true;
++}
++
+ void new_frame(VKContext &context) {
+     if (context.state.features.enable_memory_mapping) {
+         FrameDoneRequest request = { context.frame_timestamp };
+@@ -750,7 +777,14 @@ void new_frame(VKContext &context) {
                  return context.last_frame_waited >= previous_frame_timestamp;
              });
          } else {
@@ -12559,6 +12868,59 @@ index 689060fb..939984bb 100644
              if (result != vk::Result::eSuccess) {
                  LOG_ERROR("Could not wait for fences.");
                  assert(false);
+@@ -758,6 +792,13 @@ void new_frame(VKContext &context) {
+             }
+         }
+ 
++        // these submissions are done: release their ring data before their fences get reset and reused
++        while (!context.pending_submissions.empty()
++            && std::ranges::find(frame.rendered_fences, context.pending_submissions.front().fence) != frame.rendered_fences.end()) {
++            context.release_rings(context.pending_submissions.front().heads);
++            context.pending_submissions.pop_front();
++        }
++
+         // reset the fences in both case (the wait thread does not do that as they can still be used)
+         device.resetFences(frame.rendered_fences);
+         frame.rendered_fences.clear();
+diff --git a/vita3k/renderer/src/vulkan/creation.cpp b/vita3k/renderer/src/vulkan/creation.cpp
+index d89da55d..ebae243d 100644
+--- a/vita3k/renderer/src/vulkan/creation.cpp
++++ b/vita3k/renderer/src/vulkan/creation.cpp
+@@ -53,6 +53,18 @@ VKContext::VKContext(VKState &state, MemState &mem)
+     vertex_info_uniform_buffer.alignment = uniform_alignment;
+     fragment_info_uniform_buffer.alignment = uniform_alignment;
+ 
++    vertex_stream_ring_buffer.name = "vertex streams";
++    index_stream_ring_buffer.name = "indices";
++    vertex_uniform_stream_ring_buffer.name = "vertex uniforms";
++    fragment_uniform_stream_ring_buffer.name = "fragment uniforms";
++    vertex_info_uniform_buffer.name = "vertex info";
++    fragment_info_uniform_buffer.name = "fragment info";
++    for (vkutil::RingBuffer *ring : rings())
++        ring->make_room = [this]() { return wait_oldest_submission(); };
++    // bound per draw, so they can grow when a single scene does not fit
++    vertex_stream_ring_buffer.max_capacity = MiB(256);
++    index_stream_ring_buffer.max_capacity = MiB(256);
++
+     if (state.features.enable_memory_mapping) {
+         // use the default buffer
+         std::fill_n(vertex_stream_buffers, SCE_GXM_MAX_VERTEX_STREAMS, state.default_buffer.buffer);
+diff --git a/vita3k/renderer/src/vulkan/gxm_to_vulkan.cpp b/vita3k/renderer/src/vulkan/gxm_to_vulkan.cpp
+index a7fd4fb8..f5d369e3 100644
+--- a/vita3k/renderer/src/vulkan/gxm_to_vulkan.cpp
++++ b/vita3k/renderer/src/vulkan/gxm_to_vulkan.cpp
+@@ -382,6 +382,11 @@ static vk::ComponentMapping translate_swizzle4_a1r5g5b5(SceGxmColorSwizzle4Mode
+ }
+ 
+ vk::ComponentMapping translate_swizzle(SceGxmColorFormat format) {
++    // U8_A surfaces are canonicalized to the host red channel by the
++    // shader recompiler. Treat their cached storage as an ordinary R surface.
++    if (format == SCE_GXM_COLOR_FORMAT_U8_A)
++        return swizzle_r001;
++
+     const SceGxmColorBaseFormat base_format = gxm::get_base_format(format);
+     const uint32_t swizzle = format & SCE_GXM_COLOR_SWIZZLE_MASK;
+     switch (base_format) {
 diff --git a/vita3k/renderer/src/vulkan/pipeline_cache.cpp b/vita3k/renderer/src/vulkan/pipeline_cache.cpp
 index ff6d0c5b..ab744977 100644
 --- a/vita3k/renderer/src/vulkan/pipeline_cache.cpp
@@ -12738,7 +13100,7 @@ index ed8c71ad..093208ad 100644
          dispatch.init();
  #endif
 diff --git a/vita3k/renderer/src/vulkan/scene.cpp b/vita3k/renderer/src/vulkan/scene.cpp
-index acd85ab5..95eb1d1e 100644
+index acd85ab5..0ce23524 100644
 --- a/vita3k/renderer/src/vulkan/scene.cpp
 +++ b/vita3k/renderer/src/vulkan/scene.cpp
 @@ -19,6 +19,10 @@
@@ -12757,28 +13119,21 @@ index acd85ab5..95eb1d1e 100644
  
  // vertex count is only used with double buffer mapping
 -static void bind_vertex_streams(VKContext &context, MemState &mem, uint32_t instance_count, uint32_t max_index) {
-+// first_vertex: the lowest index the draw uses, from which per-vertex streams are copied (the draw
-+// then subtracts it from its indices: vertexOffset), 0 to copy them whole
-+static void bind_vertex_streams(VKContext &context, MemState &mem, uint32_t instance_count, uint32_t max_index, uint32_t first_vertex = 0) {
++// base_index: smallest index of the draw when its indices were rebased on it (copy path only): per-vertex
++// streams then start at that vertex instead of vertex 0.
++static void bind_vertex_streams(VKContext &context, MemState &mem, uint32_t instance_count, uint32_t max_index, uint32_t base_index = 0) {
      GxmRecordState &state = context.record;
      const SceGxmVertexProgram &vertex_program = *state.vertex_program.get(mem);
      VertexProgram *vkvert = vertex_program.renderer_data.get();
-@@ -299,12 +305,33 @@ static void bind_vertex_streams(VKContext &context, MemState &mem, uint32_t inst
+@@ -299,14 +305,30 @@ static void bind_vertex_streams(VKContext &context, MemState &mem, uint32_t inst
              } else {
                  const uint8_t *stream = state.vertex_streams[i].data.get(mem);
                  uint32_t stream_size = state.vertex_streams[i].size;
-+#ifdef __PS4__
-+                // only from the draw's first vertex: a game that keeps many models in one buffer had
-+                // its whole buffer copied up to each draw's last vertex (God of War II: 20-50 us a draw)
-+                const SceGxmVertexStream &gxm_stream = vertex_program.streams[i];
-+                if (first_vertex > 0 && gxm_stream.stride > 0 && !gxm::is_stream_instancing(static_cast<SceGxmIndexSource>(gxm_stream.indexSource))) {
-+                    const uint64_t skip = static_cast<uint64_t>(first_vertex) * gxm_stream.stride;
-+                    if (skip < stream_size) {
-+                        stream += skip;
-+                        stream_size -= static_cast<uint32_t>(skip);
-+                    }
++                if (base_index != 0 && !gxm::is_stream_instancing(static_cast<SceGxmIndexSource>(vertex_program.streams[i].indexSource))) {
++                    const uint32_t skip = static_cast<uint32_t>(std::min<uint64_t>(static_cast<uint64_t>(base_index) * vertex_program.streams[i].stride, stream_size));
++                    stream += skip;
++                    stream_size -= skip;
 +                }
-+#endif
  #ifdef __APPLE__
                  // Vulkan allows any stride, but Metal only allows multiples of 4.
                  const bool restride = vertex_program.streams[i].stride % 4 != 0;
@@ -12796,8 +13151,12 @@ index acd85ab5..95eb1d1e 100644
 +                }
  #endif
                  context.vertex_stream_ring_buffer.allocate(context.prerender_cmd, stream_size, stream);
++                // the ring may have been replaced by a larger buffer (RingBuffer::grow)
++                context.vertex_stream_buffers[i] = context.vertex_stream_ring_buffer.handle();
                  context.vertex_stream_offsets[i] = context.vertex_stream_ring_buffer.data_offset;
-@@ -469,6 +496,10 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
+ 
+ #ifdef __APPLE__
+@@ -469,6 +491,10 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
          context.begin_visibility_query();
      }
  
@@ -12808,7 +13167,7 @@ index acd85ab5..95eb1d1e 100644
      // do we need to check for a pipeline change?
      if (context.refresh_pipeline || type != context.last_primitive) {
          context.refresh_pipeline = false;
-@@ -501,6 +532,9 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
+@@ -501,6 +527,9 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
      }
  
      const bool use_memory_mapping = context.state.features.enable_memory_mapping;
@@ -12818,7 +13177,7 @@ index acd85ab5..95eb1d1e 100644
  
      // update uniforms if needed
      // first update the buffer and texture count
-@@ -549,8 +583,14 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
+@@ -549,8 +578,14 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
          memcpy(&context.prev_frag_ublock, &frag_ublock, sizeof(frag_ublock));
      }
  
@@ -12833,51 +13192,60 @@ index acd85ab5..95eb1d1e 100644
  
      // Upload index data.
      vk::IndexType index_type = (format == SCE_GXM_INDEX_FORMAT_U16) ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
-@@ -580,8 +620,34 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
-         context.render_cmd.bindIndexBuffer(context.index_stream_ring_buffer.handle(), context.index_stream_ring_buffer.data_offset, index_type);
-     }
- 
-+    // the lowest index: the vertex streams are copied from there (bind_vertex_streams)
-+    uint32_t first_vertex = 0;
-+#ifdef __PS4__
-+    if (!use_memory_mapping && !ordered_indices && count > 0) {
+@@ -576,12 +611,50 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
+         context.render_cmd.bindIndexBuffer(buffer, offset, index_type);
+     } else if (!ordered_indices) {
+         const size_t index_buffer_size = index_size * count;
+-        context.index_stream_ring_buffer.allocate(context.prerender_cmd, index_buffer_size, indices_ptr);
++        // Copy only the vertex range the draw uses: rebase the indices on the smallest one, so the vertex
++        // streams are copied from that vertex instead of vertex 0. A draw using a few vertices at the end of a
++        // large buffer otherwise copies the whole buffer, and the ring wraps over data not yet consumed.
++        uint32_t min_index = UINT32_MAX;
 +        if (format == SCE_GXM_INDEX_FORMAT_U16) {
 +            const uint16_t *data = static_cast<const uint16_t *>(indices_ptr);
-+            uint16_t lowest = data[0];
-+            for (size_t i = 1; i < count; i++)
-+                lowest = std::min(lowest, data[i]);
-+            first_vertex = lowest;
++            for (size_t i = 0; i < count; i++)
++                min_index = std::min<uint32_t>(min_index, data[i]);
 +        } else {
 +            const uint32_t *data = static_cast<const uint32_t *>(indices_ptr);
-+            uint32_t lowest = data[0];
-+            for (size_t i = 1; i < count; i++)
-+                lowest = std::min(lowest, data[i]);
-+            first_vertex = std::min<uint32_t>(lowest, 0x7FFFFFFF);
++            for (size_t i = 0; i < count; i++)
++                min_index = std::min<uint32_t>(min_index, data[i]);
 +        }
-+    }
-+#endif
++        if (count == 0 || instance_count > 1)
++            min_index = 0;
++        if (min_index == 0) {
++            context.index_stream_ring_buffer.allocate(context.prerender_cmd, index_buffer_size, indices_ptr);
++        } else {
++            context.rebased_indices.resize(index_buffer_size);
++            if (format == SCE_GXM_INDEX_FORMAT_U16) {
++                const uint16_t *data = static_cast<const uint16_t *>(indices_ptr);
++                uint16_t *out = reinterpret_cast<uint16_t *>(context.rebased_indices.data());
++                for (size_t i = 0; i < count; i++)
++                    out[i] = static_cast<uint16_t>(data[i] - min_index);
++            } else {
++                const uint32_t *data = static_cast<const uint32_t *>(indices_ptr);
++                uint32_t *out = reinterpret_cast<uint32_t *>(context.rebased_indices.data());
++                for (size_t i = 0; i < count; i++)
++                    out[i] = data[i] - min_index;
++            }
++            context.index_stream_ring_buffer.allocate(context.prerender_cmd, index_buffer_size, context.rebased_indices.data());
++        }
+         context.render_cmd.bindIndexBuffer(context.index_stream_ring_buffer.handle(), context.index_stream_ring_buffer.data_offset, index_type);
++        bind_vertex_streams(context, mem, instance_count, max_index, min_index);
+     }
+ 
+-    // bind the vertex streams
+-    bind_vertex_streams(context, mem, instance_count, max_index);
++    // bind the vertex streams (the copy path above already did, but for ordered indices)
++    if (use_memory_mapping || ordered_indices)
++        bind_vertex_streams(context, mem, instance_count, max_index);
 +
 +#ifdef __PS4__
-+    phase.next(ps4stats::phase_ticks[ps4stats::PhaseVertices]);
-+#endif
-     // bind the vertex streams
--    bind_vertex_streams(context, mem, instance_count, max_index);
-+    bind_vertex_streams(context, mem, instance_count, max_index, first_vertex);
-+#ifdef __PS4__
++    // (the vertex streams were bound with the indices: their time is in "indices")
 +    phase.next(ps4stats::phase_ticks[ps4stats::PhaseRecord]);
 +#endif
  
      if (ordered_fetch) {
          if (ordered_indices) {
-@@ -598,7 +664,7 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
-             }
-         }
-     } else {
--        context.render_cmd.drawIndexed(count, instance_count, 0, 0, 0);
-+        context.render_cmd.drawIndexed(count, instance_count, 0, -static_cast<int32_t>(first_vertex), 0);
-     }
-     if (maskupdate && count && instance_count && context.record.writing_mask < 0.5f)
-         context.render_target->mask_may_reject = true;
 diff --git a/vita3k/renderer/src/vulkan/screen_filters.cpp b/vita3k/renderer/src/vulkan/screen_filters.cpp
 index 192dba99..4ae1b08b 100644
 --- a/vita3k/renderer/src/vulkan/screen_filters.cpp
@@ -12921,7 +13289,7 @@ index 84f14b6a..59999c19 100644
  
  bool VKSurfaceCache::check_for_surface(MemState &mem, Address source_address, CallbackRequestFunction &callback, Address target_address) {
 diff --git a/vita3k/renderer/src/vulkan/texture.cpp b/vita3k/renderer/src/vulkan/texture.cpp
-index 3a0120c1..e4d8cb35 100644
+index 3a0120c1..499b7b8f 100644
 --- a/vita3k/renderer/src/vulkan/texture.cpp
 +++ b/vita3k/renderer/src/vulkan/texture.cpp
 @@ -15,6 +15,7 @@
@@ -12932,18 +13300,54 @@ index 3a0120c1..e4d8cb35 100644
  #include <renderer/vulkan/functions.h>
  
  #include <renderer/vulkan/gxm_to_vulkan.h>
-@@ -27,6 +28,10 @@
+@@ -27,8 +28,26 @@
  #include <util/align.h>
  #include <vkutil/vkutil.h>
  
++#include <unordered_map>
++
 +#ifdef __PS4__
 +extern "C" bool ps4_format_log(); // vita3k/ps4/ps4_settings.cpp
 +#endif
 +
  namespace renderer::vulkan {
  
++static bool format_supports_linear_filtering(const vk::PhysicalDevice &device, vk::Format format) {
++    static std::unordered_map<vk::Format, bool> cache;
++    const auto it = cache.find(format);
++    if (it != cache.end())
++        return it->second;
++
++    const vk::FormatProperties props = device.getFormatProperties(format);
++    const bool supported = static_cast<bool>(props.optimalTilingFeatures & vk::FormatFeatureFlagBits::eSampledImageFilterLinear);
++    cache[format] = supported;
++    return supported;
++}
++
  // return if this format can be used to read a depth stencil buffer
-@@ -385,6 +390,15 @@ void VKTextureCache::configure_texture(const SceGxmTexture &gxm_texture) {
+ // Only return the formats we support and make sense for now
+ // (technically we can read a D24S8 or D32 as R8R8R8R8, but it is not implemented
+@@ -125,7 +144,8 @@ void sync_texture(VKContext &context, MemState &mem, std::size_t index, SceGxmTe
+ 
+     if (lookup_result.has_value()) {
+         // get the sampler now
+-        context.state.texture_cache.cache_and_bind_sampler(texture, is_depth_surface);
++        const bool no_linear = !format_supports_linear_filtering(context.state.physical_device, lookup_result->format);
++        context.state.texture_cache.cache_and_bind_sampler(texture, no_linear);
+     } else {
+         context.state.texture_cache.cache_and_bind_texture(texture, mem);
+         auto &image = context.state.texture_cache.current_texture->texture;
+@@ -134,6 +154,9 @@ void sync_texture(VKContext &context, MemState &mem, std::size_t index, SceGxmTe
+             image.layout,
+             image.format
+         };
++        if (context.state.texture_cache.use_sampler_cache
++            && !format_supports_linear_filtering(context.state.physical_device, image.format))
++            context.state.texture_cache.cache_and_bind_sampler(texture, true);
+     }
+ 
+     const vk::ImageLayout layout = vkutil::get_underlying_layout(lookup_result->layout);
+@@ -385,6 +408,15 @@ void VKTextureCache::configure_texture(const SceGxmTexture &gxm_texture) {
          vk_format = bcn_to_rgba8(vk_format);
      if (gxm_texture.gamma_mode)
          vk_format = linear_to_srgb(vk_format);
@@ -12959,8 +13363,83 @@ index 3a0120c1..e4d8cb35 100644
  
      current_texture->mip_count = mip_count;
      current_texture->is_cube = is_cube;
+diff --git a/vita3k/renderer/tests/command_list_tests.cpp b/vita3k/renderer/tests/command_list_tests.cpp
+new file mode 100644
+index 00000000..9516de30
+--- /dev/null
++++ b/vita3k/renderer/tests/command_list_tests.cpp
+@@ -0,0 +1,69 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++
++#include <renderer/functions.h>
++
++#include <gtest/gtest.h>
++
++TEST(command_list, append_copies_ownership_through_declared_tail) {
++    renderer::Command first{};
++    renderer::Command last{};
++    renderer::Command stale_tail{};
++    first.opcode = renderer::CommandOpcode::SetContext;
++    first.flags = renderer::Command::FLAG_NO_FREE;
++    first.next = &last;
++    renderer::RenderTarget *render_target = nullptr;
++    auto *color_surface = new SceGxmColorSurface{};
++    auto *depth_stencil_surface = new SceGxmDepthStencilSurface{};
++    color_surface->width = 960;
++    depth_stencil_surface->background_depth = 0.5f;
++    renderer::CommandHelper source_helper(&first);
++    source_helper.push(render_target);
++    source_helper.push(color_surface);
++    source_helper.push(depth_stencil_surface);
++    last.opcode = renderer::CommandOpcode::Nop;
++    last.flags = renderer::Command::FLAG_NO_FREE;
++    last.next = &stale_tail;
++
++    renderer::CommandList source{};
++    source.first = &first;
++    source.last = &last;
++
++    renderer::Context destination;
++    destination.alloc_func = []() {
++        auto *command = new renderer::Command;
++        command->flags = renderer::Command::FLAG_FROM_HOST;
++        return command;
++    };
++
++    renderer::append_command_list(destination, source);
++
++    ASSERT_NE(destination.command_list.first, nullptr);
++    EXPECT_NE(destination.command_list.first, &first);
++    EXPECT_EQ(destination.command_list.first->opcode, renderer::CommandOpcode::SetContext);
++    EXPECT_EQ(destination.command_list.first->flags, renderer::Command::FLAG_FROM_HOST);
++    renderer::CommandHelper copy_helper(destination.command_list.first);
++    EXPECT_EQ(copy_helper.pop<renderer::RenderTarget *>(), render_target);
++    const auto *color_surface_copy = copy_helper.pop<SceGxmColorSurface *>();
++    const auto *depth_stencil_surface_copy = copy_helper.pop<SceGxmDepthStencilSurface *>();
++    ASSERT_NE(color_surface_copy, nullptr);
++    EXPECT_NE(color_surface_copy, color_surface);
++    ASSERT_NE(depth_stencil_surface_copy, nullptr);
++    EXPECT_NE(depth_stencil_surface_copy, depth_stencil_surface);
++    renderer::destroy_command_payload(first);
++    EXPECT_EQ(color_surface_copy->width, 960);
++    EXPECT_EQ(depth_stencil_surface_copy->background_depth, 0.5f);
++    ASSERT_NE(destination.command_list.last, nullptr);
++    EXPECT_NE(destination.command_list.last, &last);
++    EXPECT_EQ(destination.command_list.last->opcode, renderer::CommandOpcode::Nop);
++    EXPECT_EQ(destination.command_list.last->next, nullptr);
++
++    renderer::destroy_command_payload(*destination.command_list.first);
++    delete destination.command_list.last;
++    delete destination.command_list.first;
++}
 diff --git a/vita3k/shader/include/shader/spirv_recompiler.h b/vita3k/shader/include/shader/spirv_recompiler.h
-index f93de644..3a3fe06f 100644
+index f93de644..97a70398 100644
 --- a/vita3k/shader/include/shader/spirv_recompiler.h
 +++ b/vita3k/shader/include/shader/spirv_recompiler.h
 @@ -31,7 +31,13 @@ namespace shader {
@@ -12970,7 +13449,7 @@ index f93de644..3a3fe06f 100644
 +#ifdef __PS4__
 +// upstream's 14, then the PS4 port's translator changes (01: !p2, loop guard): shaders cached by an
 +// older translation are made again
-+static constexpr uint32_t CURRENT_VERSION = 1402;
++static constexpr uint32_t CURRENT_VERSION = 1403;
 +#else
  static constexpr uint32_t CURRENT_VERSION = 14;
 +#endif
@@ -13039,6 +13518,72 @@ index e31942f2..42665d6d 100644
 +        return ExtPredicate::NEGP2;
      default:
          return ExtPredicate::NONE;
+     }
+diff --git a/vita3k/shader/src/spirv_recompiler.cpp b/vita3k/shader/src/spirv_recompiler.cpp
+index 28c781b6..05e52b4f 100644
+--- a/vita3k/shader/src/spirv_recompiler.cpp
++++ b/vita3k/shader/src/spirv_recompiler.cpp
+@@ -117,6 +117,21 @@ struct TranslationState {
+     const Hints *hints = nullptr;
+ };
+ 
++static bool is_u8_alpha_color_surface(const TranslationState &state) {
++    return state.hints->color_format == SCE_GXM_COLOR_FORMAT_U8_A;
++}
++
++static spv::Id alpha_surface_to_shader_color(spv::Builder &b, const spv::Id color) {
++    // Host R8 image reads return (R, 0, 0, 1); GXM A8 exposes (0, 0, 0, R).
++    return b.createOp(spv::OpVectorShuffle, b.getTypeId(color), { { true, color }, { true, color }, { false, 1 }, { false, 2 }, { false, 1 }, { false, 0 } });
++}
++
++static spv::Id shader_color_to_alpha_surface(spv::Builder &b, const spv::Id color) {
++    // Host single-component render targets store the red output, so move the
++    // guest alpha value there while retaining alpha for blend factors.
++    return b.createOp(spv::OpVectorShuffle, b.getTypeId(color), { { true, color }, { true, color }, { false, 3 }, { false, 1 }, { false, 2 }, { false, 3 } });
++}
++
+ struct VertexProgramOutputProperties {
+     std::string name;
+     std::uint32_t component_count{};
+@@ -730,6 +745,9 @@ static void create_fragment_inputs(spv::Builder &b, SpirvShaderParameters &param
+ 
+         auto store_source_result = [&](const bool direct_store = false) {
+             if (source != spv::NoResult) {
++                if (is_u8_alpha_color_surface(translation_state))
++                    source = alpha_surface_to_shader_color(b, source);
++
+                 if (!direct_store && !is_float_data_type(target_to_store.type)) {
+                     source = utils::convert_to_int(b, utils, source, target_to_store.type, true);
+                 }
+@@ -1628,6 +1646,9 @@ static spv::Function *make_frag_finalize_function(spv::Builder &b, const SpirvSh
+     if (!is_float_data_type(color_val_operand.type))
+         color = utils::convert_to_float(b, utils, color, color_val_operand.type, true);
+ 
++    if (is_u8_alpha_color_surface(translate_state))
++        color = shader_color_to_alpha_surface(b, color);
++
+     if (program.is_frag_color_used() && features.should_use_shader_interlock()) {
+         spv::Id signed_i32 = b.makeIntType(32);
+         spv::Id coord_id = b.createLoad(translate_state.frag_coord_id, spv::NoPrecision);
+@@ -1663,6 +1684,9 @@ static spv::Function *make_frag_finalize_function(spv::Builder &b, const SpirvSh
+             color_val_operand.type = DataType::UINT16;
+             color = utils::load(b, parameters, utils, features, color_val_operand, 0xF, reg_off);
+ 
++            if (is_u8_alpha_color_surface(translate_state))
++                color = shader_color_to_alpha_surface(b, color);
++
+             b.createNoResultOp(spv::OpImageWrite, { b.createLoad(translate_state.color_attachment_raw_id, spv::NoPrecision), translated_id, color });
+         }
+     } else {
+@@ -1680,6 +1704,9 @@ static spv::Function *make_frag_finalize_function(spv::Builder &b, const SpirvSh
+             color_val_operand.type = DataType::UINT16;
+             color = utils::load(b, parameters, utils, features, color_val_operand, 0xF, reg_off);
+ 
++            if (is_u8_alpha_color_surface(translate_state))
++                color = shader_color_to_alpha_surface(b, color);
++
+             b.createStore(color, out_u16_raw);
+         }
      }
 diff --git a/vita3k/shader/src/usse_disasm.cpp b/vita3k/shader/src/usse_disasm.cpp
 index 00c041e1..19335445 100644
@@ -13121,6 +13666,25 @@ index e9f0e42f..6effc570 100644
  
      // If true
      const usse::USSEBlockNode &content_block = *(loop.content_block());
+diff --git a/vita3k/shader/src/usse_utilities.cpp b/vita3k/shader/src/usse_utilities.cpp
+index 8ae6b391..7385a3ef 100644
+--- a/vita3k/shader/src/usse_utilities.cpp
++++ b/vita3k/shader/src/usse_utilities.cpp
+@@ -1599,6 +1599,14 @@ spv::Id convert_to_int(spv::Builder &b, const SpirvUtilFunctions &utils, spv::Id
+         opr = b.createBuiltinCall(opr_type, utils.std_builtins, GLSLstd450Round, { opr });
+     }
+ 
++    if (type != DataType::INT32 && type != DataType::UINT32 && type != DataType::C10) {
++        const float range_max = get_int_normalize_range_constants(type);
++        const float range_min = is_uint ? 0.0f : -(range_max + 1.0f);
++        const auto range_begin = create_constant_vector_or_scalar(b, b.makeFloatConstant(range_min), comp_count);
++        const auto range_end = create_constant_vector_or_scalar(b, b.makeFloatConstant(range_max), comp_count);
++        opr = b.createBuiltinCall(opr_type, utils.std_builtins, GLSLstd450FClamp, { opr, range_begin, range_end });
++    }
++
+     if (!is_uint) {
+         opr = b.createUnaryOp(spv::OpConvertFToS, target_type, opr);
+     } else {
 diff --git a/vita3k/shaders-builtin/vulkan/fsr_filter_easu_f32.comp b/vita3k/shaders-builtin/vulkan/fsr_filter_easu_f32.comp
 new file mode 100644
 index 00000000..34435bae
@@ -13782,3 +14346,175 @@ index 816c6297..9115c351 100644
      spdlog::flush_on(spdlog::level::trace);
  #endif
  
+diff --git a/vita3k/vkutil/include/vkutil/objects.h b/vita3k/vkutil/include/vkutil/objects.h
+index 81ce13b5..cb0a7585 100644
+--- a/vita3k/vkutil/include/vkutil/objects.h
++++ b/vita3k/vkutil/include/vkutil/objects.h
+@@ -17,6 +17,8 @@
+ 
+ #pragma once
+ 
++#include <functional>
++
+ #include <vkutil/vkutil.h>
+ 
+ #include <bit>
+@@ -90,18 +92,47 @@ struct Buffer {
+ 
+ // structure that holds contiguous data
+ // if the end is reached, it starts back at the beginning
++// Ring heap in the style of RPCS3's data_heap: [tail, head) (monotonic byte counters) may still be read
++// by submitted or not yet submitted GPU work. The owner records head with every submission and moves
++// tail forward once that submission's fence has signaled; when an allocation does not fit, allocate()
++// calls make_room() (wait for the oldest pending submission) until it does.
+ class RingBuffer {
+ protected:
+     vkutil::Buffer buffer;
+     vk::BufferUsageFlags usage;
+ 
+-    uint32_t cursor = ~0;
++    uint64_t head = 0;
++    uint64_t tail = 0;
++    // head when the current buffer was created (offsets are relative to it, see grow)
++    uint64_t base = 0;
+     uint32_t capacity;
++    // buffers replaced by grow(), kept until the work recorded before the replacement has completed
++    std::vector<std::pair<vkutil::Buffer, uint64_t>> retired;
++
++    // Replace the buffer with a larger empty one (data in flight stays in the retired buffer).
++    virtual bool grow(const uint32_t needed) {
++        return false;
++    }
+ 
+ public:
+     // any buffer alignment on vulkan is at most 256 on 99% of instances
+     uint32_t alignment = 256;
+     uint32_t data_offset = 0;
++    const char *name = "ring";
++    // Waits for the oldest pending submission and releases its data; false when nothing is pending.
++    std::function<bool()> make_room;
++    // When the work not yet submitted alone fills the ring, grow up to this size instead of overwriting
++    // (only for rings bound per draw: descriptor sets keep referencing the buffer of the others).
++    uint32_t max_capacity = 0;
++
++    uint64_t get_head() const {
++        return head;
++    }
++    // everything allocated before position has been consumed by the GPU
++    void release_until(const uint64_t position) {
++        tail = std::max(tail, position);
++        std::erase_if(retired, [position](const auto &entry) { return position >= entry.second; });
++    }
+ 
+     explicit RingBuffer(vk::BufferUsageFlags usage, const size_t capacity);
+     virtual ~RingBuffer() = default;
+@@ -149,6 +180,7 @@ public:
+         : RingBuffer(usage, capacity) {
+     }
+     void create() override;
++    bool grow(const uint32_t needed) override;
+ 
+     void copy(vk::CommandBuffer cmd_buffer, const uint32_t size, const void *data, const uint32_t offset = 0) override;
+ };
+diff --git a/vita3k/vkutil/src/objects.cpp b/vita3k/vkutil/src/objects.cpp
+index 579a479d..f062ee62 100644
+--- a/vita3k/vkutil/src/objects.cpp
++++ b/vita3k/vkutil/src/objects.cpp
+@@ -187,9 +187,7 @@ void Buffer::init_buffer(vk::BufferUsageFlags usage_flags, const vma::Allocation
+     mapped_data = alloc_info.pMappedData;
+ }
+ 
+-RingBuffer::RingBuffer(vk::BufferUsageFlags usage, const size_t capacity)
+-    : usage(usage)
+-    , capacity(capacity) {
++static uint32_t padded_ring_capacity(vk::BufferUsageFlags usage, const size_t capacity) {
+     uint32_t buffer_capacity = capacity;
+     if (usage & vk::BufferUsageFlagBits::eStorageBuffer)
+         // TODO: put max size of a gxm uniform buffer
+@@ -201,19 +199,42 @@ RingBuffer::RingBuffer(vk::BufferUsageFlags usage, const size_t capacity)
+         // the descriptor set for the uniform buffers specify the max possible size while we only allocate
+         // the actual size, this prevents validation errors
+         buffer_capacity += 512;
++    return buffer_capacity;
++}
+ 
+-    buffer = Buffer(buffer_capacity);
++RingBuffer::RingBuffer(vk::BufferUsageFlags usage, const size_t capacity)
++    : usage(usage)
++    , capacity(capacity) {
++    buffer = Buffer(padded_ring_capacity(usage, capacity));
+ }
+ 
+ void RingBuffer::allocate(const uint32_t data_size) {
+-    if (cursor + data_size > capacity)
+-        cursor = 0;
+-
+-    data_offset = cursor;
+-
+-    cursor += data_size;
++    const auto place = [&]() {
++        uint64_t start = head;
++        // an allocation never straddles the end of the buffer: skip to the next lap
++        if ((start - base) % capacity + data_size > capacity)
++            start += capacity - (start - base) % capacity;
++        return start;
++    };
++    uint64_t start = place();
++    while (start + data_size - tail > capacity) {
++        if (!make_room || !make_room()) {
++            if (grow(data_size)) {
++                start = place();
++                continue;
++            }
++            // the work not yet submitted alone fills the ring: nothing can be waited for
++            static std::atomic<int> overflows{ 0 };
++            if (overflows.fetch_add(1) < 20)
++                LOG_ERROR("Ring buffer {} overflow: {} bytes requested, {} of {} still used by work not submitted yet", name, data_size, head - tail, capacity);
++            tail = start + data_size - capacity;
++            break;
++        }
++        start = place();
++    }
+ 
+-    cursor = align(cursor, alignment);
++    data_offset = static_cast<uint32_t>((start - base) % capacity);
++    head = align(start + data_size, alignment);
+ }
+ 
+ void HostRingBuffer::create() {
+@@ -222,7 +243,25 @@ void HostRingBuffer::create() {
+     vk::MemoryPropertyFlags memory_properties = allocator.getAllocationMemoryProperties(buffer.allocation);
+     is_coherent = static_cast<bool>(memory_properties & vk::MemoryPropertyFlagBits::eHostCoherent);
+ 
+-    cursor = 0;
++    head = tail = 0;
++}
++
++bool HostRingBuffer::grow(const uint32_t needed) {
++    if (capacity >= max_capacity)
++        return false;
++    uint32_t new_capacity = capacity;
++    while (new_capacity < max_capacity && new_capacity < 2 * static_cast<uint64_t>(needed) + capacity)
++        new_capacity = static_cast<uint32_t>(std::min<uint64_t>(static_cast<uint64_t>(new_capacity) * 2, max_capacity));
++    // everything allocated so far stays in the old buffer until its work has completed
++    base = align(head, alignment);
++    head = tail = base;
++    retired.emplace_back(std::move(buffer), base);
++    capacity = new_capacity;
++    buffer = Buffer(padded_ring_capacity(usage, capacity));
++    create();
++    head = tail = base;
++    LOG_INFO("Ring buffer {} grown to {} MiB", name, capacity >> 20);
++    return true;
+ }
+ 
+ void HostRingBuffer::copy(vk::CommandBuffer cmd_buffer, const uint32_t size, const void *data, const uint32_t offset) {
+@@ -236,7 +275,7 @@ void LocalRingBuffer::create() {
+     // the auto_alloc default behavior should give us memory on the gpu
+     // UpdateBuffer needs the buffer to have TransferDst specified
+     buffer.init_buffer(usage | vk::BufferUsageFlagBits::eTransferDst);
+-    cursor = 0;
++    head = tail = 0;
+ }
+ 
+ void LocalRingBuffer::copy(vk::CommandBuffer cmd_buffer, const uint32_t size, const void *data, const uint32_t offset) {
