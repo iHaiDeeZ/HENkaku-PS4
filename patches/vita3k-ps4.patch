@@ -14800,10 +14800,10 @@ index 3860cced..17284694 100644
      void refresh_available_textures();
 diff --git a/vita3k/renderer/include/renderer/vulkan/frame_generation.h b/vita3k/renderer/include/renderer/vulkan/frame_generation.h
 new file mode 100644
-index 00000000..9668d3fb
+index 00000000..283ee3fa
 --- /dev/null
 +++ b/vita3k/renderer/include/renderer/vulkan/frame_generation.h
-@@ -0,0 +1,129 @@
+@@ -0,0 +1,133 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -14831,13 +14831,15 @@ index 00000000..9668d3fb
 +// command buffers; each vblank's image is chosen (and made) in the screen's command buffer
 +// (renderer.cpp, render_generated). Compute passes over the frames as Vita3K presents them (before
 +// the screen filter, which then scales a made frame like a real one):
-+//   fg_copy    the frame copied out of its surface, and its luma at 1/scale of its size
-+//   fg_motion  per 8x8 luma block, a search for where it was in the frame before: first on the
-+//              luma at half size (camera pans), then on the luma from there; then a count of the
-+//              blocks that found no match or move unlike their neighbours (the judge)
-+//   fg_interp  each pixel along the best of the motions around it, at the moment's place between the
-+//              two frames; the nearer frame's pixel where none fits, and the whole nearer frame when
-+//              the judge says the motion can't be trusted (a cut, a whip, a fade)
++//   fg_copy    the frame copied out of its surface, and its luma at 1/scale of its size (and that
++//              at half and quarter size)
++//   fg_motion  per 8x8 luma block, a search for where it was in the frame before: on the luma at
++//              quarter size, then half size (fast pans), then on the luma, each from the level
++//              above's vectors and the camera's motion; a count of the textured blocks that found
++//              no match (the judge), and the camera's motion (the most common vector)
++//   fg_interp  each pixel along the motion that fits it and its neighbours best, at the moment's
++//              place between the two frames; where none fits the nearer frame (along the blocks'
++//              motion where they agree), and the whole nearer frame when the judge saw a cut or a fade
 +
 +#include <renderer/vulkan/state.h>
 +#include <vkutil/objects.h>
@@ -14872,14 +14874,15 @@ index 00000000..9668d3fb
 +        uint32_t scale;
 +        uint32_t luma_w, luma_h;
 +        uint32_t blocks_w;
-+        uint32_t pass_index; // fg_motion: 0 the coarse pass, 1 the fine one, 2 the judge
++        uint32_t pass_index; // fg_motion: 3 the quarter pass, 0 the coarse one, 1 the fine one, 2 the camera's
 +        float phase; // fg_interp: the moment between the two frames (0 the first, 1 the second)
 +    };
-+    // a frame of the history: its picture, luma, motion from the frame before and the judge's counts
-+    // for it, its time
++    // a frame of the history: its picture, luma (and that at half and quarter size), motion from the
++    // frame before and the judge's counts for it (and the camera's motion), its time
 +    struct Frame {
 +        vkutil::Image image;
 +        vkutil::Buffer luma;
++        vkutil::Buffer levels;
 +        vkutil::Buffer vectors;
 +        vkutil::Buffer judge;
 +        double time = 0.0;
@@ -14916,8 +14919,9 @@ index 00000000..9668d3fb
 +    std::array<Frame, HISTORY> history;
 +    int newest = -1;
 +    double newest_stamp_ = -1.0;
-+    // the coarse pass's vectors (the next one starts from them)
-+    vkutil::Buffer coarse;
++    // the coarse and quarter passes' vectors (the next ones start from them), the fine pass's matched
++    // vectors counted (the most common is the camera's)
++    vkutil::Buffer coarse, quarter, counts;
 +    vkutil::Image result;
 +
 +    // the pacing (vblanks): how far apart frames come and how long they take to get here (averaged),
@@ -15973,10 +15977,10 @@ index d89da55d..ebae243d 100644
          std::fill_n(vertex_stream_buffers, SCE_GXM_MAX_VERTEX_STREAMS, state.default_buffer.buffer);
 diff --git a/vita3k/renderer/src/vulkan/frame_generation.cpp b/vita3k/renderer/src/vulkan/frame_generation.cpp
 new file mode 100644
-index 00000000..3b7ab1fd
+index 00000000..573d60bc
 --- /dev/null
 +++ b/vita3k/renderer/src/vulkan/frame_generation.cpp
-@@ -0,0 +1,510 @@
+@@ -0,0 +1,546 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -16010,6 +16014,8 @@ index 00000000..3b7ab1fd
 +
 +constexpr int BLOCK = 8; // luma pixels a side of a motion block
 +constexpr uint32_t GROUP = 8; // the shaders' work groups: 8x8
++// the camera's counts (fg_motion) cover vectors of -LIMIT..LIMIT luma pixels
++constexpr uint32_t LIMIT = 48;
 +// frames further apart than this (vblanks: loading, a pause) get no motion between them
 +constexpr double LONG_GAP = 8.0;
 +
@@ -16105,11 +16111,15 @@ index 00000000..3b7ab1fd
 +    };
 +    constexpr vk::DescriptorType BUFFER = vk::DescriptorType::eStorageBuffer;
 +    const std::vector<vk::DescriptorSetLayoutBinding> layouts[3] = {
-+        // copy: the game's frame, the history's image, its luma
-+        { binding(0, vk::DescriptorType::eCombinedImageSampler, &nearest), binding(1, vk::DescriptorType::eStorageImage), binding(2, BUFFER) },
++        // copy: the game's frame, the history's image, its luma, its luma at half and quarter size
++        { binding(0, vk::DescriptorType::eCombinedImageSampler, &nearest), binding(1, vk::DescriptorType::eStorageImage), binding(2, BUFFER),
++            binding(3, BUFFER) },
 +        // motion: the frame before's luma, the luma, the vectors, the coarse vectors, the judge's
-+        // counts, the frame before's vectors (where the search starts)
-+        { binding(0, BUFFER), binding(1, BUFFER), binding(2, BUFFER), binding(3, BUFFER), binding(4, BUFFER), binding(5, BUFFER) },
++        // counts, the frame before's vectors (where the search starts) and judge (its camera), the
++        // vectors' counts (the camera's), both frames' luma at half and quarter size, the quarter
++        // vectors
++        { binding(0, BUFFER), binding(1, BUFFER), binding(2, BUFFER), binding(3, BUFFER), binding(4, BUFFER), binding(5, BUFFER),
++            binding(6, BUFFER), binding(7, BUFFER), binding(8, BUFFER), binding(9, BUFFER), binding(10, BUFFER) },
 +        // in-between: the two frames, the second's vectors, the result, the judge's counts
 +        { binding(0, vk::DescriptorType::eCombinedImageSampler, &linear), binding(1, vk::DescriptorType::eCombinedImageSampler, &linear),
 +            binding(2, BUFFER), binding(3, vk::DescriptorType::eStorageImage), binding(4, BUFFER) },
@@ -16145,7 +16155,7 @@ index 00000000..3b7ab1fd
 +    const std::array<vk::DescriptorPoolSize, 3> sizes = {
 +        vk::DescriptorPoolSize{ .type = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = HISTORY + screen_slots * 2 },
 +        vk::DescriptorPoolSize{ .type = vk::DescriptorType::eStorageImage, .descriptorCount = HISTORY + screen_slots },
-+        vk::DescriptorPoolSize{ .type = BUFFER, .descriptorCount = HISTORY * 7 + screen_slots * 2 },
++        vk::DescriptorPoolSize{ .type = BUFFER, .descriptorCount = HISTORY * 13 + screen_slots * 2 },
 +    };
 +    vk::DescriptorPoolCreateInfo pool_info{ .maxSets = HISTORY * 2 + screen_slots };
 +    pool_info.setPoolSizes(sizes);
@@ -16191,6 +16201,9 @@ index 00000000..3b7ab1fd
 +    luma_h = (height + scale - 1) / scale;
 +    blocks_w = (luma_w + BLOCK - 1) / BLOCK;
 +    blocks_h = (luma_h + BLOCK - 1) / BLOCK;
++    // the search's levels: the luma at half and at quarter size
++    const uint32_t half_w = (luma_w + 1) / 2, half_h = (luma_h + 1) / 2;
++    const uint32_t quarter_w = (luma_w + 3) / 4, quarter_h = (luma_h + 3) / 4;
 +
 +    const auto make_image = [&](vkutil::Image &image) {
 +        image.destroy();
@@ -16209,14 +16222,18 @@ index 00000000..3b7ab1fd
 +        make_image(frame.image);
 +        make_buffer(frame.luma, static_cast<vk::DeviceSize>(luma_w) * luma_h * sizeof(float));
 +        make_buffer(frame.vectors, static_cast<vk::DeviceSize>(blocks_w) * blocks_h * 2 * sizeof(int32_t));
-+        make_buffer(frame.judge, 4 * sizeof(uint32_t));
++        // (no_match, textured, unmatched, unused, the camera's vector)
++        make_buffer(frame.judge, 8 * sizeof(uint32_t));
++        make_buffer(frame.levels, static_cast<vk::DeviceSize>(half_w * half_h + quarter_w * quarter_h) * sizeof(float));
 +        frame.valid = false;
 +        frame.has_motion = false;
 +    }
 +    make_image(result);
-+    // the coarse pass's blocks: on the luma at half size
-+    const uint32_t coarse_w = ((luma_w + 1) / 2 + BLOCK - 1) / BLOCK, coarse_h = ((luma_h + 1) / 2 + BLOCK - 1) / BLOCK;
++    // the coarse pass's blocks: on the luma at half size; the quarter pass's: at quarter size
++    const uint32_t coarse_w = (half_w + BLOCK - 1) / BLOCK, coarse_h = (half_h + BLOCK - 1) / BLOCK;
 +    make_buffer(coarse, static_cast<vk::DeviceSize>(coarse_w) * coarse_h * 2 * sizeof(int32_t));
++    make_buffer(quarter, static_cast<vk::DeviceSize>((quarter_w + BLOCK - 1) / BLOCK) * ((quarter_h + BLOCK - 1) / BLOCK) * 2 * sizeof(int32_t));
++    make_buffer(counts, static_cast<vk::DeviceSize>(2 * LIMIT + 1) * (2 * LIMIT + 1) * sizeof(uint32_t));
 +    const vk::MemoryBarrier filled{
 +        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
 +        .dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
@@ -16277,32 +16294,48 @@ index 00000000..3b7ab1fd
 +    const vk::DescriptorImageInfo src_info{ .imageView = src, .imageLayout = src_layout };
 +    const vk::DescriptorImageInfo storage{ .imageView = frame.image.view, .imageLayout = vk::ImageLayout::eGeneral };
 +    const vk::DescriptorBufferInfo luma_info = whole(frame.luma);
++    const vk::DescriptorBufferInfo levels_info = whole(frame.levels);
 +    std::vector<vk::WriteDescriptorSet> writes = {
 +        write_image(copy_sets[slot], 0, vk::DescriptorType::eCombinedImageSampler, src_info),
 +        write_image(copy_sets[slot], 1, vk::DescriptorType::eStorageImage, storage),
 +        write_buffer(copy_sets[slot], 2, luma_info),
++        write_buffer(copy_sets[slot], 3, levels_info),
 +    };
-+    vk::DescriptorBufferInfo before_luma, vectors_info, coarse_info, judge_info, last_info;
++    vk::DescriptorBufferInfo before_luma, vectors_info, coarse_info, judge_info, last_info, last_judge_info, counts_info, before_levels, quarter_info;
 +    if (motion) {
 +        before_luma = whole(history[before].luma);
 +        vectors_info = whole(frame.vectors);
 +        coarse_info = whole(coarse);
 +        judge_info = whole(frame.judge);
 +        last_info = whole(history[before].vectors);
++        last_judge_info = whole(history[before].judge);
++        counts_info = whole(counts);
++        before_levels = whole(history[before].levels);
++        quarter_info = whole(quarter);
 +        writes.push_back(write_buffer(motion_sets[slot], 0, before_luma));
 +        writes.push_back(write_buffer(motion_sets[slot], 1, luma_info));
 +        writes.push_back(write_buffer(motion_sets[slot], 2, vectors_info));
 +        writes.push_back(write_buffer(motion_sets[slot], 3, coarse_info));
 +        writes.push_back(write_buffer(motion_sets[slot], 4, judge_info));
 +        writes.push_back(write_buffer(motion_sets[slot], 5, last_info));
++        writes.push_back(write_buffer(motion_sets[slot], 6, last_judge_info));
++        writes.push_back(write_buffer(motion_sets[slot], 7, counts_info));
++        writes.push_back(write_buffer(motion_sets[slot], 8, before_levels));
++        writes.push_back(write_buffer(motion_sets[slot], 9, levels_info));
++        writes.push_back(write_buffer(motion_sets[slot], 10, quarter_info));
 +    }
 +    device.updateDescriptorSets(writes, {});
 +
-+    // the judge counts this pair's blocks from zero, once what read its counts before is done
-+    if (motion) {
-+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags(), {}, {}, {});
-+        cmd.fillBuffer(frame.judge.buffer, 0, VK_WHOLE_SIZE, 0);
-+    }
++    // the judge counts this pair's blocks from zero (a frame without motion has no camera either)
++    // and the vectors' counts start again, once what read or wrote them before is done
++    const vk::MemoryBarrier reused{
++        .srcAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
++        .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
++    };
++    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags(), reused, {}, {});
++    cmd.fillBuffer(frame.judge.buffer, 0, VK_WHOLE_SIZE, 0);
++    if (motion)
++        cmd.fillBuffer(counts.buffer, 0, VK_WHOLE_SIZE, 0);
 +    // the game's frame (drawn before), and what the screen passes read from this slot before
 +    const vk::MemoryBarrier drawn{
 +        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite | vk::AccessFlagBits::eShaderRead,
@@ -16329,18 +16362,23 @@ index 00000000..3b7ab1fd
 +    cmd.dispatch((luma_w + GROUP - 1) / GROUP, (luma_h + GROUP - 1) / GROUP, 1);
 +
 +    if (motion) {
-+        // the motion: the coarse pass, the fine one from it, the judge
-+        compute_barrier(cmd);
++        // the motion: the quarter pass, the coarse one from it, the fine one from that (with the
++        // judge's counts), the camera's (one group)
++        const uint32_t quarter_blocks_w = ((luma_w + 3) / 4 + BLOCK - 1) / BLOCK, quarter_blocks_h = ((luma_h + 3) / 4 + BLOCK - 1) / BLOCK;
++        const uint32_t coarse_w = ((luma_w + 1) / 2 + BLOCK - 1) / BLOCK, coarse_h = ((luma_h + 1) / 2 + BLOCK - 1) / BLOCK;
++        const std::array<std::array<uint32_t, 3>, 4> passes = { {
++            { 3, (quarter_blocks_w + GROUP - 1) / GROUP, (quarter_blocks_h + GROUP - 1) / GROUP },
++            { 0, (coarse_w + GROUP - 1) / GROUP, (coarse_h + GROUP - 1) / GROUP },
++            { 1, (blocks_w + GROUP - 1) / GROUP, (blocks_h + GROUP - 1) / GROUP },
++            { 2, 1, 1 },
++        } };
 +        cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipelines[1]);
 +        cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layouts[1], 0, motion_sets[slot], {});
-+        const uint32_t coarse_w = ((luma_w + 1) / 2 + BLOCK - 1) / BLOCK, coarse_h = ((luma_h + 1) / 2 + BLOCK - 1) / BLOCK;
-+        cmd.pushConstants(pipeline_layouts[1], vk::ShaderStageFlagBits::eCompute, 0, sizeof(Constants), &constants);
-+        cmd.dispatch((coarse_w + GROUP - 1) / GROUP, (coarse_h + GROUP - 1) / GROUP, 1);
-+        for (uint32_t pass = 1; pass <= 2; pass++) {
++        for (const auto &[pass, groups_x, groups_y] : passes) {
 +            compute_barrier(cmd);
 +            constants.pass_index = pass;
 +            cmd.pushConstants(pipeline_layouts[1], vk::ShaderStageFlagBits::eCompute, 0, sizeof(Constants), &constants);
-+            cmd.dispatch((blocks_w + GROUP - 1) / GROUP, (blocks_h + GROUP - 1) / GROUP, 1);
++            cmd.dispatch(groups_x, groups_y, 1);
 +        }
 +    }
 +    // (the screen passes, in later command buffers, wait for these with their own barrier)
@@ -16475,7 +16513,9 @@ index 00000000..3b7ab1fd
 +    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipelines[2]);
 +    cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layouts[2], 0, set, {});
 +    cmd.pushConstants(pipeline_layouts[2], vk::ShaderStageFlagBits::eCompute, 0, sizeof(Constants), &constants);
-+    cmd.dispatch((width + GROUP - 1) / GROUP, (height + GROUP - 1) / GROUP, 1);
++    // (at odd scales the groups are shifted by half a group onto the blocks' centres: a group more)
++    const uint32_t shifted = (scale * BLOCK / 2) % GROUP != 0 ? 1 : 0;
++    cmd.dispatch((width + GROUP - 1) / GROUP + shifted, (height + GROUP - 1) / GROUP + shifted, 1);
 +
 +    // the screen pass (and its filter's compute passes) read it
 +    const vk::MemoryBarrier made{
@@ -17476,10 +17516,10 @@ index 8ae6b391..7385a3ef 100644
      } else {
 diff --git a/vita3k/shaders-builtin/vulkan/fg_copy.comp b/vita3k/shaders-builtin/vulkan/fg_copy.comp
 new file mode 100644
-index 00000000..75898c64
+index 00000000..5ae00ff9
 --- /dev/null
 +++ b/vita3k/shaders-builtin/vulkan/fg_copy.comp
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,94 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -17500,7 +17540,8 @@ index 00000000..75898c64
 +#version 450
 +// Frame generation, 1 of 3 (renderer/vulkan/frame_generation.cpp): the game's frame copied out of
 +// its surface (which the game draws the next one into), and its brightness at 1/scale of its size
-+// (one luma value per scale x scale pixels), which the motion search compares.
++// (one luma value per scale x scale pixels), which the motion search compares, with that luma at half
++// and quarter size (2x2 and 4x4 means), where the search starts.
 +
 +layout(local_size_x = 8, local_size_y = 8) in;
 +
@@ -17520,73 +17561,137 @@ index 00000000..75898c64
 +layout(set = 0, binding = 2) writeonly buffer Luma {
 +    float luma[];
 +};
++// the luma at half size, then at quarter size
++layout(set = 0, binding = 3) writeonly buffer Levels {
++    float levels[];
++};
++
++shared float group_luma[64];
 +
 +void main() {
 +    const uvec2 l = gl_GlobalInvocationID.xy;
-+    if (l.x >= c.luma_w || l.y >= c.luma_h)
-+        return;
++    const bool inside = l.x < c.luma_w && l.y < c.luma_h;
++    // (threads past the luma's edge take the edge's luma for the means, and store nothing)
++    const uvec2 e = min(l, uvec2(c.luma_w - 1, c.luma_h - 1));
 +    float sum = 0.0;
 +    uint count = 0;
 +    for (uint j = 0; j < c.scale; j++) {
 +        for (uint i = 0; i < c.scale; i++) {
-+            const uvec2 p = l * c.scale + uvec2(i, j);
++            const uvec2 p = e * c.scale + uvec2(i, j);
 +            if (p.x >= c.frame_size.x || p.y >= c.frame_size.y)
 +                continue;
 +            const vec4 v = texelFetch(src, c.src_offset + ivec2(p), 0);
-+            imageStore(frame, ivec2(p), vec4(v.rgb, 1.0));
++            if (inside)
++                imageStore(frame, ivec2(p), vec4(v.rgb, 1.0));
 +            sum += dot(v.rgb, vec3(0.299, 0.587, 0.114));
 +            count++;
 +        }
 +    }
-+    luma[l.y * c.luma_w + l.x] = count > 0 ? sum / float(count) : 0.0;
++    const float value = count > 0 ? sum / float(count) : 0.0;
++    if (inside)
++        luma[l.y * c.luma_w + l.x] = value;
++
++    // the levels: a group's 8x8 luma values are 4x4 at half size, 2x2 at quarter size
++    const uint lane = gl_LocalInvocationIndex;
++    group_luma[lane] = value;
++    barrier();
++    const uvec2 g = gl_LocalInvocationID.xy;
++    const uint half_w = (c.luma_w + 1) / 2, half_h = (c.luma_h + 1) / 2;
++    if ((g.x & 1u) == 0u && (g.y & 1u) == 0u) {
++        const uvec2 h = l / 2u;
++        if (h.x < half_w && h.y < half_h)
++            levels[h.y * half_w + h.x] = 0.25 * (group_luma[lane] + group_luma[lane + 1] + group_luma[lane + 8] + group_luma[lane + 9]);
++    }
++    const uint quarter_w = (c.luma_w + 3) / 4, quarter_h = (c.luma_h + 3) / 4;
++    if ((g.x & 3u) == 0u && (g.y & 3u) == 0u) {
++        const uvec2 q = l / 4u;
++        if (q.x < quarter_w && q.y < quarter_h) {
++            float s = 0.0;
++            for (uint y = 0; y < 4; y++)
++                for (uint x = 0; x < 4; x++)
++                    s += group_luma[lane + y * 8 + x];
++            levels[half_w * half_h + q.y * quarter_w + q.x] = s / 16.0;
++        }
++    }
 +}
 diff --git a/vita3k/shaders-builtin/vulkan/fg_copy.comp.spv b/vita3k/shaders-builtin/vulkan/fg_copy.comp.spv
 new file mode 100644
-index 0000000000000000000000000000000000000000..edf9dde7e7a10dd648c69e7fb9de305a4905a8f8
+index 0000000000000000000000000000000000000000..914cf84acb0ff71669b0f79e1b22fdd6e9618b9e
 GIT binary patch
-literal 4240
-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
+literal 8720
+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
+Y%js)>;@MMc$2(2^VphZd@oKXF1E^*j4gdfE
 
 literal 0
 HcmV?d00001
 
 diff --git a/vita3k/shaders-builtin/vulkan/fg_interp.comp b/vita3k/shaders-builtin/vulkan/fg_interp.comp
 new file mode 100644
-index 00000000..479e7a7d
+index 00000000..56f1a249
 --- /dev/null
 +++ b/vita3k/shaders-builtin/vulkan/fg_interp.comp
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,198 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -17607,14 +17712,18 @@ index 00000000..479e7a7d
 +#version 450
 +// Frame generation, 3 of 3: the frame at a moment between two (the phase t: 0 the first frame, 1 the
 +// second). Each pixel tries a few motions d (a point of the second frame at q was at q + d in the
-+// first): none, the blocks' vectors around it blended (smooth motion), and each of those 4 blocks'
-+// own (an edge between two motions); a try samples both frames where the point was and will be (the
-+// first at p + d t, the second at p - d (1 - t)) at 5 points around the pixel, and the closest match
-+// wins (no motion and the blend win near ties). The pixel is the two samples mixed by t. Where
-+// nothing matches (something appears, or is uncovered, or changes), and in the whole frame when
-+// fg_motion counted too many blocks without a match or unlike their neighbours (a cut, a whip, a
-+// fade), it is the nearer frame's pixel, as without frame generation, instead of a smeared one. What
-+// stays put (the HUD over a moving scene) is the two frames mixed.
++// first): none, the blocks' vectors around it blended (smooth motion), each of those 4 blocks' own
++// (an edge between two motions) and the camera's (fg_motion's most common vector). A try samples both
++// frames where the point was and will be (the first at p + d t, the second at p - d (1 - t)); a work
++// group is 8x8 pixels on the grid of the blocks' centres (all its pixels have the same 4 blocks), so
++// it shares its pixels' differences per try, and each pixel takes the try whose differences over its
++// neighbours (5x5, within the group) are the least: neighbours choose alike (no speckle, no torn
++// patches), no motion and the blend win near ties. The pixel is the two samples mixed by t; where the
++// best try still differs (something appears, is uncovered, or changes) it fades to the nearer frame:
++// along the blended vectors where the 4 blocks agree (at the frame's edges from the frame that shows
++// the point), as it is where they don't. A group where nothing moves (its 4 blocks and the camera
++// still) mixes the two frames. When fg_motion found a cut or a fade (nearly all textured blocks
++// without a match), the whole frame is the nearer one.
 +
 +layout(local_size_x = 8, local_size_y = 8) in;
 +
@@ -17637,13 +17746,25 @@ index 00000000..479e7a7d
 +layout(set = 0, binding = 3, rgba8) uniform writeonly image2D result;
 +layout(set = 0, binding = 4) readonly buffer Judge {
 +    uint no_match;
-+    uint incoherent;
++    uint textured;
++    uint unmatched;
++    uint unused;
++    ivec2 camera;
 +} judge;
 +
 +const int BS = 8;
 +const vec3 WEIGHTS = vec3(0.299, 0.587, 0.114);
-+// a match: the frames differ by less than this around the pixel (luma, 0 to 1)
++// a match: the frames differ by less than this around the pixel (luma, 0 to 1); the result fades
++// from the made pixel to the nearer frame's between GOOD * 0.7 and GOOD * 1.6
 +const float GOOD = 0.05;
++// the tries: no motion, the blend, the 4 blocks', the camera's, and how they're favoured
++const int TRIES = 7;
++const float BIAS[TRIES] = float[](0.9, 0.85, 1.0, 1.0, 1.0, 1.0, 0.95);
++// the neighbours a pixel's choice looks at: (2 RADIUS + 1)^2, within the group
++const int RADIUS = 2;
++
++shared float group_difference[TRIES][64];
++shared float group_rows[TRIES][64];
 +
 +vec2 vector_at(ivec2 b) {
 +    const int blocks_h = (int(c.luma_h) + BS - 1) / BS;
@@ -17655,178 +17776,280 @@ index 00000000..479e7a7d
 +    return dot(abs(a - b), WEIGHTS);
 +}
 +
-+// how far apart the frames are around p (frame pixels) along the motion d
-+float mismatch(vec2 p, vec2 d, vec2 size) {
-+    const vec2 at[5] = vec2[](vec2(0.0), vec2(2.0, 0.0), vec2(-2.0, 0.0), vec2(0.0, 2.0), vec2(0.0, -2.0));
-+    const float weight[5] = float[](2.0, 1.0, 1.0, 1.0, 1.0);
-+    float sum = 0.0;
-+    for (int i = 0; i < 5; i++) {
-+        const vec3 was = textureLod(previous, (p + at[i] + d * c.phase) / size, 0.0).rgb;
-+        const vec3 is = textureLod(current, (p + at[i] - d * (1.0 - c.phase)) / size, 0.0).rgb;
-+        sum += weight[i] * difference(was, is);
-+    }
-+    return sum / 6.0;
++bool inside(vec2 at, vec2 size) {
++    return all(greaterThanEqual(at, vec2(0.0))) && all(lessThanEqual(at, size));
 +}
 +
 +void main() {
-+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
-+    if (pixel.x >= int(c.frame_size.x) || pixel.y >= int(c.frame_size.y))
-+        return;
-+    const vec3 was = texelFetch(previous, pixel, 0).rgb;
-+    const vec3 is = texelFetch(current, pixel, 0).rgb;
++    // (groups sit on the blocks' centres: shifted by half a group where half a block isn't a whole
++    // number of groups; threads off the frame work on its edge for their neighbours, store nothing)
++    const int shift = (int(c.scale) * BS / 2) % 8;
++    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy) - ivec2(shift);
++    const bool live = all(greaterThanEqual(pixel, ivec2(0))) && pixel.x < int(c.frame_size.x) && pixel.y < int(c.frame_size.y);
++    const ivec2 q = clamp(pixel, ivec2(0), ivec2(c.frame_size) - 1);
++    const vec3 was = texelFetch(previous, q, 0).rgb;
++    const vec3 is = texelFetch(current, q, 0).rgb;
 +    const vec3 nearer = c.phase < 0.5 ? was : is;
-+    // the frame's motion can't be trusted: the nearer frame
++    // a cut or a fade (the same for the whole frame): the nearer frame. Textured frames: nearly all
++    // their textured blocks found no match; frames with little texture: a quarter of the blocks
 +    const uint blocks = c.blocks_w * uint((int(c.luma_h) + BS - 1) / BS);
-+    if (judge.no_match * 4u > blocks || judge.incoherent * 20u > blocks * 7u) {
-+        imageStore(result, pixel, vec4(nearer, 1.0));
-+        return;
-+    }
-+    if (difference(was, is) < 0.03) {
-+        imageStore(result, pixel, vec4(mix(was, is, c.phase), 1.0));
++    const bool cut = judge.textured * 20u >= blocks ? judge.unmatched * 100u > judge.textured * 92u : judge.no_match * 4u > blocks;
++    if (cut) {
++        if (live)
++            imageStore(result, pixel, vec4(nearer, 1.0));
 +        return;
 +    }
 +
 +    const vec2 size = vec2(c.frame_size);
-+    const vec2 p = vec2(pixel) + 0.5;
++    const vec2 p = vec2(q) + 0.5;
 +    // the pixel among the blocks (their centres), in luma pixels
 +    const vec2 at = p / float(c.scale) / float(BS) - 0.5;
 +    const ivec2 b = ivec2(floor(at));
 +    const vec2 f = at - vec2(b);
 +    const float scale = float(c.scale);
-+    const vec2 tries[5] = vec2[](
-+        mix(mix(vector_at(b), vector_at(b + ivec2(1, 0)), f.x), mix(vector_at(b + ivec2(0, 1)), vector_at(b + ivec2(1, 1)), f.x), f.y) * scale,
-+        vector_at(b) * scale, vector_at(b + ivec2(1, 0)) * scale, vector_at(b + ivec2(0, 1)) * scale, vector_at(b + ivec2(1, 1)) * scale);
-+    // no motion first; the blend and no motion are favoured (still things and smooth motion)
-+    vec2 d = vec2(0.0);
-+    float best_mismatch = mismatch(p, d, size);
-+    float best = best_mismatch * 0.9;
-+    for (int i = 0; i < 5; i++) {
-+        bool tried = tries[i] == vec2(0.0);
-+        for (int j = 0; j < i; j++)
-+            tried = tried || tries[j] == tries[i];
-+        if (tried)
++    const vec2 v00 = vector_at(b) * scale, v10 = vector_at(b + ivec2(1, 0)) * scale;
++    const vec2 v01 = vector_at(b + ivec2(0, 1)) * scale, v11 = vector_at(b + ivec2(1, 1)) * scale;
++    const vec2 blend = mix(mix(v00, v10, f.x), mix(v01, v11, f.x), f.y);
++    const vec2 camera = vec2(judge.camera) * scale;
++    const vec2 none = vec2(0.0);
++    // nothing moves around here (the same for the whole group): the two frames mixed, where they
++    // differ (something changes in place) the nearer one
++    if (v00 == none && v10 == none && v01 == none && v11 == none && camera == none) {
++        const float w = smoothstep(GOOD * 0.7, GOOD * 1.6, difference(was, is));
++        if (live)
++            imageStore(result, pixel, vec4(mix(mix(was, is, c.phase), nearer, w), 1.0));
++        return;
++    }
++
++    // the tries, and which the group skips (the same for the whole group: no motion again, one the
++    // group already has; the blend stands for the 4 when they're alike)
++    const vec2 tries[TRIES] = vec2[](none, blend, v00, v10, v01, v11, camera);
++    const bool alike = v00 == v10 && v00 == v01 && v00 == v11;
++    bool skip[TRIES];
++    skip[0] = false;
++    skip[1] = alike && v00 == none;
++    skip[2] = alike || v00 == none;
++    skip[3] = alike || v10 == none || v10 == v00;
++    skip[4] = alike || v01 == none || v01 == v00 || v01 == v10;
++    skip[5] = alike || v11 == none || v11 == v00 || v11 == v10 || v11 == v01;
++    skip[6] = camera == none || camera == v00 || camera == v10 || camera == v01 || camera == v11;
++    const uint lane = gl_LocalInvocationIndex;
++    for (int i = 0; i < TRIES; i++) {
++        float m = 0.0;
++        if (!skip[i]) {
++            const vec3 from = textureLod(previous, (p + tries[i] * c.phase) / size, 0.0).rgb;
++            const vec3 to = textureLod(current, (p - tries[i] * (1.0 - c.phase)) / size, 0.0).rgb;
++            m = difference(from, to);
++        }
++        group_difference[i][lane] = m;
++    }
++    barrier();
++    // the differences summed over the neighbours: along the row, then down the column
++    const ivec2 l = ivec2(gl_LocalInvocationID.xy);
++    const ivec2 lo = max(l - RADIUS, ivec2(0)), hi = min(l + RADIUS, ivec2(7));
++    for (int i = 0; i < TRIES; i++) {
++        float sum = 0.0;
++        for (int x = lo.x; x <= hi.x; x++)
++            sum += group_difference[i][l.y * 8 + x];
++        group_rows[i][lane] = sum;
++    }
++    barrier();
++    const float count = float((hi.x - lo.x + 1) * (hi.y - lo.y + 1));
++    vec2 d = none;
++    float best = 1e9, best_difference = 1e9;
++    for (int i = 0; i < TRIES; i++) {
++        if (skip[i])
 +            continue;
-+        const float m = mismatch(p, tries[i], size);
-+        const float score = m * (i == 0 ? 0.85 : 1.0);
++        float sum = 0.0;
++        for (int y = lo.y; y <= hi.y; y++)
++            sum += group_rows[i][y * 8 + l.x];
++        const float m = sum / count;
++        const float score = m * BIAS[i];
 +        if (score < best - 1e-4) {
 +            best = score;
-+            best_mismatch = m;
++            best_difference = m;
 +            d = tries[i];
 +        }
 +    }
-+    if (best_mismatch >= GOOD) {
-+        imageStore(result, pixel, vec4(nearer, 1.0));
-+        return;
-+    }
++
 +    const vec3 before = textureLod(previous, (p + d * c.phase) / size, 0.0).rgb;
 +    const vec3 after = textureLod(current, (p - d * (1.0 - c.phase)) / size, 0.0).rgb;
-+    imageStore(result, pixel, vec4(mix(before, after, c.phase), 1.0));
++    const vec3 made = mix(before, after, c.phase);
++    // no match: the nearer frame. Where the 4 blocks agree (one motion: what appears or changes there
++    // moves with it), along the blend, at the frame's edges from the frame that shows the point (the
++    // other one's is past its edge); where they don't (an edge between motions, a failed search), as
++    // it is (a warp along unlike vectors melts the picture)
++    const vec2 from = p + blend * c.phase, to = p - blend * (1.0 - c.phase);
++    const bool from_in = inside(from, size), to_in = inside(to, size);
++    const bool first = from_in != to_in ? from_in : c.phase < 0.5;
++    const vec3 along = first ? textureLod(previous, from / size, 0.0).rgb : textureLod(current, to / size, 0.0).rgb;
++    const vec2 s0 = abs(v00 - v10), s1 = abs(v00 - v01), s2 = abs(v00 - v11), s3 = abs(v10 - v01), s4 = abs(v10 - v11), s5 = abs(v01 - v11);
++    const float spread = max(max(max(s0.x + s0.y, s1.x + s1.y), max(s2.x + s2.y, s3.x + s3.y)), max(s4.x + s4.y, s5.x + s5.y)) / scale;
++    const vec3 lone = mix(along, nearer, smoothstep(2.0, 6.0, spread));
++    const float w = smoothstep(GOOD * 0.7, GOOD * 1.6, best_difference);
++    if (live)
++        imageStore(result, pixel, vec4(mix(made, lone, w), 1.0));
 +}
 diff --git a/vita3k/shaders-builtin/vulkan/fg_interp.comp.spv b/vita3k/shaders-builtin/vulkan/fg_interp.comp.spv
 new file mode 100644
-index 0000000000000000000000000000000000000000..805021ca2f4301acac60ee47ec3de5986be58ff5
+index 0000000000000000000000000000000000000000..3c65ec0f24c899af77d265c2e6b279fe45f14035
 GIT binary patch
-literal 12392
-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
+literal 20564
+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
+HyAS^lPdtv?
 
 literal 0
 HcmV?d00001
 
 diff --git a/vita3k/shaders-builtin/vulkan/fg_motion.comp b/vita3k/shaders-builtin/vulkan/fg_motion.comp
 new file mode 100644
-index 00000000..17a16625
+index 00000000..f62c6673
 --- /dev/null
 +++ b/vita3k/shaders-builtin/vulkan/fg_motion.comp
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,266 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -17847,16 +18070,22 @@ index 00000000..17a16625
 +#version 450
 +// Frame generation, 2 of 3: per 8x8 block of the new frame's luma, where it was in the previous
 +// frame's (the vector d: new(p) = previous(p + d)), by the sum of absolute differences plus a small
-+// cost per pixel of motion, so flat areas keep still. Coarse to fine, so camera pans are found:
-+//   pass 0  on the luma at half size (2x2 means): from no motion or the block's last coarse vector,
-+//           steps of 8, 4, 2 and 1, up to 24 (48 luma pixels)
++// cost per pixel of motion away from the camera's (the frame before's most common vector), so flat
++// areas move with the camera (and keep still when it does). Coarse to fine, so camera pans are found:
++//   pass 3  on the luma at quarter size (fg_copy's 4x4 means): from no motion or the camera's,
++//           steps of 8, 4, 2 and 1, up to 16 (64 luma pixels)
++//   pass 0  on the luma at half size (fg_copy's 2x2 means): from no motion, the block's last coarse
++//           vector, the camera's or twice the quarter vectors around it, steps of 8, 4, 2 and 1, up
++//           to 40 (80 luma pixels)
 +//   pass 1  on the luma: from the best of no motion, the block's vector in the frame before (its
-+//           motion from the one before that) and twice the coarse
-+//           vectors around it, steps of 2 and 1; a block whose best still differs by more than 0.07
-+//           a pixel is counted (it found no match)
-+//   pass 2  per block: counted when its vector is unlike all four neighbours' (by more than 4 luma
-+//           pixels). Many blocks of either kind: a cut, a whip or a fade, where an in-between frame
-+//           would be a mess (fg_interp shows the new frame instead)
++//           motion from the one before that), the camera's and twice the coarse vectors around it,
++//           steps of 2 and 1; a block whose best still differs by more than 0.07 a pixel is counted
++//           (it found no match), and a textured block (its luma's mean deviation over 0.023) whose best
++//           differs by more than half its texture (no real match anywhere); a textured block with
++//           a match counts its vector
++//   pass 2  one group: the most counted vector, the camera's (the next frame's search starts there)
++// Nearly all textured blocks without a match: a cut or a fade, where an in-between frame would be a
++// mess (fg_interp shows the new frame instead)
 +
 +layout(local_size_x = 8, local_size_y = 8) in;
 +
@@ -17885,30 +18114,64 @@ index 00000000..17a16625
 +};
 +layout(set = 0, binding = 4) buffer Judge {
 +    uint no_match;
-+    uint incoherent;
++    uint textured;
++    uint unmatched;
++    uint unused;
++    ivec2 camera;
 +} judge;
 +layout(set = 0, binding = 5) readonly buffer Last {
 +    ivec2 last_vectors[];
 +};
++// the frame before's judge (its camera)
++layout(set = 0, binding = 6) readonly buffer LastJudge {
++    uint no_match;
++    uint textured;
++    uint unmatched;
++    uint unused;
++    ivec2 camera;
++} last_judge;
++// the textured blocks' vectors with a match, counted (pass 1), cleared for each frame
++layout(set = 0, binding = 7) buffer Counts {
++    uint counts[];
++};
++// the frames' luma at half size, then at quarter size (fg_copy)
++layout(set = 0, binding = 8) readonly buffer PreviousLevels {
++    float previous_levels[];
++};
++layout(set = 0, binding = 9) readonly buffer CurrentLevels {
++    float current_levels[];
++};
++// the quarter pass's vectors
++layout(set = 0, binding = 10) buffer Quarter {
++    ivec2 quarter[];
++};
 +
 +const int BS = 8;
++const int LIMIT = 48; // luma pixels: the counts' range (the camera's)
++const int SIDE = 2 * LIMIT + 1;
 +
-+int level_w() { return c.pass_index == 0 ? (int(c.luma_w) + 1) / 2 : int(c.luma_w); }
-+int level_h() { return c.pass_index == 0 ? (int(c.luma_h) + 1) / 2 : int(c.luma_h); }
++shared uint group_most[64];
++shared uint group_at[64];
++
++// the level's size: pass 3 the quarter, 0 the half, 1 the luma
++ivec2 level_size() {
++    const ivec2 luma = ivec2(int(c.luma_w), int(c.luma_h));
++    return c.pass_index == 3 ? (luma + 3) / 4 : c.pass_index == 0 ? (luma + 1) / 2 : luma;
++}
 +
 +float luma_at(bool is_current, ivec2 p) {
-+    const ivec2 last = ivec2(int(c.luma_w) - 1, int(c.luma_h) - 1);
-+    if (c.pass_index == 0) {
-+        // a 2x2 mean of the luma
-+        const ivec2 q = clamp(p * 2, ivec2(0), last);
-+        const ivec2 r = clamp(p * 2 + 1, ivec2(0), last);
-+        const int w = int(c.luma_w);
-+        if (is_current)
-+            return 0.25 * (current[q.y * w + q.x] + current[q.y * w + r.x] + current[r.y * w + q.x] + current[r.y * w + r.x]);
-+        return 0.25 * (previous[q.y * w + q.x] + previous[q.y * w + r.x] + previous[r.y * w + q.x] + previous[r.y * w + r.x]);
-+    }
-+    const ivec2 q = clamp(p, ivec2(0), last);
-+    return is_current ? current[q.y * int(c.luma_w) + q.x] : previous[q.y * int(c.luma_w) + q.x];
++    const ivec2 size = level_size();
++    const ivec2 q = clamp(p, ivec2(0), size - 1);
++    if (c.pass_index == 1)
++        return is_current ? current[q.y * size.x + q.x] : previous[q.y * size.x + q.x];
++    const ivec2 half_size = (ivec2(int(c.luma_w), int(c.luma_h)) + 1) / 2;
++    const int at = (c.pass_index == 3 ? half_size.x * half_size.y : 0) + q.y * size.x + q.x;
++    return is_current ? current_levels[at] : previous_levels[at];
++}
++
++// the camera's motion at this level
++ivec2 camera_here() {
++    return c.pass_index == 3 ? last_judge.camera / 4 : c.pass_index == 0 ? last_judge.camera / 2 : last_judge.camera;
 +}
 +
 +float sad(ivec2 block, ivec2 d) {
@@ -17917,48 +18180,79 @@ index 00000000..17a16625
 +    for (int j = 0; j < BS; j++)
 +        for (int i = 0; i < BS; i++)
 +            s += abs(luma_at(true, origin + ivec2(i, j)) - luma_at(false, origin + ivec2(i, j) + d));
-+    return s + 0.02 * float(abs(d.x) + abs(d.y));
++    const ivec2 off = d - camera_here();
++    return s + 0.02 * float(abs(off.x) + abs(off.y));
 +}
 +
 +void main() {
-+    const ivec2 block = ivec2(gl_GlobalInvocationID.xy);
-+    const int bw = (level_w() + BS - 1) / BS, bh = (level_h() + BS - 1) / BS;
-+    if (block.x >= bw || block.y >= bh)
-+        return;
-+    const int index = block.y * bw + block.x;
 +    if (c.pass_index == 2) {
-+        const ivec2 v = vectors[index];
-+        int nearest = 1 << 30;
-+        for (int k = 0; k < 4; k++) {
-+            const ivec2 around = k == 0 ? ivec2(-1, 0) : k == 1 ? ivec2(1, 0) : k == 2 ? ivec2(0, -1) : ivec2(0, 1);
-+            const ivec2 q = clamp(block + around, ivec2(0), ivec2(bw - 1, bh - 1));
-+            const ivec2 w = vectors[q.y * bw + q.x];
-+            nearest = min(nearest, abs(v.x - w.x) + abs(v.y - w.y));
++        // the camera: the most counted vector (one group of 64)
++        const uint lane = gl_LocalInvocationIndex;
++        uint most = 0u, at = uint(LIMIT * SIDE + LIMIT); // (no motion when nothing was counted)
++        for (uint i = lane; i < uint(SIDE * SIDE); i += 64u) {
++            const uint n = counts[i];
++            if (n > most) {
++                most = n;
++                at = i;
++            }
 +        }
-+        if (nearest > 4)
-+            atomicAdd(judge.incoherent, 1u);
++        group_most[lane] = most;
++        group_at[lane] = at;
++        barrier();
++        for (uint stride = 32u; stride > 0u; stride >>= 1) {
++            if (lane < stride && group_most[lane + stride] > group_most[lane]) {
++                group_most[lane] = group_most[lane + stride];
++                group_at[lane] = group_at[lane + stride];
++            }
++            barrier();
++        }
++        if (lane == 0u) {
++            // none from a cut (fg_interp's test), nor from a vector few blocks share
++            const uint blocks = c.blocks_w * uint((int(c.luma_h) + BS - 1) / BS);
++            const bool cut = judge.textured * 20u >= blocks ? judge.unmatched * 100u > judge.textured * 92u : judge.no_match * 4u > blocks;
++            judge.camera = cut || group_most[0] * 32u < blocks ? ivec2(0)
++                                                               : ivec2(int(group_at[0] % uint(SIDE)) - LIMIT, int(group_at[0] / uint(SIDE)) - LIMIT);
++        }
 +        return;
 +    }
-+    const int limit = c.pass_index == 0 ? 24 : 48;
++    const ivec2 block = ivec2(gl_GlobalInvocationID.xy);
++    const ivec2 blocks = (level_size() + BS - 1) / BS;
++    if (block.x >= blocks.x || block.y >= blocks.y)
++        return;
++    const int index = block.y * blocks.x + block.x;
++    const int limit = c.pass_index == 3 ? 16 : c.pass_index == 0 ? 40 : 80;
 +
 +    ivec2 d = ivec2(0);
 +    float best = sad(block, d);
-+    const ivec2 last = c.pass_index == 0 ? coarse[index] : last_vectors[index];
-+    if (last != ivec2(0)) {
-+        const float s = sad(block, last);
-+        if (s < best) {
-+            best = s;
-+            d = last;
++    if (c.pass_index != 3) {
++        const ivec2 last = c.pass_index == 0 ? coarse[index] : last_vectors[index];
++        if (last != ivec2(0)) {
++            const float s = sad(block, last);
++            if (s < best) {
++                best = s;
++                d = last;
++            }
 +        }
 +    }
-+    if (c.pass_index == 1) {
-+        // the coarse vectors of the parent block and around it
-+        const int cw = ((int(c.luma_w) + 1) / 2 + BS - 1) / BS, ch = ((int(c.luma_h) + 1) / 2 + BS - 1) / BS;
++    // the camera's motion
++    const ivec2 camera = camera_here();
++    if (camera != ivec2(0) && camera != d) {
++        const float s = sad(block, camera);
++        if (s < best) {
++            best = s;
++            d = camera;
++        }
++    }
++    if (c.pass_index == 0 || c.pass_index == 1) {
++        // the level above's vectors of the parent block and around it (twice: a level is twice the size)
++        const ivec2 above = (c.pass_index == 0 ? (ivec2(int(c.luma_w), int(c.luma_h)) + 3) / 4 : (ivec2(int(c.luma_w), int(c.luma_h)) + 1) / 2);
++        const ivec2 above_blocks = (above + BS - 1) / BS;
 +        const ivec2 parent = block / 2;
 +        for (int k = 0; k < 5; k++) {
 +            const ivec2 around = k == 0 ? ivec2(0) : k == 1 ? ivec2(-1, 0) : k == 2 ? ivec2(1, 0) : k == 3 ? ivec2(0, -1) : ivec2(0, 1);
-+            const ivec2 q = clamp(parent + around, ivec2(0), ivec2(cw - 1, ch - 1));
-+            const ivec2 candidate = coarse[q.y * cw + q.x] * 2;
++            const ivec2 q = clamp(parent + around, ivec2(0), above_blocks - 1);
++            const int at = q.y * above_blocks.x + q.x;
++            const ivec2 candidate = clamp((c.pass_index == 0 ? quarter[at] : coarse[at]) * 2, ivec2(-limit), ivec2(limit));
 +            if (candidate == d)
 +                continue;
 +            const float s = sad(block, candidate);
@@ -17968,7 +18262,7 @@ index 00000000..17a16625
 +            }
 +        }
 +    }
-+    for (int step = c.pass_index == 0 ? 8 : 2; step >= 1; step >>= 1) {
++    for (int step = c.pass_index == 1 ? 2 : 8; step >= 1; step >>= 1) {
 +        ivec2 next = d;
 +        float next_best = best;
 +        for (int j = -1; j <= 1; j++) {
@@ -17988,135 +18282,212 @@ index 00000000..17a16625
 +        d = next;
 +        best = next_best;
 +    }
++    if (c.pass_index == 3) {
++        quarter[index] = d;
++        return;
++    }
 +    if (c.pass_index == 0) {
 +        coarse[index] = d;
-+    } else {
-+        vectors[index] = d;
-+        if (best - 0.02 * float(abs(d.x) + abs(d.y)) > 0.07 * float(BS * BS))
-+            atomicAdd(judge.no_match, 1u);
++        return;
++    }
++    vectors[index] = d;
++    const ivec2 off = d - camera;
++    const float differs = best - 0.02 * float(abs(off.x) + abs(off.y));
++    const bool matched = differs <= 0.07 * float(BS * BS);
++    if (!matched)
++        atomicAdd(judge.no_match, 1u);
++    // the block's texture: its luma's deviation from its mean (a flat block's vector is any motion)
++    float sum = 0.0;
++    const ivec2 origin = block * BS;
++    for (int j = 0; j < BS; j++)
++        for (int i = 0; i < BS; i++)
++            sum += luma_at(true, origin + ivec2(i, j));
++    const float mean = sum / float(BS * BS);
++    float texture = 0.0;
++    for (int j = 0; j < BS; j++)
++        for (int i = 0; i < BS; i++)
++            texture += abs(luma_at(true, origin + ivec2(i, j)) - mean);
++    if (texture > 1.5) {
++        atomicAdd(judge.textured, 1u);
++        if (differs > 0.5 * texture)
++            atomicAdd(judge.unmatched, 1u);
++        // a textured block with a match counts its vector (the camera's is the most counted)
++        if (matched && abs(d.x) <= LIMIT && abs(d.y) <= LIMIT)
++            atomicAdd(counts[(d.y + LIMIT) * SIDE + d.x + LIMIT], 1u);
 +    }
 +}
 diff --git a/vita3k/shaders-builtin/vulkan/fg_motion.comp.spv b/vita3k/shaders-builtin/vulkan/fg_motion.comp.spv
 new file mode 100644
-index 0000000000000000000000000000000000000000..0747409ed3aa29d391539e8b4eb3ff808a006aa9
+index 0000000000000000000000000000000000000000..853d4ba7c25d02d5634959cdc85bb28f7ecfd3b0
 GIT binary patch
-literal 16676
-zcmZ9T1$bUnwuXObQ>?V56t@;iad$0VV9FrHEltz3O-YlIRM3Iq?rsAVch|w)1|P<l
-zVHAe3dvTZn?)&~ZAKmvqWIg*^-&%XEwdL${a#H%ty}~@T+FZ2-YV+3KnY&iM7OKq+
-zQ-kYQZ%2(DGkVRQY2(*ie}lDk7*Oj|_tR$}K25ZJktr?hof<a8FbH05A!Oc4^zXxe
-zrg<8r36HX06O6tcZ8O?BnrE&IglVeH{{uIv;`-Hw$W5Qp(%dp_<#Fq5Hluyr&Fa2`
-z;oEzfTc>w-w{=dlf1ldIa8r>cYFdJ}r)B)gcBpr%^L=ZJ(T?lrYCWW`_o*#TJHC#a
-zYRk}W+tt}Kt)+8X54a!y$$9m3w>Ec8n9$QkuJDd?LU+rQw&tGpBiiJ9V>s@f)|L*a
-zA2?^SK8~4lIOn9!O_~$aIj+~&(~RdFz8`pMOHWU8d*}GJ!{)?bQEO8twe*<FIarRi
-zwT}DNM$>k*^iXlH?Eu<CE38j<g`EqNxlTH7TTQCtsdt9UM4Mv<x|eG<n|8PEwi)eR
-z)19*V+{k%NEqMD~-%Hc0PwjPZYWW0gXY+qX+tuAZ(H*AW*XWb$wm!AFnDF+>Zy<PT
-z3zJ{zgBtWD8}y|b^!3o^?1OphdwF6<^QexlaV;G?b<XH&ZJE~I)w$DlRqjpoXOgUG
-zq?k3c-Z9{6N$R#1bmvD~D|qj=)@fbcJ@tK{?lq(0jMY|g`cDRTwzYJ(v1Hmh(0lhO
-z>jG}+?wa1oX4Q5kdgkw9aMteu@Xpi6Pwd@${c7r7on6gSTBfy9b?+L<YijRo?V8k<
-zd#G>iA;`&9e`|USy`z0fyZgYr&!YF<FMVszfyY^F-PX7EJbJk%FE;3}pwHQleQR%{
-zZ`;+<?dEl_se83nocZ3ZIBWS0cyzU&`_<;D>-rnBIg^TRzxRLW*QfR&IQ#1(a9QKW
-z|4(PXp|@7+JU2J8GiL4u!1Vj!tQm-&wOJfouFbmWy=&7{+Z^25(mB3;e9N@lqr1YT
-zp54G@J$p3h2kSen&10=z$7J-*w!^A9Z>n`vdULf9j=d8u_sk4%?>*C0I|<xa%hhnH
-z<r;8V%j`lQMO@E9sM?NHl5=qd3*!pM^ws3%Ejatg4Jx=k6*r{dJP-BrOisL}id(wi
-zJPY+3T5z6&a>J2Pte0cb&zRQkgqd?knEK>_lP9|Uz4Z4U)^05EFvPJ%UmonGel2a8
-zYc_gviM^65`U<^tJ=gV>-B@CCc||XC`OIAaoAaT49J;xkZ|nAq>CN3#$I$h8vDM%6
-zW*FEti9RQOpZa-`{y95Rt80>TL#}sjd(RAGminBSeQR%#v#inkJUMdDCx<n8&l^vl
-z=w-ZLH^lQ?=#AHVM$qkt`PSw&Cw}kQkhS%k7>3<_W-j$I*V}XV&bRLq3o~n|`1^L#
-zJBN$V$FU7X=vueA7v+ZF-Jf<SJ`2*yt1pH=fL0&lX&*?dU4Bubd#?;dhEdr<wCcvt
-zPj1nQQ&+5GDcYfkmpR-ca^_f;w=3^i<A>K)N^j1-_||IkA^LAd9ChC-<W@t^czfHv
-z)YEG-mUdh3LodfRf;MxK{;R?{htbyr&sFGagRMLEkzn^%^k%Tv>db{>8jHv&`ZyNf
-zZ)&w;w_Juyo(FQvg1z6>t!+B3dE^|cy7zl>I~Jd<)~5e4mCabjy_Pm{XM@%CyN=cv
-za>iBn-j>t;4y|)y-_-jl*ehfF0_=Ug3VGZ&^HIdA6&?&uzY*a1-<!R;Yra0%nw?wo
-zY=F*Bowp8k&k#BL>w6H2bvYi-6X(-;@+?s|&UjjV<cy>4S(5QgtgwAk{~>T(TSY$t
-z{d=yg*^%gSu35O_(A^6qcT(k}Z~RWKIDH-WDd^6T^(>3-Ipx?C>wgeko4oa_`>vDv
-zAFi<esrM;3&xz<yqpywbJb9*No;<_U>+4EuOgZzsL+g1aXFt!b^z&>|x8HAR^^vom
-zx@VDG@-K?wIi>Etc@=$?1JB+{-MZgGcfYL89qK;t?2=R5!yD2Yh<ESh9{CE!nCA2x
-zS&x41OLgztO&fIIeM|e8LbrcQq1)eg+S1>5+UWZGUR&xj8}wrubl-bRf8TwhoA0qg
-zH@@$yv3t+?&Kh02@2sWnJ8P-?&RXiP7rOC$w=C_xUzWP>m(i`y_sdfE9W%Q1_?{VE
-zf8R5sYxiBV)R$_|hc)OcHR$U$=)RvOp5yV|G`jhGKP~k=3f=mAKP~OPpGG&H@2AoA
-z_uaJAeLszEKHpKJ+yCl9*X}!N?CQRws&B!5b<b~vc)sll>vL}7ij()UISOCz!A(%K
-zZ^?b>zE|G_TR&`@fxVZG<?c}599_;c`M8SP0$tuS=;Vsq5?x+D<9h$dCGJ*WzjGw+
-z*64C&+-=b1%edR3%O|e)q1@KwbzZjvJBHz4=faw|N0*Pj1K4`*q>pFiD6l^AH_=CK
-zN3i^t)V?#V*EiVYcS7VmGsMaLBe1zWW0Gq$x_tCqz}B4HKL+a~|26Rv*Y<PP&RTW_
-zTZ`wD{^qo<-D$n7OP}2kIqMRC%PNcIQsbWB#v1p6lTVF%gPorfs<qq)tdD%+><ez3
-z=l$U1v!?rl?JMsd7(**(jA7J$0C+jtp@_LXyAOnuzolB6gTZnKA&z-0t(Rlg){MwG
-zPI1OC0c^gl*#Q%2Cm}wkeV%I5&%NJX*{shqTU|Vv*5|g^v)X>H&lIq^Y`-8z7wuHU
-zOZ%af-8Qv!gN<=_HKrc0+(`O34)spNSjHBo?{u(zGaoa+a@ON~91iv}j<&;)qY&eW
-zt$!x%k%;x_uT7uiI2v5$_zAk4_nkRrfxXP3?O5b^#5iJe97B5?Vh;Va>608MfXf^w
-zqRaUnu^aPp3iwn+Ub&fdbA3*$_>*W)Mv_au%w<k<+2?ey^<?bo<=CBr_?`iFe)RPj
-ztRCB0;PndqY_LA=Z}Xf3)<-_$JQwV}le6(Wu$*%lpYzd27Csk%<@9kbjC~=xeYN%H
-z1eUu9%uj6%#N1<P^|SUfX|?D6yaX&)o<*0U%cqXZz}A}k{Bp29@`-Z=*f`~RdL_Di
-z?(?g__La~5_ET`~H|?3ztHIi=`C?l2)N>8k`!2b!1-Bq&?%C+_@wpCcoYLodbos2o
-z4Pg7p_h(=EOt=xu53^mXX-~YHz~(IH?PhfO_}l_EXX$e*x_olp2DYDka^4Q+r=C-L
-z=I;)$^=R+UnQwh}g88Yfgg7tyIA_j}HutmVj`x{u=I}0X2a?!#gXP>?_SYt7|0%Tg
-z@1jlrd%)(nohp6y+zXcTtnw_lAME8>pzS_H&NyP{=waGNkcSZSe$1FW+aIlX=gsx9
-zwT|?+%`<B(*jU5xc^teP?NG!zjr9bae9pxu!E(m+>~IdBL6?6Dc^Yy2kI~ADpQRm(
-zpE13^UO->3vOQ0$9@|S`{q6T6t@<Wp@%N9H!G0I9k2Zatqm|DXUIjOf;Waq<jN#{C
-zImh5!zX|qouC={^{0ecd#aXjofX5)Y_ud1)i};MtmNEPitj+pfr&V|U&0|bsC+6?K
-zWz65BzmFJGTVj3y)|Qy+WlUqo_YYw6>iY_<dTf6L%iYSFpF;a5L~bnkE@S-e#XncP
-zbMsfQmvbZk7evl+h!gj3;H>FKVD;Gk4mPLtd`zpJHT?(JHMNg6eLkd>x4-NDPq19{
-ze}P^1hpKz$-(Y>@t@(dxy{uW={~&VKEKZzHz{WMF@zhiEr{L7=epGk96USCPb77l3
-z_!+oy4}K0OpFQ{mSk8OXn!f^jS+lk;5jkrXC-ygBWBWbJTD?dA11InA8Qzco1<U1Z
-z`W7tb8Ij)`zC)Myy&!(yqsy1S8<4&xU-q2~PCmaIe2rZ$HTD5p<47bm_JxyAjZI*=
-z<n9NSEAz~QE??F-FS>kL<9z7yW#9SH<x``-_sV5``-9!Dc@J0+-8_nOG=O#hoPOHe
-zBmS-|C-(Q`W_;WOgTStnt?#OXX%|Mkv=6E5w&r(@76BV0@2ZP|<^1O29#CHhF_y8#
-z>AM8jzS&Dlg5|8oy|fJ2%Q)JWMwUg4Bes5jj~|PV_35uopX68$T;>>xF6SJZV+F96
-zIkYX03`dM3HizE^j%1F_p}#hLl4C`1nPUXHoNHi?Rlr{6(6%zNDq<Y5IsD#mT$MwA
-zZTcj~YTz=*>gaObKY1Ts16^Lp`|z4z`ICr!GLl^KjwiWn&E<Ys3v4|ZyLvfx=ODgo
-zgPk9JT?_ScEnJiMt^?LbU%$tw$F?5WeHndyus+^b*0cdwA9;P;dmDniXY&rV5xSgf
-z8=sBQy=UUH30O{_+%ub^+gDrOoi_s$y8iBL?y+F~tle)x+C3*mz;6MTE8p+7M3+w;
-zBf-|1cjv9p^^s4Ut-;0_Zp><o+h|8}zHAG&Z=GirCK7Wy^gO?{+t)eU9;_|n+yR`k
-z!8-IA1*e}j$L4n}xy0BJEEjzzu+I_iS)aQ*qw6DoIeC5V{s=7Z-rt4R%e^l@8j*8<
-zi`^@pG3xTkvpYD?;oZRMv5f&+llAUFtDfiZo?xHD_R*%#uC(&@AB1f$uw3-L!R2#!
-zA9Q`>9m9UKUXDTAzKEPPixX#muyM_4JoVIk05~-}f9j4sacs-Ea8B&&K0gpV5Xl}m
-z2rTCwHkURz`wybEuECX_XRmFZYt7hvt_?-Z;j?!voP5sW7O<RqG4IFY(B*v=xsS|!
-zFuJ_CTWQU0>+_?Hb^_w1ePU&|&DbV^jgjwL?O-{_=6tJ<M~r1`apv?8uybi0lfmlR
-zT;nNV*FakbSY6yndj!1obb*a&YrTikb|YTedn&ta>YWBQ#=Y!+_xg0OT<TSyiWtk-
-zV)M?RP2QQ6&DOk!YeT%udt_y|P2Qux#z@|y!E(u~ei&jb^NQ2=Ct&+#ZI1!V`J9c<
-zvFMH~KC{4b`rKHJ^*D6<YV*E0f!51)(sn!|XMV9`aa`*1<{E(i$zazlxlcj2zUZfd
-zttIEyX<&Wi<8wOLeG{KEz;a5?wll%@)t2YTSzz;Pb6rlNmCG4?HdxMmpIqml%jfs<
-zbHS9)tngh09KZ9x{=S&sh0jOVS3ci~F96Fse;3huIe+pOB67}`I5k}iwx;s=atXS8
-zYPuAhnzW^+%fMw#m!s<|@A@R4ZN4900k%fhOn+;!-m7R+uRd2Ia@H#@*IV8iT<>ea
-zIm@pBtH*X7*s-}5vuV|HmR}F{EVqv~eXgdJx4-xK4Pd$GH-f$2^E=f|V148r!!5L4
-z&bhXm5jn>oPMll8#x<w$)Kl|q;M6=BtnSzo$F`gc?*aRImfsGZf#fW|11#r#Y%Xnb
-z_Rl%tJ+1E9WSzE&cPF?LNxZwja*3x+&i-Ar_V;YcSndWp26KB)s%vv@?*Th@ZJwp-
-z#+g8C9NW}!FWCF>8SV<lc^_CVb!d~be=Dv1J=60{x*y#5OnLxLK4;Q{U^(wi*YaVo
-zmuso*A>=W{*y7ao2zU(jXUvbHJJx*v_!)ZMpY(OSa{5`Xd5mf7#C#lF#(V<3jQJ#b
-z8#z2b^);rPe#UTqp8`9txzC?QH%58(JOd}6`}|ojF7>lVTlzi+wr_bxJP#+IzAu2&
-zS6lYXi(unw@2YBh2`qminXL6?@CZ7~A762=fE|OjN8o%Oz6O?m6>*JTr}c7;wEY~B
-zb3Vn^|1fdi06#?QeC7M!n{e`u$vLrgJ<{K{Tp!oT?|~a5{>|Qf=-(o}{9C6v{kJ&z
-z8@=C3<+BHu2RH7)72xEv2Ui5kWe=_b_HumMRz}uE%q33j)xgFszjv&TE}w4+ey5kq
-zx~v73^B&6gj&;EDYa{L{#~|lCSc`ehpS<gV8}qIYC!f3<faMZTy^Lqv?E4MD=KPL4
-z;&QJ2`>dC9Y90Q2yUg|G6`#5`L2sPvP2uD-*PDUmGS^#zy_{=pTOivb<`O6NR$ya~
-zM6BEQ+pUqUkc@eoipyMYi!N8r^>*m;nQO-&=iFF}dCi}^JAfPWj)Id<-W|bm&b9H>
-z%Xr4kT<-+d$GH|~uDu_JAYT3(w~dJ9zi}H}VgJ6rFk*d+(7Fb4qY>98`T-4kYoU(-
-zA5!S{f4$KCHwN!kdd9yCy5leR_>a-$GyYw{a`}CHH?W-Zo;bUM8|QHkIQhgG1C~pi
-zJ;8Fu$vfd*b<FR6w9dEVmrI_#!R8r?WS{H<md_sC7c7@OxIfs-J*aIzM9#Su8)pFR
-zfrx96S`GrckCeQh9t_q`Tl%$ttux;t#(_B&>*s*}V-bBEkL#yBeaC~#oNefhIVZsB
-zr!BQj1Uqkv_k;CMLiE*^`0e1bw#n$JP5-foKGx=5(w@2Q05|T9DRA;x(@wCQ{oQ-&
-z=I&41g}A?crW{J^<r>IOMdVxqu{qtphat|9&kf`BqdgpvkA4K$T=_0@Bv>E$#5oFV
-z9QQ!_9SxSx`SBC5edT?xIHqpnU5~aI(Qe;Cw6l<7k;Fd^+*s%FaPrA_0=TU6M09=R
-z6Xztb^FAC&zmvi8sq+-DedSZ<so>P9J$0T2);5dzwC>aEnBS>rlk*I)Im<ad6J0(v
-zoCPjxKO0>i`NTN~+&IVQ!pW!h^T76%PwnS}Q@i%megRlpYQGR{{qo6q5xBATi{a!`
-z`z7GA_Dj+Akx!h<z>V{MIh=fIzXEJu`P6<TIJIj}?N@=drS_kKtzSOxV^@Q_5p6yn
-z)ZPEy2dV1@aO1wZ5l%kiy9r#5?`Cv;<P+x>aO2wC3MZfO-3GR=e8zV>_<F?suRY_t
-z1FS9a?*up2c^8~~>bx6V)_D)QKJtlkFSv0X?t_z0o%e(7E1x<a0H;pvsq;awwprEw
-ze+X>t^2zxyxN#3X0w<r^9|f1S{|sFp`NVk)+&IUN!^x-iC&2cVPwh{FQ@i%m{uEeS
-zYJVDR{qo8A47joOXW`^i`*Yy3_UF;{kx!f#z{VMlq~D8R`PBXr*uL_q{bg`!*Phy6
-z0c%U`uY#>#KKuVQu=`(|`(NGtzdx;U2GG8NEL`Ysf=45Hw!Q_<^Gn~ch(11lUZ>S=
-ztp2obBZCp2Kkw0c`TUXp1@b4v{Nl{ZFTuu{iDX`W1(w%m811i-<&aeoeU_sA4I-cC
-z;%_T1&#3p&jU%62zXO}AT!Y`E%V!Nf0NYnSYw!o~45S(P0I`Naw0}gjIT!C%y6>ru
-z-ElhJ<o+|bah!jFlg~K+3T_<dhj8*4=SN_<jPq|`<H#r1$Kb|s{vA#}<NOEMzVaF8
-zKf&2++B437fwg6v>g6~cZ+!m^b}rm+;_`ib33RVT5#PrL(k@ou#lg<olC-{mzeD>8
-zGEb%J|5>4r0Ds+}&&6hq|AN>C7P|ch6}t8%3tjtCmF`&0{VC$uyjMO)tT*q3UxL4=
-zB=4(Vq3fs37}hH%wpRC$bN5Z1?`{3Q{a^HN5ijlE(K;8l=I=-Qecd+a@5tVma@OE|
-zrv4wWvFs~0uXB>TbAz?nnzt`)6XIpwewE!edFKHeBY(f17c7^&>U|Jn8C#q=n;+~P
-zB-R4x#){q_?7U=77ev=b-o5I)4*(lSo8xg!=c};msXgCA7XlBVk3QN`$HL&Ujv?q}
-z9gCosbu5amk9_J_3~U^2iMu%1eH))8(DjqIR`=K73cI(or`Dyx)~b)Td^1`G>^QXh
-zUCOg&Suj7W82_&a!2I&df!(LGs^{-ebUFRauT9Rib)8)w+sywku=8O3?y=>;a%+OK
-zcjWA!z2iEoyI+lGn|LeKZFAxcN0&=H=UC4Exd+^@8PAH?tT|`dO6bn-@XE&;SB8_%
-zH@j89{4j!ETl%gFY2TSh>RSy?K7CgQ^HcAuE%UGj*tpvBy>Cshe4ejsf&JbmpZQ-K
-N>=?9p2C91o{vR#KZN2~i
+literal 24348
+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
 
 literal 0
 HcmV?d00001
