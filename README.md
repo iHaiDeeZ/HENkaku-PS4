@@ -148,7 +148,7 @@ use **Install game** as usual:
 | L1 / R1 | L / R |
 | OPTIONS | START |
 | Touch pad click | SELECT |
-| Touch pad | Front touch screen |
+| Touch pad | A pointer on the front touch screen: tap to touch |
 | L2 / R2 | Rear touch pad, left / right |
 | L3 / R3 | Front touch screen, two places |
 | **L3 + R3** | **The HENkaku menu** |
@@ -157,8 +157,13 @@ Change them for all games in HENkaku > Controls, or for one game in its own sett
 DualShock 4 button can be any Vita button, a PS TV button, a touch at one of nine places of the front screen or the
 rear touch pad, or nothing. **Sticks** sets their range: **Square** (the default) makes a full diagonal full on both
 axes, as on the PS2's and PS3's pads the games were made for (Ratchet & Clank needs it for diagonals); **Round** gives
-the DualShock 4's own range. The touch pad is the front touch screen, and a circle shows where each finger is
-(HENkaku > Display > Touch markers).
+the DualShock 4's own range.
+
+The touch pad is a **pointer** on the front screen (**Touch pad**: Pointer, the default): your finger moves it as on
+a laptop's touch pad (lifting the finger leaves it where it is), a **tap** touches the screen where it is, and a tap
+then your finger down again and moving drags a touch (a swipe). A ring shows the pointer, filled while it touches
+(HENkaku > Display > Touch markers). **Front** makes the touch pad the screen itself instead (where you touch is
+where it touches, with two fingers too).
 
 ## The HENkaku menu
 

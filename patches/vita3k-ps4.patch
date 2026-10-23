@@ -4779,7 +4779,7 @@ index 6c5147b7..404c7c97 100644
  };
 diff --git a/vita3k/overlay/include/overlay/touch_indicator.h b/vita3k/overlay/include/overlay/touch_indicator.h
 new file mode 100644
-index 00000000..b318564f
+index 00000000..e3e68402
 --- /dev/null
 +++ b/vita3k/overlay/include/overlay/touch_indicator.h
 @@ -0,0 +1,46 @@
@@ -4809,13 +4809,13 @@ index 00000000..b318564f
 +
 +namespace overlay {
 +
-+// PS4: where the fingers are on the front screen (the DualShock 4's touch pad shows no picture of
-+// its own): a soft circle on each, as a finger on a PS Vita's screen
++// PS4: where the touch pad points or touches on the front screen (the DualShock 4's touch pad shows
++// no picture of its own): a ring for the pointer, filled while it touches
 +struct touch_indicator : public overlay {
 +    touch_indicator();
 +
-+    // up to 4 points, x and y from 0 to 1 of the screen
-+    void set_points(const float *xy, int count);
++    // up to 4 points: x and y from 0 to 1 of the screen, and 1 for a touch (0 the pointer only)
++    void set_points(const float *xyt, int count);
 +
 +    compiled_resource get_compiled() override;
 +
@@ -5645,10 +5645,10 @@ index b5b30616..f0e13b5d 100644
          break;
 diff --git a/vita3k/overlay/src/touch_indicator.cpp b/vita3k/overlay/src/touch_indicator.cpp
 new file mode 100644
-index 00000000..b1fe7e79
+index 00000000..118fb994
 --- /dev/null
 +++ b/vita3k/overlay/src/touch_indicator.cpp
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,61 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -5682,11 +5682,17 @@ index 00000000..b1fe7e79
 +    }
 +}
 +
-+void touch_indicator::set_points(const float *xy, const int count) {
++void touch_indicator::set_points(const float *xyt, const int count) {
 +    m_count = std::clamp(count, 0, k_max_points);
 +    for (int i = 0; i < m_count; i++) {
-+        const float x = std::clamp(xy[i * 2], 0.f, 1.f) * virtual_width;
-+        const float y = std::clamp(xy[i * 2 + 1], 0.f, 1.f) * virtual_height;
++        const float x = std::clamp(xyt[i * 3], 0.f, 1.f) * virtual_width;
++        const float y = std::clamp(xyt[i * 3 + 1], 0.f, 1.f) * virtual_height;
++        // (filled while it touches)
++        const color4f inner = xyt[i * 3 + 2] > 0.5f ? color4f{ 1.f, 1.f, 1.f, 0.5f } : color4f{ 0.f, 0.f, 0.f, 0.25f };
++        if (m_inner[i].back_color.a != inner.a) {
++            m_inner[i].back_color = inner;
++            m_inner[i].refresh();
++        }
 +        m_outer[i].set_pos(static_cast<int16_t>(x - k_outer / 2), static_cast<int16_t>(y - k_outer / 2));
 +        m_inner[i].set_pos(static_cast<int16_t>(x - k_inner / 2), static_cast<int16_t>(y - k_inner / 2));
 +    }
@@ -7552,10 +7558,10 @@ index 00000000..6f5ad8c6
 +} // namespace ps4ui
 diff --git a/vita3k/ps4/ps4_controls.cpp b/vita3k/ps4/ps4_controls.cpp
 new file mode 100644
-index 00000000..0deaa419
+index 00000000..22b4ca32
 --- /dev/null
 +++ b/vita3k/ps4/ps4_controls.cpp
-@@ -0,0 +1,313 @@
+@@ -0,0 +1,319 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -7614,8 +7620,8 @@ index 00000000..0deaa419
 +const float PLACES[9][2] = { { 0.5f, 0.5f }, { 0.2f, 0.5f }, { 0.8f, 0.5f }, { 0.5f, 0.2f }, { 0.5f, 0.8f }, { 0.2f, 0.2f }, { 0.8f, 0.2f },
 +    { 0.2f, 0.8f }, { 0.8f, 0.8f } };
 +
-+const char *const TOUCHPAD_NAMES[TouchpadUseCount] = { "Front", "Rear", "Both halves", "Off" };
-+const char *const TOUCHPAD_KEYS[TouchpadUseCount] = { "front", "back", "split", "off" };
++const char *const TOUCHPAD_NAMES[TouchpadUseCount] = { "Front", "Rear", "Both halves", "Off", "Pointer" };
++const char *const TOUCHPAD_KEYS[TouchpadUseCount] = { "front", "back", "split", "off", "pointer" };
 +const char *const STICKS_NAMES[SticksRangeCount] = { "Square", "Round (the DS4's)" };
 +const char *const STICKS_KEYS[SticksRangeCount] = { "square", "round" };
 +
@@ -7667,7 +7673,7 @@ index 00000000..0deaa419
 +    if (!f)
 +        return false;
 +    char line[256];
-+    bool layout_2 = false;
++    int layout = 1;
 +    std::vector<std::pair<std::string, std::string>> lines;
 +    while (std::fgets(line, sizeof(line), f)) {
 +        const std::string text = line;
@@ -7675,9 +7681,11 @@ index 00000000..0deaa419
 +        if (eq == std::string::npos || text[0] == '#')
 +            continue;
 +        lines.push_back({ trim(text.substr(0, eq)), trim(text.substr(eq + 1)) });
-+        layout_2 |= lines.back().first == "layout" && lines.back().second == "2";
++        if (lines.back().first == "layout")
++            layout = std::atoi(lines.back().second.c_str());
 +    }
 +    std::fclose(f);
++    const bool layout_2 = layout >= 2;
 +    for (const auto &[key, value] : lines) {
 +        // (a file from before layout 2 keeps the new touches on L2/R2/L3/R3 where it had the old
 +        // defaults there)
@@ -7687,6 +7695,10 @@ index 00000000..0deaa419
 +            for (int i = 0; i < TouchpadUseCount; i++)
 +                if (value == TOUCHPAD_KEYS[i])
 +                    controls.touchpad = static_cast<uint8_t>(i);
++            // (a file from before layout 3 had the touch pad as the front screen by default: it
++            // becomes the pointer, the new default)
++            if (layout < 3 && controls.touchpad == TouchpadFront)
++                controls.touchpad = TouchpadPointer;
 +            continue;
 +        }
 +        if (key == "sticks") {
@@ -7715,7 +7727,7 @@ index 00000000..0deaa419
 +        return;
 +    }
 +    std::fprintf(f, "# HENkaku: the DualShock 4 button = what the game gets (HENkaku > Controls)\n");
-+    std::fprintf(f, "layout = 2\n");
++    std::fprintf(f, "layout = 3\n");
 +    std::fprintf(f, "touchpad = %s\n", TOUCHPAD_KEYS[std::min<int>(controls.touchpad, TouchpadUseCount - 1)]);
 +    std::fprintf(f, "sticks = %s\n", STICKS_KEYS[std::min<int>(controls.sticks, SticksRangeCount - 1)]);
 +    const auto &names = action_names();
@@ -7786,7 +7798,7 @@ index 00000000..0deaa419
 +    const uint8_t layout[PadButtonCount] = { ActCross, ActCircle, ActSquare, ActTriangle, ActUp, ActDown, ActLeft, ActRight, ActL, ActR,
 +        ActBackTouch + 1, ActBackTouch + 2, ActFrontTouch + 1, ActFrontTouch + 2, ActStart, ActSelect };
 +    std::copy(std::begin(layout), std::end(layout), controls.button);
-+    controls.touchpad = TouchpadFront;
++    controls.touchpad = TouchpadPointer;
 +    controls.sticks = SticksSquare;
 +    return controls;
 +}
@@ -7871,10 +7883,10 @@ index 00000000..0deaa419
 +} // namespace ps4controls
 diff --git a/vita3k/ps4/ps4_controls.h b/vita3k/ps4/ps4_controls.h
 new file mode 100644
-index 00000000..9c68cf71
+index 00000000..07ffe9d0
 --- /dev/null
 +++ b/vita3k/ps4/ps4_controls.h
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,118 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -7959,6 +7971,7 @@ index 00000000..9c68cf71
 +    TouchpadBack,
 +    TouchpadSplit, // left half the front screen, right half the rear pad
 +    TouchpadOff,
++    TouchpadPointer, // a pointer on the front screen: a tap touches where it is (ps4_pad.cpp)
 +    TouchpadUseCount
 +};
 +
@@ -11926,10 +11939,10 @@ index 00000000..800318b2
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..8d2bb5b9
+index 00000000..f627a57e
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
-@@ -0,0 +1,639 @@
+@@ -0,0 +1,650 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -12482,10 +12495,21 @@ index 00000000..8d2bb5b9
 +    // app when a submission doesn't finish, rather than the whole PS4 freezing) and the PS4
 +    // winsys' flight recorder (port/mesa/ac_ps4_drm.c, into /data/DolphinPS4/flight), when
 +    // /data/HENkaku/radv-trace is there; it slows the rendering down.
++    std::string radv_debug;
 +    if (fs::exists(root_paths.get_log_path() / "radv-trace", ec)) {
 +        setenv("RADV_PS4_TRACE", "1", 1);
-+        setenv("RADV_DEBUG", "hang", 1);
++        radv_debug = "hang";
 +        trace("radv: RADV_DEBUG=hang, flight recorder on");
++    }
++    // AMD's tile compression of depth (HiZ) and colour fast clears: an image a game also reads as a
++    // texture, read without the decompression it needs, shows 8x8 tiles of garbage (Uncharted's
++    // waterfall, on AMD GPUs everywhere). Off unless HENkaku > Graphics > GPU compression is on: at
++    // the Vita's sizes the GPU has the time to spare
++    if (!ps4settings::prefs().gpu_compression)
++        radv_debug += std::string(radv_debug.empty() ? "" : ",") + "nohiz,nofastclears";
++    if (!radv_debug.empty()) {
++        setenv("RADV_DEBUG", radv_debug.c_str(), 1);
++        LOG_INFO("PS4: RADV_DEBUG={}", radv_debug);
 +    }
 +
 +    // CLI11 needs a program name (a PS4 app gets none)
@@ -12571,10 +12595,10 @@ index 00000000..8d2bb5b9
 +}
 diff --git a/vita3k/ps4/ps4_pad.cpp b/vita3k/ps4/ps4_pad.cpp
 new file mode 100644
-index 00000000..1402e972
+index 00000000..3ae0c61b
 --- /dev/null
 +++ b/vita3k/ps4/ps4_pad.cpp
-@@ -0,0 +1,307 @@
+@@ -0,0 +1,382 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -12691,10 +12715,81 @@ index 00000000..1402e972
 +    LOG_INFO("PS4 pad: user {:08X} on handle {}", static_cast<uint32_t>(user), handle);
 +}
 +
++// The touch pad as a pointer on the front screen (Controls > Touch pad > Pointer, the default): the
++// finger moves it as it moves (lifting the finger leaves it where it is), a tap touches the screen
++// where it is, and a tap then the finger down again and moving drags a touch there (a swipe). With
++// the touch pad as the front screen, a finger landing anywhere touched there: pointing at something
++// and then tapping it touched somewhere else.
++struct Pointer {
++    float x = 0.5f, y = 0.5f; // on the front screen, 0 to 1
++    bool finger = false; // on the pad
++    uint8_t finger_id = 0;
++    float last_x = 0.f, last_y = 0.f; // the finger, on the pad
++    float travel = 0.f; // since it came down
++    bool drag = false; // down again just after a tap: a touch that follows the finger
++    std::chrono::steady_clock::time_point down_at{}, tap_at{}, tap_until{}, shown_until{};
++};
++Pointer pointer;
++
++// (the pad is about 2 times as wide as it is high, the screen 1.8: a finger's travel moves the
++// pointer about as far either way)
++constexpr float POINTER_GAIN_X = 1.3f, POINTER_GAIN_Y = 1.0f;
++
++// Moves the pointer with the finger; whether it touches now
++bool move_pointer(const Snapshot &pad) {
++    using namespace std::chrono_literals;
++    const auto now = std::chrono::steady_clock::now();
++    if (!pad.connected) {
++        // (the HENkaku menu: no pointer under it)
++        pointer.finger = false;
++        pointer.drag = false;
++        return false;
++    }
++    if (pad.touch_count > 0) {
++        const float fx = std::clamp(pad.touch[0].x / TOUCHPAD_WIDTH, 0.f, 1.f);
++        const float fy = std::clamp(pad.touch[0].y / TOUCHPAD_HEIGHT, 0.f, 1.f);
++        if (!pointer.finger) {
++            pointer.finger = true;
++            pointer.down_at = now;
++            pointer.travel = 0.f;
++            pointer.drag = now - pointer.tap_at < 300ms;
++        } else if (pointer.finger_id == pad.touch[0].id) {
++            const float dx = fx - pointer.last_x, dy = fy - pointer.last_y;
++            pointer.x = std::clamp(pointer.x + dx * POINTER_GAIN_X, 0.f, 1.f);
++            pointer.y = std::clamp(pointer.y + dy * POINTER_GAIN_Y, 0.f, 1.f);
++            pointer.travel += std::abs(dx) + std::abs(dy);
++        }
++        pointer.finger_id = pad.touch[0].id;
++        pointer.last_x = fx;
++        pointer.last_y = fy;
++        pointer.shown_until = now + 1500ms;
++    } else if (pointer.finger) {
++        pointer.finger = false;
++        // a tap: down and up at once, hardly moving
++        if (!pointer.drag && now - pointer.down_at < 220ms && pointer.travel < 0.03f) {
++            pointer.tap_at = now;
++            pointer.tap_until = now + 90ms;
++        }
++        pointer.drag = false;
++    }
++    return pointer.drag || now < pointer.tap_until;
++}
++
 +// The fingers on each Vita panel: the touchpad's (where its use puts them) and the buttons set to
-+// touch (held = a finger on their place). Ids: the touchpad's finger ids, the buttons' 64 and up.
++// touch (held = a finger on their place). Ids: the touchpad's finger ids, the buttons' 64 and up,
++// the pointer's 63.
 +void update_touch(EmuEnvState &emuenv, const Snapshot &pad, const ps4controls::Controls &controls, uint32_t buttons) {
 +    std::vector<Ps4TouchPoint> points[2];
++    // the touch markers (renderer.cpp): the pointer (id 0, or 1 touching) and the front screen's touches
++    std::vector<Ps4TouchPoint> marks;
++    const bool pointing = controls.touchpad == ps4controls::TouchpadPointer;
++    if (pointing) {
++        const bool touching = move_pointer(pad);
++        if (touching)
++            points[0].push_back({ pointer.x, pointer.y, 63 });
++        if (touching || std::chrono::steady_clock::now() < pointer.shown_until)
++            marks.push_back({ pointer.x, pointer.y, static_cast<uint8_t>(touching ? 1 : 0) });
++    }
 +    for (uint8_t j = 0; j < pad.touch_count; j++) {
 +        float x = std::clamp(pad.touch[j].x / TOUCHPAD_WIDTH, 0.f, 1.f);
 +        const float y = std::clamp(pad.touch[j].y / TOUCHPAD_HEIGHT, 0.f, 1.f);
@@ -12734,7 +12829,11 @@ index 00000000..1402e972
 +            LOG_INFO("PS4 controls: first touch on the {}", port ? "rear touch pad" : "front screen");
 +        }
 +    }
++    for (const Ps4TouchPoint &point : points[0])
++        if (!pointing || point.id != 63)
++            marks.push_back({ point.x, point.y, 1 });
 +    ps4_set_touches(emuenv.touch, points);
++    ps4_set_touch_marks(marks);
 +}
 +
 +// The Vita buttons an action gives (sceCtrl's, and the PS TV's extended set)
@@ -13449,10 +13548,10 @@ index 00000000..4291971e
 +} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_settings.cpp b/vita3k/ps4/ps4_settings.cpp
 new file mode 100644
-index 00000000..4c9ead8e
+index 00000000..85946125
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.cpp
-@@ -0,0 +1,741 @@
+@@ -0,0 +1,748 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -13779,6 +13878,10 @@ index 00000000..4c9ead8e
 +    items.push_back(choice<bool>(scope, "GPU accuracy", { "Standard", "High" }, { false, true }, &Config::CurrentConfig::high_accuracy, next_start));
 +    // Vita3K's "disable surface sync", the other way round
 +    items.push_back(choice<bool>(scope, "Frame read-back", { "Off", "On" }, { true, false }, &Config::CurrentConfig::disable_surface_sync));
++    if (global)
++        items.push_back(pref_choice("GPU compression", { "Off", "On" },
++            [](const Prefs &p) { return p.gpu_compression ? 1 : 0; },
++            [](Prefs &p, int value) { p.gpu_compression = value == 1; }, next_start));
 +    items.push_back(section("Shaders and textures"));
 +    items.push_back(choice<bool>(scope, "Shader compiling", { "Background", "Before drawing" }, { true, false }, &Config::CurrentConfig::async_pipeline_compilation));
 +    if (global)
@@ -13959,6 +14062,8 @@ index 00000000..4c9ead8e
 +            g_prefs.frame_generation = value == "on";
 +        else if (key == "touch-markers")
 +            g_prefs.touch_markers = value == "on";
++        else if (key == "gpu-compression")
++            g_prefs.gpu_compression = value == "on";
 +        else if (key == "vita-cores")
 +            g_prefs.vita_cores = value != "parallel";
 +        else if (key == "profiler")
@@ -13995,6 +14100,7 @@ index 00000000..4c9ead8e
 +    std::fprintf(f, "vita-cores = %s\n", g_prefs.vita_cores ? "vita" : "parallel");
 +    std::fprintf(f, "frame-generation = %s\n", g_prefs.frame_generation ? "on" : "off");
 +    std::fprintf(f, "touch-markers = %s\n", g_prefs.touch_markers ? "on" : "off");
++    std::fprintf(f, "gpu-compression = %s\n", g_prefs.gpu_compression ? "on" : "off");
 +    std::fprintf(f, "profiler = %s\n", g_prefs.profiler ? "on" : "off");
 +    std::fprintf(f, "renderer-profiler = %s\n", g_prefs.host_profiler ? "on" : "off");
 +    std::fprintf(f, "freeze-log = %s\n", g_prefs.freeze_log ? "on" : "off");
@@ -14196,10 +14302,10 @@ index 00000000..4c9ead8e
 +} // namespace ps4settings
 diff --git a/vita3k/ps4/ps4_settings.h b/vita3k/ps4/ps4_settings.h
 new file mode 100644
-index 00000000..b89113ce
+index 00000000..875fc7ef
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.h
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,101 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -14253,6 +14359,8 @@ index 00000000..b89113ce
 +    bool frame_generation = false;
 +    // a circle where each finger is on the front screen (the touch pad shows no picture)
 +    bool touch_markers = true;
++    // AMD's tile compression of depth (HiZ) and colour fast clears (ps4_main.cpp: RADV_DEBUG)
++    bool gpu_compression = false;
 +    // the threads a game pins to one Vita core run one at a time, switching when one blocks, as on
 +    // the Vita (some games deadlock when they run side by side), or all side by side
 +    bool vita_cores = true;
@@ -16242,7 +16350,7 @@ index c92e2983..42bd7c26 100644
          glBindTexture(GL_TEXTURE_2D, info.gl_ping_pong_texture[0]);
      }
 diff --git a/vita3k/renderer/src/renderer.cpp b/vita3k/renderer/src/renderer.cpp
-index 24a868b9..f89215a6 100644
+index 24a868b9..2f5c643b 100644
 --- a/vita3k/renderer/src/renderer.cpp
 +++ b/vita3k/renderer/src/renderer.cpp
 @@ -26,6 +26,8 @@
@@ -16260,7 +16368,7 @@ index 24a868b9..f89215a6 100644
  
 +#ifdef __PS4__
 +std::string ps4_bgdl_notice(); // vita3k/ps4/ps4_bgdl.cpp
-+extern "C" int ps4_touch_front(float *xy, int max); // touch/src/touch.cpp
++extern "C" int ps4_touch_marks_get(float *xyt, int max); // touch/src/touch.cpp
 +extern "C" bool ps4_touch_markers(); // vita3k/ps4/ps4_settings.cpp
 +#endif
 +
@@ -16286,13 +16394,13 @@ index 24a868b9..f89215a6 100644
 +    }
 +    // where the fingers are on the front screen (HENkaku > Display > Touch markers)
 +    {
-+        float xy[8];
-+        const int count = ps4_touch_markers() ? ps4_touch_front(xy, 4) : 0;
++        float xyt[12];
++        const int count = ps4_touch_markers() ? ps4_touch_marks_get(xyt, 4) : 0;
 +        auto markers = overlay_manager->get<overlay::touch_indicator>();
 +        if (count > 0) {
 +            if (!markers)
 +                markers = overlay_manager->create<overlay::touch_indicator>();
-+            markers->set_points(xy, count);
++            markers->set_points(xyt, count);
 +        } else if (markers) {
 +            overlay_manager->remove<overlay::touch_indicator>();
 +        }
@@ -19868,7 +19976,7 @@ literal 0
 HcmV?d00001
 
 diff --git a/vita3k/touch/include/touch/functions.h b/vita3k/touch/include/touch/functions.h
-index 043c2c78..ffc8d726 100644
+index 043c2c78..95aecfee 100644
 --- a/vita3k/touch/include/touch/functions.h
 +++ b/vita3k/touch/include/touch/functions.h
 @@ -2,6 +2,7 @@
@@ -19879,7 +19987,7 @@ index 043c2c78..ffc8d726 100644
  #include <vector>
  
  struct EmuEnvState;
-@@ -20,3 +21,12 @@ void touch_set_force_mode(TouchState &state, int port, bool mode);
+@@ -20,3 +21,14 @@ void touch_set_force_mode(TouchState &state, int port, bool mode);
  #ifdef __ANDROID__
  void set_rear_touchscreen(TouchState &state, bool is_back);
  #endif
@@ -19891,9 +19999,11 @@ index 043c2c78..ffc8d726 100644
 +    uint8_t id;
 +};
 +void ps4_set_touches(TouchState &state, const std::vector<Ps4TouchPoint> (&points)[2]);
++// the touch markers to draw (x, y; id 1 a touch, 0 the pointer only)
++void ps4_set_touch_marks(const std::vector<Ps4TouchPoint> &marks);
 +#endif
 diff --git a/vita3k/touch/src/touch.cpp b/vita3k/touch/src/touch.cpp
-index ec982f49..4106329f 100644
+index ec982f49..743b03cb 100644
 --- a/vita3k/touch/src/touch.cpp
 +++ b/vita3k/touch/src/touch.cpp
 @@ -27,7 +27,9 @@
@@ -19906,7 +20016,7 @@ index ec982f49..4106329f 100644
  
  void set_rear_touchscreen(TouchState &state, bool is_back) {
      state.touchscreen_port = static_cast<SceTouchPortType>(is_back);
-@@ -89,10 +91,63 @@ static SceTouchData recover_touchpad_events(const EmuEnvState &emuenv) {
+@@ -89,10 +91,71 @@ static SceTouchData recover_touchpad_events(const EmuEnvState &emuenv) {
      return touch_data;
  }
  
@@ -19914,6 +20024,7 @@ index ec982f49..4106329f 100644
 +namespace {
 +std::mutex ps4_touch_mutex;
 +std::vector<Ps4TouchPoint> ps4_touch_points[2];
++std::vector<Ps4TouchPoint> ps4_touch_marks;
 +} // namespace
 +
 +void ps4_set_touches(TouchState &state, const std::vector<Ps4TouchPoint> (&points)[2]) {
@@ -19922,15 +20033,22 @@ index ec982f49..4106329f 100644
 +    ps4_touch_points[1] = points[1];
 +}
 +
-+// The front screen's fingers for the touch markers (renderer.cpp): x, y pairs, at most `max`
-+extern "C" int ps4_touch_front(float *xy, const int max) {
++void ps4_set_touch_marks(const std::vector<Ps4TouchPoint> &marks) {
++    const std::lock_guard<std::mutex> lock(ps4_touch_mutex);
++    ps4_touch_marks = marks;
++}
++
++// The touch markers for the renderer (renderer.cpp): x, y, and 1 for a touch (0 the pointer only),
++// at most `max`
++extern "C" int ps4_touch_marks_get(float *xyt, const int max) {
 +    const std::lock_guard<std::mutex> lock(ps4_touch_mutex);
 +    int count = 0;
-+    for (const Ps4TouchPoint &point : ps4_touch_points[0]) {
++    for (const Ps4TouchPoint &mark : ps4_touch_marks) {
 +        if (count >= max)
 +            break;
-+        xy[count * 2] = point.x;
-+        xy[count * 2 + 1] = point.y;
++        xyt[count * 3] = mark.x;
++        xyt[count * 3 + 1] = mark.y;
++        xyt[count * 3 + 2] = mark.id ? 1.f : 0.f;
 +        count++;
 +    }
 +    return count;
