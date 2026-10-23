@@ -7437,10 +7437,10 @@ index 00000000..6f5ad8c6
 +} // namespace ps4ui
 diff --git a/vita3k/ps4/ps4_controls.cpp b/vita3k/ps4/ps4_controls.cpp
 new file mode 100644
-index 00000000..4e2236a6
+index 00000000..0deaa419
 --- /dev/null
 +++ b/vita3k/ps4/ps4_controls.cpp
-@@ -0,0 +1,297 @@
+@@ -0,0 +1,313 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -7501,6 +7501,8 @@ index 00000000..4e2236a6
 +
 +const char *const TOUCHPAD_NAMES[TouchpadUseCount] = { "Front", "Rear", "Both halves", "Off" };
 +const char *const TOUCHPAD_KEYS[TouchpadUseCount] = { "front", "back", "split", "off" };
++const char *const STICKS_NAMES[SticksRangeCount] = { "Square", "Round (the DS4's)" };
++const char *const STICKS_KEYS[SticksRangeCount] = { "square", "round" };
 +
 +// The actions' names in the menus and keys in the files
 +struct ActionName {
@@ -7572,6 +7574,12 @@ index 00000000..4e2236a6
 +                    controls.touchpad = static_cast<uint8_t>(i);
 +            continue;
 +        }
++        if (key == "sticks") {
++            for (int i = 0; i < SticksRangeCount; i++)
++                if (value == STICKS_KEYS[i])
++                    controls.sticks = static_cast<uint8_t>(i);
++            continue;
++        }
 +        for (int b = 0; b < PadButtonCount; b++) {
 +            if (key != PAD_KEYS[b])
 +                continue;
@@ -7594,6 +7602,7 @@ index 00000000..4e2236a6
 +    std::fprintf(f, "# HENkaku: the DualShock 4 button = what the game gets (HENkaku > Controls)\n");
 +    std::fprintf(f, "layout = 2\n");
 +    std::fprintf(f, "touchpad = %s\n", TOUCHPAD_KEYS[std::min<int>(controls.touchpad, TouchpadUseCount - 1)]);
++    std::fprintf(f, "sticks = %s\n", STICKS_KEYS[std::min<int>(controls.sticks, SticksRangeCount - 1)]);
 +    const auto &names = action_names();
 +    for (int b = 0; b < PadButtonCount; b++)
 +        std::fprintf(f, "%s = %s\n", PAD_KEYS[b], names[std::min<size_t>(controls.button[b], names.size() - 1)].key.c_str());
@@ -7663,6 +7672,7 @@ index 00000000..4e2236a6
 +        ActBackTouch + 1, ActBackTouch + 2, ActFrontTouch + 1, ActFrontTouch + 2, ActStart, ActSelect };
 +    std::copy(std::begin(layout), std::end(layout), controls.button);
 +    controls.touchpad = TouchpadFront;
++    controls.sticks = SticksSquare;
 +    return controls;
 +}
 +
@@ -7718,6 +7728,12 @@ index 00000000..4e2236a6
 +        [app_path] { return static_cast<int>(effective(app_path).touchpad); },
 +        [app_path](int value) { change(app_path, [value](Controls &c) { c.touchpad = static_cast<uint8_t>(value); }); }));
 +
++    std::vector<std::string> sticks_names(std::begin(STICKS_NAMES), std::end(STICKS_NAMES));
++    list.push_back(section("Sticks"));
++    list.push_back(choice("Range", sticks_names,
++        [app_path] { return static_cast<int>(effective(app_path).sticks); },
++        [app_path](int value) { change(app_path, [value](Controls &c) { c.sticks = static_cast<uint8_t>(value); }); }));
++
 +    std::vector<std::string> action_labels;
 +    for (const ActionName &name : action_names())
 +        action_labels.push_back(name.label);
@@ -7740,10 +7756,10 @@ index 00000000..4e2236a6
 +} // namespace ps4controls
 diff --git a/vita3k/ps4/ps4_controls.h b/vita3k/ps4/ps4_controls.h
 new file mode 100644
-index 00000000..43f21fd8
+index 00000000..9c68cf71
 --- /dev/null
 +++ b/vita3k/ps4/ps4_controls.h
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,117 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -7831,9 +7847,17 @@ index 00000000..43f21fd8
 +    TouchpadUseCount
 +};
 +
++// The sticks' range (ps4_pad.cpp: to_square)
++enum SticksRange : uint8_t {
++    SticksSquare, // a full diagonal full on both axes, as on a PS2's or PS3's pad
++    SticksRound, // as the DualShock 4 gives them
++    SticksRangeCount
++};
++
 +struct Controls {
 +    uint8_t button[PadButtonCount];
 +    uint8_t touchpad = TouchpadFront;
++    uint8_t sticks = SticksSquare;
 +};
 +
 +// The DS4 button's ORBIS_PAD_BUTTON_* bit
@@ -12432,10 +12456,10 @@ index 00000000..8d2bb5b9
 +}
 diff --git a/vita3k/ps4/ps4_pad.cpp b/vita3k/ps4/ps4_pad.cpp
 new file mode 100644
-index 00000000..a8fca29b
+index 00000000..1402e972
 --- /dev/null
 +++ b/vita3k/ps4/ps4_pad.cpp
-@@ -0,0 +1,287 @@
+@@ -0,0 +1,307 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -12485,6 +12509,7 @@ index 00000000..a8fca29b
 +
 +#include <algorithm>
 +#include <chrono>
++#include <cmath>
 +#include <mutex>
 +
 +namespace ps4pad {
@@ -12505,6 +12530,20 @@ index 00000000..a8fca29b
 +
 +float stick(uint8_t v) {
 +    return std::clamp((static_cast<int>(v) - 128) / 127.f, -1.f, 1.f);
++}
++
++// The DualShock 4's sticks reach a circle: a diagonal pushed all the way is about 70% on each axis.
++// The PS2's and PS3's pads, and the games made for them, reach a square, a full diagonal full on
++// both: a game that wants each axis past a mark for a diagonal (Ratchet & Clank) saw only up or only
++// left. Square (HENkaku > Controls > Sticks): the point goes out along its own direction to the
++// square, so the direction stays and a full diagonal reaches the corner.
++void to_square(float &x, float &y) {
++    const float most = std::max(std::abs(x), std::abs(y));
++    if (most < 1e-4f)
++        return;
++    const float scale = std::min(std::sqrt(x * x + y * y) / most, 1.41421356f);
++    x = std::clamp(x * scale, -1.f, 1.f);
++    y = std::clamp(y * scale, -1.f, 1.f);
 +}
 +
 +// Opens the pad of the first signed-in user (and again after it went away)
@@ -12698,10 +12737,15 @@ index 00000000..a8fca29b
 +        kb.buttons = vita;
 +        kb.buttons_ext = vita_ext;
 +        const float mult = emuenv.cfg.controller_analog_multiplier;
-+        kb.axes[0] = std::clamp(stick(pad.lx) * mult, -1.f, 1.f);
-+        kb.axes[1] = std::clamp(stick(pad.ly) * mult, -1.f, 1.f);
-+        kb.axes[2] = std::clamp(stick(pad.rx) * mult, -1.f, 1.f);
-+        kb.axes[3] = std::clamp(stick(pad.ry) * mult, -1.f, 1.f);
++        float lx = stick(pad.lx), ly = stick(pad.ly), rx = stick(pad.rx), ry = stick(pad.ry);
++        if (!menu_open && controls.sticks == ps4controls::SticksSquare) {
++            to_square(lx, ly);
++            to_square(rx, ry);
++        }
++        kb.axes[0] = std::clamp(lx * mult, -1.f, 1.f);
++        kb.axes[1] = std::clamp(ly * mult, -1.f, 1.f);
++        kb.axes[2] = std::clamp(rx * mult, -1.f, 1.f);
++        kb.axes[3] = std::clamp(ry * mult, -1.f, 1.f);
 +    }
 +    if (menu_open)
 +        update_touch(emuenv, Snapshot{}, controls, 0);
