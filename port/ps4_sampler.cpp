@@ -3,10 +3,10 @@
 // PS4 has no perf/Razor access for homebrew, so the app samples itself: a helper thread sends
 // SIGPROF to each registered thread every millisecond, and the handler records the interrupted
 // instruction pointer. Every 10 seconds the samples are aggregated and appended to
-// /data/Vita3K/samples.log: per thread, the busiest eboot addresses (ELF virtual addresses,
+// /data/HENkaku/samples.log: per thread, the busiest eboot addresses (ELF virtual addresses,
 // symbolize with `llvm-symbolizer --obj=<oelf> 0x...`), system module addresses ("sys") and JIT
 // code addresses ("jit", 16-byte buckets). Every 60 s the busiest JIT code (64 KiB chunks) is
-// copied to /data/Vita3K/jitcode.bin and the emulated MEM1 to mem1.bin, so the generated x86
+// copied to /data/HENkaku/jitcode.bin and the emulated MEM1 to mem1.bin, so the generated x86
 // and the guest code behind it can be disassembled offline (blocks: the jit-perf map written by
 // Common/JitRegister).
 //
@@ -28,8 +28,16 @@
 extern "C" char __text_start[];  // defined by the OpenOrbis link.x at the start of .text
 extern "C" int pthread_getthreadid_np(void);  // libkernel (FreeBSD libthr)
 extern "C" void ps4_boot_trace(const char* stage);
+extern "C" const char* ps4_data_dir();  // ps4_crashlog.cpp
 
 namespace {
+
+// a file in the app's folder
+int createDataFile(const char* name) {
+    char path[128];
+    snprintf(path, sizeof(path), "%s/%s", ps4_data_dir(), name);
+    return open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+}
 
 constexpr int kSigProf = 27;    // FreeBSD value
 constexpr int kSaSiginfo = 0x40, kSaRestart = 0x0002;
@@ -238,7 +246,7 @@ bool isReadable(uint64_t address, uint64_t size) {
 // jitcode.bin: records of {u64 address, u64 size, bytes}. Copied through a buffer first so the
 // kernel never reads JIT memory for the file write.
 void dumpJitCode() {
-    const int fd = open("/data/Vita3K/jitcode.bin", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    const int fd = createDataFile("jitcode.bin");
     if (fd >= 0) {
         static uint8_t buffer[0x10000];
         for (int i = 0; i < g_hot_chunk_count; i++) {
@@ -253,7 +261,7 @@ void dumpJitCode() {
     }
     g_hot_chunk_count = 0;
     if (ps4_profile_guest_ram && ps4_profile_guest_ram_size) {
-        const int ram = open("/data/Vita3K/mem1.bin", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        const int ram = createDataFile("mem1.bin");
         if (ram >= 0) {
             static uint8_t copy[0x100000];
             for (uint32_t offset = 0; offset < ps4_profile_guest_ram_size; offset += sizeof(copy)) {
@@ -270,7 +278,7 @@ void dumpJitCode() {
 std::atomic<bool> g_sampler_on{false};
 
 void* samplerThread(void*) {
-    const int fd = open("/data/Vita3K/samples.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    const int fd = createDataFile("samples.log");
     if (fd < 0)
         return nullptr;
     writeModuleList(fd);
@@ -656,7 +664,7 @@ extern "C" void ps4_sampler_start() {
 
     pthread_t thread;
     if (pthread_create(&thread, nullptr, samplerThread, nullptr) == 0)
-        ps4_boot_trace("sampler: started, writing /data/Vita3K/samples.log every 10 s");
+        ps4_boot_trace("sampler: started, writing samples.log every 10 s");
 }
 
 // The menus' Profiler switch: starts the sampler the first time, then pauses / resumes it.

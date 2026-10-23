@@ -2,9 +2,9 @@
 //
 // PS4 coredumps are encrypted and klog is shared with other tools, so the app reports its own
 // crashes: a constructor that runs before all others (priority 101) starts
-// /data/Vita3K/boot-trace.log and installs a handler for fatal signals that appends the
+// /data/HENkaku/boot-trace.log and installs a handler for fatal signals that appends the
 // signal, fault address, registers and the code addresses found on the stack to
-// /data/Vita3K/crash.log. Addresses are printed relative to the start of .text, i.e. as ELF
+// /data/HENkaku/crash.log. Addresses are printed relative to the start of .text, i.e. as ELF
 // virtual addresses: symbolize with `llvm-symbolizer --obj=<elf> 0x...`.
 //
 // Handlers installed later (Dolphin's fastmem handler) chain to this one for faults they don't
@@ -22,6 +22,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cxxabi.h>
 #include <exception>
 #include <typeinfo>
@@ -53,6 +54,56 @@ extern "C" void ps4_install_signal_stack() {
 extern "C" void ps4_dump_thread_stacks(const char* path, const char* reason);  // ps4_sampler.cpp
 // the system's (ps4_runtime.cpp wraps pthread_create with an allocation; a crash may hold the heap)
 extern "C" int __real_pthread_create(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
+
+// The app's folder in /data: /data/HENkaku. Up to v00.42 it was /data/Vita3K, which the first start
+// of 1.00 renames (the games, the firmware, the saves and the settings go with it at once); if that
+// fails, the old folder stays in use. Worked out at the first file the app writes (the boot trace,
+// which the heap may write before anything else has run: no heap here), with the crash files' paths.
+namespace {
+constexpr const char* kDataDir = "/data/HENkaku";
+constexpr const char* kOldDataDir = "/data/Vita3K";
+std::atomic<const char*> g_dataDir{nullptr};
+int g_dataMoved = 0;
+char g_crashLogPath[64];
+char g_bootTracePath[64];
+char g_bootTracePrevPath[64];
+
+bool pathExists(const char* path) {
+    struct stat info;
+    return stat(path, &info) == 0;
+}
+}  // namespace
+
+extern "C" const char* ps4_data_dir() {
+    if (const char* dir = g_dataDir.load(std::memory_order_acquire))
+        return dir;
+    const char* dir = kDataDir;
+    if (!pathExists(kDataDir) && pathExists(kOldDataDir)) {
+        if (rename(kOldDataDir, kDataDir) == 0) {
+            g_dataMoved = 1;
+        } else if (!pathExists(kDataDir)) {
+            dir = kOldDataDir;
+            g_dataMoved = -1;
+        }
+    }
+    mkdir(dir, 0777);
+    snprintf(g_crashLogPath, sizeof(g_crashLogPath), "%s/crash.log", dir);
+    snprintf(g_bootTracePath, sizeof(g_bootTracePath), "%s/boot-trace.log", dir);
+    snprintf(g_bootTracePrevPath, sizeof(g_bootTracePrevPath), "%s/boot-trace.prev.log", dir);
+    g_dataDir.store(dir, std::memory_order_release);
+    return dir;
+}
+
+// 1: this start moved /data/Vita3K to /data/HENkaku; -1: it couldn't (/data/Vita3K stays in use)
+extern "C" int ps4_data_dir_moved() {
+    ps4_data_dir();
+    return g_dataMoved;
+}
+
+extern "C" const char* ps4_crash_log_path() {
+    ps4_data_dir();
+    return g_crashLogPath;
+}
 
 namespace {
 
@@ -87,9 +138,9 @@ bool readable(const void* address) {
 // as boot-trace.prev.log (Vita3K v00.04: a quick second start had wiped the one that mattered).
 int traceFd() {
     if (g_traceFd < 0) {
-        mkdir("/data/Vita3K", 0777);
-        rename("/data/Vita3K/boot-trace.log", "/data/Vita3K/boot-trace.prev.log");
-        g_traceFd = open("/data/Vita3K/boot-trace.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        ps4_data_dir();
+        rename(g_bootTracePath, g_bootTracePrevPath);
+        g_traceFd = open(g_bootTracePath, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     }
     return g_traceFd;
 }
@@ -139,7 +190,7 @@ void crashHandler(int sig, siginfo_t* info, void* context) {
     if (s_depth++ > 0)
         _exit(128 + sig);
 
-    const int fd = open("/data/Vita3K/crash.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    const int fd = open(ps4_crash_log_path(), O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (fd >= 0) {
         const auto* regs = reinterpret_cast<const uint64_t*>(static_cast<char*>(context) + kMcontextOffset);
         const uint64_t rip = regs[kRipIndex];
@@ -182,7 +233,7 @@ void crashHandler(int sig, siginfo_t* info, void* context) {
         _exit(126);
     }, nullptr);
     // Where every other thread was (stacks, and the lock each one waits on), after the crash.
-    ps4_dump_thread_stacks("/data/Vita3K/crash.log", "every thread at the crash");
+    ps4_dump_thread_stacks(ps4_crash_log_path(), "every thread at the crash");
     // The emulator's view of the crash (Vita3K: the app that ran, into crash.log).
     if (ps4_crash_guest_info) {
         ps4_crash_guest_info();
@@ -212,7 +263,7 @@ void crashHandler(int sig, siginfo_t* info, void* context) {
         }
         snprintf(message, sizeof(message), "uncaught exception %s: %s", name ? name : type->name(), what);
     }
-    const int fd = open("/data/Vita3K/crash.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    const int fd = open(ps4_crash_log_path(), O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (fd >= 0) {
         writeFormat(fd, "\n=== %s\n", message);
         close(fd);
@@ -260,7 +311,7 @@ extern "C" __attribute__((noinline)) void ps4_trace_callers(const char* what) {
     ps4_boot_trace(line);
 }
 
-// Appends a line to /data/Vita3K/boot-trace.log (startup milestones), prefixed with the
+// Appends a line to /data/HENkaku/boot-trace.log (startup milestones), prefixed with the
 // seconds since the first trace line.
 extern "C" void ps4_boot_trace(const char* stage) {
     const int fd = traceFd();

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fetch /data/Vita3K/{boot-trace,crash,hang}.log and PPSSPP's ppsspp.log from the console
+# Fetch /data/HENkaku/{boot-trace,crash,hang}.log and PPSSPP's ppsspp.log from the console
 # and symbolize the crash and hang addresses against the ELF (default: the newest packaged
 # version's, from oelf/).
 #   crashlog.sh [elf]
@@ -11,7 +11,7 @@ HOST="ftp://${PS4_HOST:-192.168.0.212}:${PS4_FTP_PORT:-2121}"
 OUT="$PS4_BUILD_ROOT/logs"
 mkdir -p "$OUT"
 for f in boot-trace.log crash.log hang.log ppsspp.log; do
-    curl -s --max-time 30 -o "$OUT/$(basename "$f")" "$HOST/data/Vita3K/$f" || rm -f "$OUT/$(basename "$f")"
+    curl -s --max-time 30 -o "$OUT/$(basename "$f")" "$HOST/data/HENkaku/$f" || rm -f "$OUT/$(basename "$f")"
 done
 # symbolize against the build that ran (boot-trace.log: "M33 XX.YY starting")
 if [ -z "${1:-}" ]; then
@@ -41,7 +41,7 @@ print_thread_dump() {
     done
 }
 # screenshots taken from PPSSPP
-echo "== screenshots: $(curl -s --max-time 30 --list-only "$HOST/data/Vita3K/screenshots/" | tr '
+echo "== screenshots: $(curl -s --max-time 30 --list-only "$HOST/data/HENkaku/screenshots/" | tr '
 ' ' ')"
 echo "== boot-trace.log"; cat "$OUT/boot-trace.log" 2>/dev/null || echo "(none)"
 echo "== ppsspp.log (last 60 lines)"; tail -60 "$OUT/ppsspp.log" 2>/dev/null || echo "(none)"

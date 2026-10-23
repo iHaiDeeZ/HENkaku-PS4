@@ -265,17 +265,29 @@ index ecce2b3a..d1b284e0 100644
  		"${CMAKE_SOURCE_DIR}/i18n/qt/*.ts")
  	set(VITA3K_QT_QM_DIR "${CMAKE_BINARY_DIR}/qt_translations")
 diff --git a/vita3k/app/src/app_init.cpp b/vita3k/app/src/app_init.cpp
-index d7ee705f..2c72cb58 100644
+index d7ee705f..3dfaf2b1 100644
 --- a/vita3k/app/src/app_init.cpp
 +++ b/vita3k/app/src/app_init.cpp
-@@ -257,6 +257,17 @@ bool init_paths(Root &root_paths) {
+@@ -77,6 +77,11 @@
+ #include <algorithm>
+ #include <fstream>
+ 
++#ifdef __PS4__
++// the app's folder in /data (port/ps4_crashlog.cpp)
++extern "C" const char *ps4_data_dir();
++#endif
++
+ namespace app {
+ 
+ static float sdl_axis_to_float(int16_t axis, float mult) {
+@@ -257,6 +262,17 @@ bool init_paths(Root &root_paths) {
      root_paths.set_shared_path(internal_storage_path);
      root_paths.set_cache_path(internal_storage_path / "cache" / "");
      root_paths.set_patch_path(internal_storage_path / "patch" / "");
 +#elif defined(__PS4__)
 +    // The package's files (data/, shaders-builtin/, icons/) are read-only in /app0. Everything
-+    // else lives in /data/Vita3K, which survives updates of the package.
-+    const fs::path data_path = "/data/Vita3K/";
++    // else lives in the app's folder, /data/HENkaku, which survives updates of the package.
++    const fs::path data_path = std::string(ps4_data_dir()) + "/";
 +    root_paths.set_static_assets_path("/app0/");
 +    root_paths.set_vita_fs_path(data_path / "fs" / "");
 +    root_paths.set_log_path(data_path);
@@ -672,6 +684,29 @@ index cea885af..d13e7fdc 100644
      case DecoderQuery::SAMPLE_RATE: return info->samplingRate;
      case DecoderQuery::AT9_SAMPLE_PER_FRAME: return info->frameSamples;
      case DecoderQuery::AT9_SAMPLE_PER_SUPERFRAME: return info->frameSamples * info->framesInSuperframe;
+diff --git a/vita3k/config/src/config.cpp b/vita3k/config/src/config.cpp
+index 78542d3f..8e8491ed 100644
+--- a/vita3k/config/src/config.cpp
++++ b/vita3k/config/src/config.cpp
+@@ -283,6 +283,10 @@ static ExitCode parse(Config &cfg, const fs::path &load_path, const fs::path &ro
+         return FileNotFound;
+     }
+ 
++#ifdef __PS4__
++    // always the app's folder's (config.yml may still name /data/Vita3K/fs, which 1.00 moved)
++    cfg.set_vita_fs_path(root_vita_fs_path);
++#else
+     if (cfg.vita_fs_path.empty())
+         cfg.set_vita_fs_path(root_vita_fs_path);
+     else {
+@@ -291,6 +295,7 @@ static ExitCode parse(Config &cfg, const fs::path &load_path, const fs::path &ro
+             return InvalidApplicationPath;
+         }
+     }
++#endif
+ 
+     return Success;
+ }
 diff --git a/vita3k/cpu/src/dynarmic_cpu.cpp b/vita3k/cpu/src/dynarmic_cpu.cpp
 index 54e89f88..e3308cfc 100644
 --- a/vita3k/cpu/src/dynarmic_cpu.cpp
@@ -1957,6 +1992,25 @@ index 006cf39f..f13d3fab 100644
      fs::create_directories(uma0 / "data");
      fs::create_directories(vd0 / "registry");
      fs::create_directories(vd0 / "network");
+diff --git a/vita3k/io/src/state_functions.cpp b/vita3k/io/src/state_functions.cpp
+index df98d3a3..0584fc7e 100644
+--- a/vita3k/io/src/state_functions.cpp
++++ b/vita3k/io/src/state_functions.cpp
+@@ -61,7 +61,13 @@ SceOff FileStats::write(const void *data, const SceSize size, const int count) c
+     if (!can_write_file())
+         return -1;
+ 
+-    return fwrite(data, size, count, get_file_pointer());
++    // Written through, as on the PS Vita, where a write goes straight to its kernel: a write left in
++    // the buffer was lost when the app ended without closing the file (HENkaku on the PS4 starts over
++    // after every game; PKGj's databases lost their last page that way)
++    const size_t written = fwrite(data, size, count, get_file_pointer());
++    if (fflush(get_file_pointer()) != 0)
++        return -1;
++    return written;
+ }
+ 
+ int FileStats::truncate(const SceSize size) const {
 diff --git a/vita3k/kernel/include/kernel/kernel_object.h b/vita3k/kernel/include/kernel/kernel_object.h
 index f70b3397..1328a821 100644
 --- a/vita3k/kernel/include/kernel/kernel_object.h
@@ -3552,6 +3606,20 @@ index 426a3db7..b153c347 100644
  
      return 0;
  }
+diff --git a/vita3k/modules/SceIofilemgr/SceIofilemgr.cpp b/vita3k/modules/SceIofilemgr/SceIofilemgr.cpp
+index ea18aff8..64ea87cd 100644
+--- a/vita3k/modules/SceIofilemgr/SceIofilemgr.cpp
++++ b/vita3k/modules/SceIofilemgr/SceIofilemgr.cpp
+@@ -307,7 +307,8 @@ EXPORT(int, sceIoSetThreadDefaultPriorityForSystem) {
+ 
+ EXPORT(int, sceIoSyncByFd) {
+     TRACY_FUNC(sceIoSyncByFd);
+-    return UNIMPLEMENTED();
++    // (nothing to wait for: every write is already with the host, FileStats::write)
++    return 0;
+ }
+ 
+ EXPORT(int, sceIoSyncByFdAsync) {
 diff --git a/vita3k/modules/SceIpmi/SceIpmi.cpp b/vita3k/modules/SceIpmi/SceIpmi.cpp
 index 045370a3..c0ea4810 100644
 --- a/vita3k/modules/SceIpmi/SceIpmi.cpp
@@ -3740,7 +3808,7 @@ index 6b5a9155..f1482605 100644
          return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_MUTEX_ID);
      return mutex->acquire(emuenv.mem, emuenv.kernel.get_thread(thread_id), lock_count, ptimeout, false);
 diff --git a/vita3k/modules/SceLibKernel/SceLibKernel.cpp b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
-index a02c7b6a..dbb1703e 100644
+index a02c7b6a..84282366 100644
 --- a/vita3k/modules/SceLibKernel/SceLibKernel.cpp
 +++ b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
 @@ -532,7 +532,12 @@ EXPORT(int, sceIoDevctl, const char *dev, SceInt cmd, const void *indata, SceSiz
@@ -3757,7 +3825,17 @@ index a02c7b6a..dbb1703e 100644
  
          ((SceIoDevInfo *)outdata)->max_size = space.capacity;
          ((SceIoDevInfo *)outdata)->free_size = space.available;
-@@ -1583,7 +1588,7 @@ EXPORT(int, sceKernelLockLwMutexCB, Ptr<SceKernelLwMutexWork> workarea, int lock
+@@ -716,7 +721,8 @@ EXPORT(int, sceIoRmdirAsync) {
+ 
+ EXPORT(int, sceIoSync) {
+     TRACY_FUNC(sceIoSync);
+-    return UNIMPLEMENTED();
++    // (nothing to wait for: every write is already with the host, FileStats::write)
++    return 0;
+ }
+ 
+ EXPORT(int, sceIoSyncAsync) {
+@@ -1583,7 +1589,7 @@ EXPORT(int, sceKernelLockLwMutexCB, Ptr<SceKernelLwMutexWork> workarea, int lock
          return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
  
      const auto lwmutexid = workarea.get(emuenv.mem)->uid;
@@ -3766,7 +3844,7 @@ index a02c7b6a..dbb1703e 100644
      if (!mutex)
          return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_MUTEX_ID);
      const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
-@@ -1880,7 +1885,7 @@ EXPORT(int, sceKernelStopUnloadModule, SceUID uid, SceSize args, Ptr<const void>
+@@ -1880,7 +1886,7 @@ EXPORT(int, sceKernelStopUnloadModule, SceUID uid, SceSize args, Ptr<const void>
  EXPORT(int, sceKernelTryLockLwMutex, Ptr<SceKernelLwMutexWork> workarea, int lock_count) {
      TRACY_FUNC(sceKernelTryLockLwMutex, workarea, lock_count);
      const auto lwmutexid = workarea.get(emuenv.mem)->uid;
@@ -3775,7 +3853,7 @@ index a02c7b6a..dbb1703e 100644
      if (!mutex)
          return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_MUTEX_ID);
      return mutex->try_acquire(emuenv.mem, emuenv.kernel.get_thread(thread_id), lock_count);
-@@ -1947,7 +1952,7 @@ EXPORT(int, sceKernelUnloadModule, SceUID uid, SceUInt32 flags, const void *pOpt
+@@ -1947,7 +1953,7 @@ EXPORT(int, sceKernelUnloadModule, SceUID uid, SceUInt32 flags, const void *pOpt
  EXPORT(int, sceKernelUnlockLwMutex, Ptr<SceKernelLwMutexWork> workarea, int unlock_count) {
      TRACY_FUNC(sceKernelUnlockLwMutex, workarea, unlock_count);
      const auto lwmutexid = workarea.get(emuenv.mem)->uid;
@@ -3784,7 +3862,7 @@ index a02c7b6a..dbb1703e 100644
      // A delete clears the owner in the work area, so a Vita reports the unlock as not owned
      if (!mutex)
          return RET_ERROR(SCE_KERNEL_ERROR_LW_MUTEX_NOT_OWNED);
-@@ -1962,7 +1967,7 @@ EXPORT(int, sceKernelUnlockLwMutex_0, Ptr<SceKernelLwMutexWork> workarea, int un
+@@ -1962,7 +1968,7 @@ EXPORT(int, sceKernelUnlockLwMutex_0, Ptr<SceKernelLwMutexWork> workarea, int un
  EXPORT(int, sceKernelUnlockLwMutex2, Ptr<SceKernelLwMutexWork> workarea, int unlock_count) {
      TRACY_FUNC(sceKernelUnlockLwMutex2, workarea, unlock_count);
      const auto lwmutexid = workarea.get(emuenv.mem)->uid;
@@ -5631,10 +5709,10 @@ index 4eb1f4f0..bd26315a 100644
      // 8) Choose the ux0 destination (a cart image is always a full app)
 diff --git a/vita3k/ps4/ps4.cmake b/vita3k/ps4/ps4.cmake
 new file mode 100644
-index 00000000..c76359f1
+index 00000000..95f3d66b
 --- /dev/null
 +++ b/vita3k/ps4/ps4.cmake
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,46 @@
 +# PS4: Vita3K's frontend for the console, included from vita3k/CMakeLists.txt once the vita3k target
 +# exists. Built with the port's toolchain (toolchain/ps4-vita3k.cmake, and ps4-love-style.cmake as
 +# the project include: PS4_RUNTIME_SOURCES, ps4_link_mesa, ps4_add_eboot).
@@ -5645,6 +5723,7 @@ index 00000000..c76359f1
 +	ps4/ps4_bgdl.h
 +	ps4/ps4_canvas.cpp
 +	ps4/ps4_canvas.h
++	ps4/ps4_data.h
 +	ps4/ps4_download.cpp
 +	ps4/ps4_download.h
 +	ps4/ps4_launcher.cpp
@@ -6951,10 +7030,10 @@ index 00000000..6f5ad8c6
 +} // namespace ps4ui
 diff --git a/vita3k/ps4/ps4_controls.cpp b/vita3k/ps4/ps4_controls.cpp
 new file mode 100644
-index 00000000..8a9d8601
+index 00000000..4e2236a6
 --- /dev/null
 +++ b/vita3k/ps4/ps4_controls.cpp
-@@ -0,0 +1,294 @@
+@@ -0,0 +1,297 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -6975,6 +7054,7 @@ index 00000000..8a9d8601
 +// PS4: the controls, saved as "key = value" lines (ps4_controls.h).
 +
 +#include "ps4_controls.h"
++#include "ps4_data.h"
 +
 +#include <util/log.h>
 +
@@ -6995,7 +7075,9 @@ index 00000000..8a9d8601
 +
 +using Item = overlay::pause_menu_item;
 +
-+const char *const DIR = "/data/Vita3K/controls";
++std::string controls_dir() {
++    return ps4_data_path("controls");
++}
 +
 +const char *const PAD_NAMES[PadButtonCount] = { "Cross", "Circle", "Square", "Triangle", "Up", "Down", "Left", "Right", "L1", "R1", "L2", "R2", "L3", "R3",
 +    "OPTIONS", "Touch pad click" };
@@ -7038,7 +7120,7 @@ index 00000000..8a9d8601
 +Controls running_controls = defaults();
 +
 +std::string file_of(const std::string &app_path) {
-+    return std::string(DIR) + "/" + (app_path.empty() ? std::string("all") : app_path) + ".cfg";
++    return controls_dir() + "/" + (app_path.empty() ? std::string("all") : app_path) + ".cfg";
 +}
 +
 +bool exists(const std::string &path) {
@@ -7096,7 +7178,7 @@ index 00000000..8a9d8601
 +}
 +
 +void save(const std::string &path, const Controls &controls) {
-+    ::mkdir(DIR, 0777);
++    ::mkdir(controls_dir().c_str(), 0777);
 +    FILE *f = std::fopen(path.c_str(), "w");
 +    if (!f) {
 +        LOG_WARN("PS4: couldn't write {}", path);
@@ -7251,7 +7333,7 @@ index 00000000..8a9d8601
 +} // namespace ps4controls
 diff --git a/vita3k/ps4/ps4_controls.h b/vita3k/ps4/ps4_controls.h
 new file mode 100644
-index 00000000..0470cd19
+index 00000000..43f21fd8
 --- /dev/null
 +++ b/vita3k/ps4/ps4_controls.h
 @@ -0,0 +1,109 @@
@@ -7276,7 +7358,7 @@ index 00000000..0470cd19
 +// Each DualShock 4 button gives a Vita button, a PS TV button, a touch at one of nine places of the
 +// front screen or of the rear touch pad, or nothing; the DS4's touch pad is the front screen, the
 +// rear pad, both (left half and right half) or nothing. All games share one set, and a game can
-+// have its own (/data/Vita3K/controls/all.cfg and <app>.cfg).
++// have its own (/data/HENkaku/controls/all.cfg and <app>.cfg).
 +
 +#pragma once
 +
@@ -7364,6 +7446,44 @@ index 00000000..0470cd19
 +std::vector<overlay::pause_menu_item> items(const std::string &app_path);
 +
 +} // namespace ps4controls
+diff --git a/vita3k/ps4/ps4_data.h b/vita3k/ps4/ps4_data.h
+new file mode 100644
+index 00000000..5d07a91b
+--- /dev/null
++++ b/vita3k/ps4/ps4_data.h
+@@ -0,0 +1,32 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// PS4: the app's folder in /data, /data/HENkaku (port/ps4_crashlog.cpp works it out at the first
++// file the app writes). Up to v00.42 it was /data/Vita3K, which the first start of 1.00 renames.
++
++#pragma once
++
++#include <string>
++
++extern "C" const char *ps4_data_dir();
++// 1 when this start moved /data/Vita3K to /data/HENkaku, -1 when it couldn't (the old one is in use)
++extern "C" int ps4_data_dir_moved();
++
++// a file or folder in the app's folder
++inline std::string ps4_data_path(const std::string &name) {
++    return std::string(ps4_data_dir()) + "/" + name;
++}
 diff --git a/vita3k/ps4/ps4_download.cpp b/vita3k/ps4/ps4_download.cpp
 new file mode 100644
 index 00000000..baf4d8ea
@@ -7630,10 +7750,10 @@ index 00000000..baad3a63
 +} // namespace ps4download
 diff --git a/vita3k/ps4/ps4_launcher.cpp b/vita3k/ps4/ps4_launcher.cpp
 new file mode 100644
-index 00000000..7bd7d6a1
+index 00000000..a1877c1d
 --- /dev/null
 +++ b/vita3k/ps4/ps4_launcher.cpp
-@@ -0,0 +1,3564 @@
+@@ -0,0 +1,3574 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -7652,7 +7772,7 @@ index 00000000..7bd7d6a1
 +// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 +
 +// PS4: the launcher, in place of the desktop's Qt window: the installed apps with their icons, and
-+// an install browser (Triangle) over /data/Vita3K/install, the PS4's storage and USB drives: .vpk
++// an install browser (Triangle) over /data/HENkaku/install, the PS4's storage and USB drives: .vpk
 +// and .zip archives, .pkg files with their zRIF or .rif license, dumped game folders, the PS Vita
 +// firmware and font package .PUP files. When the firmware or the font package isn't installed, it
 +// downloads them from Sony's update server first. Drawn by the CPU into VideoOut buffers 12-13, so
@@ -7662,6 +7782,7 @@ index 00000000..7bd7d6a1
 +
 +#include "ps4_bgdl.h"
 +#include "ps4_canvas.h"
++#include "ps4_data.h"
 +#include "ps4_download.h"
 +#include "ps4_pad.h"
 +#include "ps4_settings.h"
@@ -7719,6 +7840,11 @@ index 00000000..7bd7d6a1
 +}
 +
 +namespace ps4launcher {
++
++const std::string &install_dir() {
++    static const std::string dir = ps4_data_path("install");
++    return dir;
++}
 +
 +using ps4ui::Canvas;
 +using ps4ui::Color;
@@ -8103,7 +8229,7 @@ index 00000000..7bd7d6a1
 +// Where the browser looks first: the install folder, the PS4's storage, the USB drives plugged in
 +std::vector<Entry> locations() {
 +    std::vector<Entry> list{
-+        { Kind::Location, "Install folder", INSTALL_DIR },
++        { Kind::Location, "Install folder", install_dir() },
 +        { Kind::Location, "PS4 storage", "/data" },
 +    };
 +    for (int i = 0; i < 8; i++) {
@@ -8243,7 +8369,7 @@ index 00000000..7bd7d6a1
 +
 +void install_worker(EmuEnvState &emuenv, InstallJob &job, std::vector<Entry> list, bool consume) {
 +    std::stable_sort(list.begin(), list.end(), [](const Entry &a, const Entry &b) { return install_order(a.kind) < install_order(b.kind); });
-+    const fs::path done_dir = fs::path(INSTALL_DIR) / "done";
++    const fs::path done_dir = fs::path(install_dir()) / "done";
 +    if (consume) {
 +        boost::system::error_code ec;
 +        fs::create_directories(done_dir, ec);
@@ -8426,7 +8552,7 @@ index 00000000..7bd7d6a1
 +        job.done.push_back(title);
 +    } else {
 +        // (its files go as they're decrypted: what's left of it can't start)
-+        job.failures.push_back("Couldn't decrypt " + title + ": copy it again (see /data/Vita3K/vita3k.log)");
++        job.failures.push_back("Couldn't decrypt " + title + ": copy it again (see " + ps4_data_path("vita3k.log") + ")");
 +    }
 +    job.finished = true;
 +}
@@ -8455,9 +8581,13 @@ index 00000000..7bd7d6a1
 +    56768512,
 +};
 +
-+constexpr const char *DOWNLOAD_DIR = "/data/Vita3K/cache/download";
++std::string download_dir() {
++    return ps4_data_path("cache/download");
++}
 +// there once the user stopped a download: it doesn't start by itself again (Square still starts it)
-+constexpr const char *DOWNLOAD_STOPPED = "/data/Vita3K/cache/download/stopped";
++std::string download_stopped() {
++    return ps4_data_path("cache/download/stopped");
++}
 +
 +std::vector<const FirmwareDownload *> missing_firmware(const app::FirmwareState &fw) {
 +    std::vector<const FirmwareDownload *> missing;
@@ -8471,7 +8601,7 @@ index 00000000..7bd7d6a1
 +// Update files the user copied to the install folder (Triangle installs them)
 +bool updates_waiting() {
 +    boost::system::error_code ec;
-+    for (const auto &e : fs::directory_iterator(INSTALL_DIR, ec)) {
++    for (const auto &e : fs::directory_iterator(install_dir(), ec)) {
 +        if (string_utils::tolower(e.path().extension().string()) == ".pup")
 +            return true;
 +    }
@@ -8482,8 +8612,8 @@ index 00000000..7bd7d6a1
 +// and carries on the next time; an installed one is deleted.
 +void firmware_worker(EmuEnvState &emuenv, InstallJob &job, const std::vector<const FirmwareDownload *> &downloads) {
 +    boost::system::error_code ec;
-+    fs::create_directories(DOWNLOAD_DIR, ec);
-+    fs::remove(DOWNLOAD_STOPPED, ec);
++    fs::create_directories(download_dir(), ec);
++    fs::remove(download_stopped(), ec);
 +    {
 +        const std::lock_guard<std::mutex> lock(job.mutex);
 +        job.total = static_cast<int>(downloads.size());
@@ -8492,7 +8622,7 @@ index 00000000..7bd7d6a1
 +    try {
 +        for (const FirmwareDownload *d : downloads) {
 +            const std::string name = d->name;
-+            const fs::path file = fs::path(DOWNLOAD_DIR) / d->file;
++            const fs::path file = fs::path(download_dir()) / d->file;
 +            {
 +                const std::lock_guard<std::mutex> lock(job.mutex);
 +                job.index++;
@@ -8528,7 +8658,7 @@ index 00000000..7bd7d6a1
 +                const std::lock_guard<std::mutex> lock(job.mutex);
 +                if (result.status == ps4download::Status::Stopped) {
 +                    job.stopped = true;
-+                    if (FILE *f = std::fopen(DOWNLOAD_STOPPED, "w"))
++                    if (FILE *f = std::fopen(download_stopped().c_str(), "w"))
 +                        std::fclose(f);
 +                    ps4_boot_trace("firmware: stopped");
 +                } else {
@@ -8743,14 +8873,14 @@ index 00000000..7bd7d6a1
 +        c.text(MARGIN + 64, LIST_Y + 120, "No games yet", 52, TEXT, Weight::Bold);
 +        const int y = c.text_wrapped(MARGIN + 64, LIST_Y + 200,
 +            "Press Triangle to install games. HENkaku installs:", 32, MUTED, cw - 128, 46);
-+        const char *lines[] = {
++        const std::string lines[] = {
 +            ".vpk and .zip archives, and dumped game folders",
 +            ".pkg packages, with a .zrif file of the same name holding the zRIF",
-+            "from /data/Vita3K/install (copy them there over FTP), anywhere on the PS4's storage, or a USB drive",
++            "from " + install_dir() + " (copy them there over FTP), anywhere on the PS4's storage, or a USB drive",
 +            "The PS Vita firmware and font package download from Sony by themselves when they're missing (Square)",
 +        };
 +        int ly = y + 24;
-+        for (const char *line : lines) {
++        for (const std::string &line : lines) {
 +            c.fill_circle(MARGIN + 82.f, ly - 10.f, 6.f, ACCENT);
 +            ly = c.text_wrapped(MARGIN + 104, ly, line, 30, TEXT, cw - 200, 42) + 14;
 +        }
@@ -8819,7 +8949,7 @@ index 00000000..7bd7d6a1
 +        return;
 +    }
 +    c.fill_round_rect(x, y, size, size, size / 6, rgb(0x1b2a44));
-+    if (e.kind == Kind::Location && e.path == INSTALL_DIR) {
++    if (e.kind == Kind::Location && e.path == fs::path(install_dir())) {
 +        // an arrow into a tray
 +        const float cx = x + s / 2;
 +        c.line(cx, y + s * 0.2f, cx, y + s * 0.6f, s / 14, ACCENT);
@@ -8900,7 +9030,7 @@ index 00000000..7bd7d6a1
 +        lines = { "PS Vita license, for the packages that need one", "Cross installs it" };
 +        break;
 +    }
-+    if (installable(e.kind) && e.path.parent_path() == INSTALL_DIR)
++    if (installable(e.kind) && e.path.parent_path() == fs::path(install_dir()))
 +        lines.push_back("Once it's installed it moves to install/done");
 +    return lines;
 +}
@@ -9076,7 +9206,7 @@ index 00000000..7bd7d6a1
 +}
 +
 +// The home screen's wallpaper: the theme's colours with a band of light waving across them (the
-+// Vita's, in its blue), or a picture from /data/Vita3K/wallpapers. Made again only when the look
++// Vita's, in its blue), or a picture from /data/HENkaku/wallpapers. Made again only when the look
 +// changes, or for each other frame while the wave moves (HENkaku > Look).
 +struct Theme {
 +    uint32_t top, bottom, light;
@@ -10566,7 +10696,7 @@ index 00000000..7bd7d6a1
 +    };
 +    bool downloads_checked = false;
 +    // the install browser, where it was the last time
-+    static fs::path browse_dir = INSTALL_DIR; // empty: the locations
++    static fs::path browse_dir = install_dir(); // empty: the locations
 +    std::vector<Entry> entries;
 +    int browse_selected = 0;
 +    int browse_top = 0;
@@ -10651,11 +10781,11 @@ index 00000000..7bd7d6a1
 +    // before or copied update files to install
 +    if (!missing_firmware(fw).empty()) {
 +        boost::system::error_code ec;
-+        if (!fs::exists(DOWNLOAD_STOPPED, ec) && !updates_waiting()) {
++        if (!fs::exists(download_stopped(), ec) && !updates_waiting()) {
 +            start_firmware();
 +        } else if (notice.empty()) {
 +            if (updates_waiting())
-+                notice = "PS Vita update files are waiting in /data/Vita3K/install: Triangle, then Square installs them";
++                notice = "PS Vita update files are waiting in " + install_dir() + ": Triangle, then Square installs them";
 +            else
 +                notice = std::string(fw.main_firmware ? "The PS Vita font package isn't installed: some games need it." : "The PS Vita firmware isn't installed: most games need it.") + " HENkaku (OPTIONS) downloads it from Sony.";
 +            notice_until = Clock::now() + std::chrono::hours(1);
@@ -10979,7 +11109,7 @@ index 00000000..7bd7d6a1
 +                if ((pressed & ORBIS_PAD_BUTTON_CROSS) && !entries.empty()) {
 +                    const Entry e = entries[browse_selected];
 +                    if (installable(e.kind))
-+                        start_install({ e }, e.path.parent_path() == INSTALL_DIR);
++                        start_install({ e }, e.path.parent_path() == fs::path(install_dir()));
 +                    else
 +                        open_dir(e.path);
 +                    dirty = true;
@@ -10987,7 +11117,7 @@ index 00000000..7bd7d6a1
 +                    std::vector<Entry> all;
 +                    std::copy_if(entries.begin(), entries.end(), std::back_inserter(all), [](const Entry &e) { return installable(e.kind); });
 +                    if (!all.empty()) {
-+                        start_install(std::move(all), browse_dir == INSTALL_DIR);
++                        start_install(std::move(all), browse_dir == fs::path(install_dir()));
 +                        dirty = true;
 +                    }
 +                } else if (pressed & ORBIS_PAD_BUTTON_CIRCLE) {
@@ -11200,7 +11330,7 @@ index 00000000..7bd7d6a1
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_launcher.h b/vita3k/ps4/ps4_launcher.h
 new file mode 100644
-index 00000000..0210098f
+index 00000000..800318b2
 --- /dev/null
 +++ b/vita3k/ps4/ps4_launcher.h
 @@ -0,0 +1,44 @@
@@ -11231,8 +11361,8 @@ index 00000000..0210098f
 +
 +namespace ps4launcher {
 +
-+// Where the user puts what they want installed (games, firmware, licenses)
-+constexpr const char *INSTALL_DIR = "/data/Vita3K/install";
++// Where the user puts what they want installed (games, firmware, licenses): /data/HENkaku/install
++const std::string &install_dir();
 +
 +struct Choice {
 +    bool quit = false;
@@ -11250,10 +11380,10 @@ index 00000000..0210098f
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..4590e9a1
+index 00000000..66ca2c82
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
-@@ -0,0 +1,599 @@
+@@ -0,0 +1,636 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -11274,10 +11404,10 @@ index 00000000..4590e9a1
 +// PS4: Vita3K's frontend, in place of main.cpp (Qt) and sdl-frontend.
 +//
 +//   /app0              the package: eboot.bin, version.txt, data/, shaders-builtin/, icons/
-+//   /data/Vita3K       config.yml, vita3k.log (and the run before's vita3k.prev.log), boot-trace.log,
-+//                      crash.log, cache/, patch/
-+//   /data/Vita3K/fs    the Vita's file system (ux0, vs0, os0, sa0, pd0, ...)
-+//   /data/Vita3K/install  what the launcher installs (firmware, games, licenses)
++//   /data/HENkaku      config.yml, vita3k.log (and the run before's vita3k.prev.log), boot-trace.log,
++//                      crash.log, cache/, patch/ (/data/Vita3K up to v00.42: 1.00 moves it, ps4_data.h)
++//   /data/HENkaku/fs   the Vita's file system (ux0, vs0, os0, sa0, pd0, ...)
++//   /data/HENkaku/install  what the launcher installs (firmware, games, licenses)
 +//
 +// The launcher (ps4_launcher.cpp) shows the installed apps; the picked one runs in a session drawn
 +// by Vita3K's Vulkan renderer on RADV, presented through VideoOut (ps4_wsi.cpp). When the game
@@ -11288,6 +11418,7 @@ index 00000000..4590e9a1
 +#include "ps4_canvas.h"
 +#include "ps4_launcher.h"
 +#include "ps4_controls.h"
++#include "ps4_data.h"
 +#include "ps4_pad.h"
 +#include "ps4_perf.h"
 +#include "ps4_settings.h"
@@ -11336,6 +11467,7 @@ index 00000000..4590e9a1
 +#include <vector>
 +
 +extern "C" void ps4_boot_trace(const char *line); // port/ps4_crashlog.cpp
++extern "C" const char *ps4_crash_log_path(); // port/ps4_crashlog.cpp
 +// port/ps4_sampler.cpp: threads' own CPU time and the wait counters
 +extern "C" void ps4_thread_busy_report(char *out, size_t size, int min_percent);
 +extern "C" long long ps4_wait_total(int slot);
@@ -11537,7 +11669,7 @@ index 00000000..4590e9a1
 +extern "C" void ps4_crash_guest_info() {
 +    if (!crash_emuenv)
 +        return;
-+    FILE *f = std::fopen("/data/Vita3K/crash.log", "a");
++    FILE *f = std::fopen(ps4_crash_log_path(), "a");
 +    if (!f)
 +        return;
 +    std::fprintf(f, "\n== HENkaku (Vita3K for PS4) %s: %s (%s), the details are in vita3k.log (vita3k.prev.log once Vita3K started again)\n", app_version,
@@ -11547,8 +11679,12 @@ index 00000000..4590e9a1
 +
 +namespace {
 +
-+const char *const NOTICE_FILE = "/data/Vita3K/notice.txt";
-+const char *const RELAUNCH_FILE = "/data/Vita3K/relaunch.txt";
++std::string notice_file() {
++    return ps4_data_path("notice.txt");
++}
++std::string relaunch_file() {
++    return ps4_data_path("relaunch.txt");
++}
 +
 +void trace(const std::string &line) {
 +    ps4_boot_trace(line.c_str());
@@ -11590,18 +11726,18 @@ index 00000000..4590e9a1
 +    }
 +};
 +
-+void save_text(const char *path, const std::string &text) {
++void save_text(const std::string &path, const std::string &text) {
 +    std::ofstream out(path, std::ios::trunc);
 +    out << text;
 +}
 +
-+std::string take_text(const char *path) {
++std::string take_text(const std::string &path) {
 +    std::ifstream in(path);
 +    if (!in)
 +        return {};
 +    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 +    in.close();
-+    std::remove(path);
++    std::remove(path.c_str());
 +    return text;
 +}
 +
@@ -11610,11 +11746,11 @@ index 00000000..4590e9a1
 +    std::string text = request.app_path + "\n" + request.self_path + "\n";
 +    for (const auto &arg : request.argv)
 +        text += arg + "\n";
-+    save_text(RELAUNCH_FILE, text);
++    save_text(relaunch_file(), text);
 +}
 +
 +std::optional<AppLaunchRequest> take_relaunch() {
-+    const std::string text = take_text(RELAUNCH_FILE);
++    const std::string text = take_text(relaunch_file());
 +    if (text.empty())
 +        return std::nullopt;
 +    AppLaunchRequest request;
@@ -11642,7 +11778,7 @@ index 00000000..4590e9a1
 +
 +[[noreturn]] void restart(const std::string &notice) {
 +    if (!notice.empty())
-+        save_text(NOTICE_FILE, notice);
++        save_text(notice_file(), notice);
 +    trace("restarting");
 +    sceSystemServiceLoadExec("/app0/eboot.bin", nullptr);
 +    std::_Exit(0);
@@ -11663,20 +11799,20 @@ index 00000000..4590e9a1
 +    if (!session.initialize_renderer(frame_host)) {
 +        session.stop(app::AppSessionStopReason::LaunchFailure);
 +        trace("session: the renderer failed");
-+        return "The renderer couldn't start (Vulkan): see /data/Vita3K/vita3k.prev.log";
++        return "The renderer couldn't start (Vulkan): see " + ps4_data_path("vita3k.prev.log");
 +    }
 +    emuenv.renderer->fsr_sharpening = ps4settings::fsr_sharpening(ps4settings::prefs().fsr_sharpness);
 +    trace("session: runtime");
 +    if (!session.initialize_runtime()) {
 +        session.stop(app::AppSessionStopReason::LaunchFailure);
 +        trace("session: the runtime failed");
-+        return "The emulator couldn't start: see /data/Vita3K/vita3k.prev.log";
++        return "The emulator couldn't start: see " + ps4_data_path("vita3k.prev.log");
 +    }
 +    trace("session: loading the app");
 +    if (!session.load_and_run()) {
 +        session.stop(app::AppSessionStopReason::LaunchFailure);
 +        trace("session: loading the app failed");
-+        return "The game couldn't be loaded: see /data/Vita3K/vita3k.prev.log";
++        return "The game couldn't be loaded: see " + ps4_data_path("vita3k.prev.log");
 +    }
 +    trace("session: running " + emuenv.current_app_title);
 +    // L3 + R3: the HENkaku menu, with what can change now and this game's own settings
@@ -11741,17 +11877,44 @@ index 00000000..4590e9a1
 +    return notice;
 +}
 +
++// The folder of the app before 1.00, /data/Vita3K, next to a /data/HENkaku it has never run in (made
++// by hand, say, to copy games into): port/ps4_crashlog.cpp renames the old folder only when there's
++// no new one, so what the old one has that the new one doesn't moves over here
++void move_missing(const fs::path &from, const fs::path &to, boost::system::error_code &ec) {
++    std::vector<fs::path> entries;
++    for (const auto &entry : fs::directory_iterator(from, ec))
++        entries.push_back(entry.path());
++    for (const fs::path &entry : entries) {
++        const fs::path target = to / entry.filename();
++        if (!fs::exists(target, ec))
++            fs::rename(entry, target, ec);
++        else if (fs::is_directory(entry, ec) && fs::is_directory(target, ec))
++            move_missing(entry, target, ec);
++    }
++    fs::remove(from, ec); // (when nothing's left)
++}
++
++void adopt_old_data() {
++    boost::system::error_code ec;
++    const fs::path data = ps4_data_dir(), old = "/data/Vita3K";
++    if (data == old || fs::exists(data / "config.yml", ec) || !fs::exists(old / "config.yml", ec))
++        return;
++    move_missing(old, data, ec);
++    trace("data: what /data/Vita3K had moved into " + data.string());
++}
++
 +// main, inside its catch-all
 +int run_app() {
 +    read_app_version();
 +    trace(std::string("main: HENkaku (Vita3K for PS4) ") + app_version);
++    adopt_old_data();
 +    Root root_paths;
 +    app::init_paths(root_paths);
 +    // the launcher's text: the PS Vita's fonts once the font package is installed
 +    ps4ui::set_vita_font_dir(fs_utils::path_to_utf8(root_paths.get_vita_fs_path() / "sa0" / "data" / "font" / "pvf") + "/");
 +    boost::system::error_code ec;
 +    fs::create_directories(root_paths.get_vita_fs_path(), ec);
-+    fs::create_directories(ps4launcher::INSTALL_DIR, ec);
++    fs::create_directories(ps4launcher::install_dir(), ec);
 +    // The last run's log stays as vita3k.prev.log: after every game the app starts over, and the
 +    // game's log went with it (v00.07: why PCSE00003 didn't load)
 +    fs::rename(root_paths.get_log_path() / "vita3k.log", root_paths.get_log_path() / "vita3k.prev.log", ec);
@@ -11762,10 +11925,14 @@ index 00000000..4590e9a1
 +    if (logging::init(root_paths, false) != Success)
 +        trace("logging could not start");
 +    LOG_INFO("Vita3K for PS4 {}", app_version);
++    if (ps4_data_dir_moved() > 0)
++        LOG_INFO("PS4: /data/Vita3K moved to {}", ps4_data_dir());
++    else if (ps4_data_dir_moved() < 0)
++        LOG_WARN("PS4: /data/Vita3K couldn't be moved to /data/HENkaku: the app keeps using it");
 +    // Which draw a GPU hang is on: RADV's per-draw trace ids (RADV_DEBUG=hang, which also ends the
 +    // app when a submission doesn't finish, rather than the whole PS4 freezing) and the PS4
 +    // winsys' flight recorder (port/mesa/ac_ps4_drm.c, into /data/DolphinPS4/flight), when
-+    // /data/Vita3K/radv-trace is there; it slows the rendering down.
++    // /data/HENkaku/radv-trace is there; it slows the rendering down.
 +    if (fs::exists(root_paths.get_log_path() / "radv-trace", ec)) {
 +        setenv("RADV_PS4_TRACE", "1", 1);
 +        setenv("RADV_DEBUG", "hang", 1);
@@ -11787,7 +11954,7 @@ index 00000000..4590e9a1
 +    }
 +    // Trace and debug lines (every shader instruction translated, every directory entry a game
 +    // reads: thousands while a game loads) each cost a write to the file here, where the log is
-+    // flushed at every line. Info and up, unless /data/Vita3K/trace-log is there.
++    // flushed at every line. Info and up, unless /data/HENkaku/trace-log is there.
 +    if (fs::exists(root_paths.get_log_path() / "trace-log", ec))
 +        logging::set_level(spdlog::level::trace);
 +    else if (cfg.log_level < static_cast<int>(spdlog::level::info))
@@ -11806,7 +11973,7 @@ index 00000000..4590e9a1
 +    if (!app::init(emuenv, cfg, root_paths)) {
 +        trace("app init failed");
 +        LOG_ERROR("Emulated environment initialization failed.");
-+        ps4launcher::show_message("Vita3K couldn't start", "See /data/Vita3K/vita3k.log");
++        ps4launcher::show_message("HENkaku couldn't start", "See " + ps4_data_path("vita3k.log"));
 +        std::this_thread::sleep_for(std::chrono::seconds(10));
 +        sceSystemServiceLoadExec("exit", nullptr);
 +        return 1;
@@ -11818,7 +11985,7 @@ index 00000000..4590e9a1
 +    trace("ready");
 +
 +    std::optional<AppLaunchRequest> next = take_relaunch();
-+    std::string notice = take_text(NOTICE_FILE);
++    std::string notice = take_text(notice_file());
 +    if (!next) {
 +        const ps4launcher::Choice choice = ps4launcher::run(emuenv, notice);
 +        if (choice.quit) {
@@ -12713,10 +12880,10 @@ index 00000000..4291971e
 +} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_settings.cpp b/vita3k/ps4/ps4_settings.cpp
 new file mode 100644
-index 00000000..65bfd567
+index 00000000..9f17fba6
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.cpp
-@@ -0,0 +1,712 @@
+@@ -0,0 +1,715 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -12750,6 +12917,7 @@ index 00000000..65bfd567
 +#include "ps4_settings.h"
 +
 +#include "ps4_controls.h"
++#include "ps4_data.h"
 +
 +#include <app/functions.h>
 +#include <camera/state.h>
@@ -12775,7 +12943,9 @@ index 00000000..65bfd567
 +
 +namespace {
 +
-+const char *const PREFS_FILE = "/data/Vita3K/ps4.cfg";
++std::string prefs_file() {
++    return ps4_data_path("ps4.cfg");
++}
 +const float SHARPENING_STOPS[] = { 0.0f, 0.2f, 0.5f, 1.0f, 2.0f };
 +
 +// Every read and change of the settings: the in-game menu reads them on the render thread while
@@ -13121,7 +13291,7 @@ index 00000000..65bfd567
 +}
 +
 +// The home screen's theme, its wave moving, and its wallpaper (a picture copied to
-+// /data/Vita3K/wallpapers, or the theme's wave)
++// /data/HENkaku/wallpapers, or the theme's wave)
 +std::vector<Item> look_items() {
 +    std::vector<Item> items;
 +    items.push_back(section("Home screen"));
@@ -13186,7 +13356,7 @@ index 00000000..65bfd567
 +}
 +
 +void load_prefs() {
-+    FILE *f = std::fopen(PREFS_FILE, "r");
++    FILE *f = std::fopen(prefs_file().c_str(), "r");
 +    if (!f)
 +        return;
 +    char line[256];
@@ -13228,9 +13398,9 @@ index 00000000..65bfd567
 +}
 +
 +void save_prefs() {
-+    FILE *f = std::fopen(PREFS_FILE, "w");
++    FILE *f = std::fopen(prefs_file().c_str(), "w");
 +    if (!f) {
-+        LOG_WARN("PS4: couldn't write {}", PREFS_FILE);
++        LOG_WARN("PS4: couldn't write {}", prefs_file());
 +        return;
 +    }
 +    std::fprintf(f, "# HENkaku (Vita3K for PS4): the frontend's own settings (HENkaku > System, Display, CPU)\n");
@@ -13308,7 +13478,7 @@ index 00000000..65bfd567
 +}
 +
 +std::string wallpaper_dir() {
-+    return "/data/Vita3K/wallpapers";
++    return ps4_data_path("wallpapers");
 +}
 +
 +std::vector<std::string> wallpaper_files() {
@@ -13431,7 +13601,7 @@ index 00000000..65bfd567
 +} // namespace ps4settings
 diff --git a/vita3k/ps4/ps4_settings.h b/vita3k/ps4/ps4_settings.h
 new file mode 100644
-index 00000000..1244a32a
+index 00000000..746a6340
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.h
 @@ -0,0 +1,95 @@
@@ -13471,7 +13641,7 @@ index 00000000..1244a32a
 +using Item = overlay::pause_menu_item;
 +
 +// The PS4 frontend's own settings, which Vita3K's config.yml has no place for
-+// (/data/Vita3K/ps4.cfg, "key = value" lines)
++// (/data/HENkaku/ps4.cfg, "key = value" lines)
 +struct Prefs {
 +    // the home screen: the PS Vita's bubbles, or Vita3K's list
 +    bool bubbles = true;
@@ -13511,7 +13681,7 @@ index 00000000..1244a32a
 +float fsr_sharpening(int index);
 +// The themes, in Prefs::theme's order (the launcher has their colours)
 +const std::vector<std::string> &theme_names();
-+// Where wallpaper pictures go (/data/Vita3K/wallpapers), and the ones there (.png, .jpg)
++// Where wallpaper pictures go (/data/HENkaku/wallpapers), and the ones there (.png, .jpg)
 +std::string wallpaper_dir();
 +std::vector<std::string> wallpaper_files();
 +

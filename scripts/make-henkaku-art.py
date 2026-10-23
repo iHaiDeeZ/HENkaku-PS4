@@ -90,8 +90,21 @@ def buttons():
     save(img, "left_right.png")
 
 
+def banner():
+    """The README's banner (docs/images/banner.png, 1600x540)"""
+    img = background(1600, 540)
+    img.alpha_composite(logo(440), (1070, 50))
+    d = ImageDraw.Draw(img)
+    d.text((118, 140), "HENkaku", font=font(150), fill=TEXT)
+    d.text((126, 330), "PlayStation Vita games on the PS4", font=font(44, bold=False), fill=MUTED)
+    d.text((126, 396), "powered by Vita3K", font=font(32, bold=False), fill=MUTED)
+    os.makedirs(os.path.join(ROOT, "docs", "images"), exist_ok=True)
+    img.convert("RGB").save(os.path.join(ROOT, "docs", "images", "banner.png"))
+
+
 def main():
     buttons()
+    banner()
     logo(512).save(os.path.join(ROOT, "assets", "henkaku.png"))
 
     icon = background(512, 512)
