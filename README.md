@@ -85,6 +85,24 @@ first time (or Sony's update files), and your own PS Vita games.
    installs from the install folder moves to `install/done/`.
 5. The game you just installed is picked: **Cross** opens its LiveArea, and **Cross** again starts it.
 
+### The firmware and fonts by hand
+
+HENkaku downloads both from Sony the first time it starts. Without an internet connection on the PS4, or when the
+download keeps failing, download them on a PC and install them yourself:
+
+1. Download Sony's two update files (keep their names):
+   - **PS Vita firmware 3.74**: [PSVUPDAT.PUP](http://dus01.psv.update.playstation.net/update/psv/image/2022_0209/rel_f2c7b12fe85496ec88a0391b514d6e3b/PSVUPDAT.PUP?dest=us),
+     133,834,240 bytes
+   - **PS Vita font package**: [PSP2UPDAT.PUP](http://dus01.psp2.update.playstation.net/update/psp2/image/2019_0924/sd_8b5f60b56c3da8365b973dba570c53a5/PSP2UPDAT.PUP?dest=us),
+     56,768,512 bytes
+
+   They come from Sony's own update server, which only offers plain HTTP: if your browser warns about that,
+   keep the file. A file of another size didn't download completely.
+2. Copy both to **`/data/HENkaku/install/`** on the PS4 over FTP (or onto a USB drive).
+3. Start HENkaku and press **Triangle** (or open **Install**): **Square** installs both, or pick one and press
+   **Cross**. Each moves to `install/done/` once it's in.
+4. With both in, the home screen no longer says the firmware is missing, and games start.
+
 **What installs:** `.vpk` and `.zip` archives; dumped game folders (with `sce_sys/param.sfo`); `.pkg` files with a
 `.zrif` text file of the same name holding the zRIF (or their `.rif` license installed first); NoNpDrm dumps (with
 `sce_sys/package/work.bin`). A NoNpDrm dump copied straight into `/data/HENkaku/fs/ux0/app/` is decrypted in place

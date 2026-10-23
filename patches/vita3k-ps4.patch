@@ -3978,8 +3978,76 @@ index 0eb48f99..c187aae3 100644
      // preserve HE-ADPCM predictor history so the runtime decoder can be rebuilt
      ADPCMHistory adpcm_history[SCE_NGS_PLAYER_MAX_PCM_CHANNELS] = {};
  };
+diff --git a/vita3k/ngs/include/ngs/rate_resampler.h b/vita3k/ngs/include/ngs/rate_resampler.h
+index 34576d0f..432cc216 100644
+--- a/vita3k/ngs/include/ngs/rate_resampler.h
++++ b/vita3k/ngs/include/ngs/rate_resampler.h
+@@ -19,30 +19,32 @@
+ 
+ #include <ngs/system.h>
+ 
+-struct SwrContext;
+-
+ namespace ngs {
+ 
++// A voice's resampling, from its playback frequency (times its scalar) to the system's rate: 4-point
++// Hermite interpolation with its place carried from one update to the next, so the rate can change
++// at every update (a game bending a sound's pitch) with nothing made again. (FFmpeg's resampler was
++// rebuilt at each change, filter bank and all: milliseconds a voice on the PS4, and 40 to 130 ms an
++// update in Ratchet & Clank 2, whose sound then broke up.)
+ struct StereoRateResamplerLogicalState {
+-    PCMFrameQueue input_history;
+-    bool needs_reset = false;
++    float tail[3][2] = {}; // the last 3 input frames
++    double position = 0; // where the next output frame is, in input frames from tail[0]
++    bool primed = false;
+ 
+     void clear() {
+-        input_history.clear();
+-        needs_reset = false;
++        primed = false;
++        position = 0;
+     }
+ 
++    // (a new start: key on, key off)
+     void reset() {
+-        input_history.clear();
+-        needs_reset = true;
++        clear();
+     }
+ };
+ 
+ struct StereoRateResamplerRuntimeState {
+-    SwrContext *context = nullptr;
+     int source_rate = 0;
+     int dest_rate = 0;
+-    std::vector<uint8_t> scratch_buffer;
+ };
+ 
+ void destroy_stereo_rate_resampler(StereoRateResamplerRuntimeState &runtime);
+diff --git a/vita3k/ngs/src/modules/atrac9.cpp b/vita3k/ngs/src/modules/atrac9.cpp
+index 89409a63..5ed4d328 100644
+--- a/vita3k/ngs/src/modules/atrac9.cpp
++++ b/vita3k/ngs/src/modules/atrac9.cpp
+@@ -61,14 +61,8 @@ void Atrac9Module::on_state_change(const MemState &mem, ModuleData &data, const
+     }
+ }
+ 
+-void Atrac9Module::on_param_change(const MemState &mem, ModuleData &data) {
+-    Atrac9LogicalState *logical = data.get_logical_state<Atrac9LogicalState>();
+-    const SceNgsAT9Params *old_params = reinterpret_cast<SceNgsAT9Params *>(data.last_info.data());
+-    const SceNgsAT9Params *new_params = static_cast<SceNgsAT9Params *>(data.info.data.get(mem));
+-
+-    if (old_params->playback_frequency != new_params->playback_frequency || old_params->playback_scalar != new_params->playback_scalar) {
+-        logical->rate_resampler.reset();
+-    }
++void Atrac9Module::on_param_change(const MemState &, ModuleData &) {
++    // (a new playback frequency or scalar: the rate resampler goes on from where it is, rate_resampler.h)
+ }
+ 
+ bool Atrac9Module::decode_more_data(KernelState &kern, const MemState &mem, const SceUID thread_id, ModuleData &data, const SceNgsAT9Params *params, SceNgsAT9States *state, Atrac9LogicalState *logical, Atrac9RuntimeState *runtime, std::unique_lock<std::recursive_mutex> &scheduler_lock, std::unique_lock<std::mutex> &voice_lock) {
 diff --git a/vita3k/ngs/src/modules/player.cpp b/vita3k/ngs/src/modules/player.cpp
-index 6403d07e..8d030b92 100644
+index 6403d07e..203d76eb 100644
 --- a/vita3k/ngs/src/modules/player.cpp
 +++ b/vita3k/ngs/src/modules/player.cpp
 @@ -46,6 +46,7 @@ void PlayerModule::on_state_change(const MemState &mem, ModuleData &data, const
@@ -3990,7 +4058,21 @@ index 6403d07e..8d030b92 100644
  
          std::memset(&logical->adpcm_history, 0, sizeof(logical->adpcm_history));
      } else if (data.parent->is_keyed_off) {
-@@ -111,9 +112,11 @@ bool PlayerModule::process(KernelState &kern, const MemState &mem, const SceUID
+@@ -82,12 +83,10 @@ void PlayerModule::on_param_change(const MemState &mem, ModuleData &data) {
+         }
+     }
+ 
+-    // if playback scaling changed, reset the rate resampler
++    // if playback scaling changed (the rate resampler goes on from where it is: rate_resampler.h)
+     if (old_params->playback_frequency != new_params->playback_frequency || old_params->playback_scalar != new_params->playback_scalar) {
+         ADPCMHistory hist_empty{};
+         std::fill_n(logical->adpcm_history, SCE_NGS_PLAYER_MAX_PCM_CHANNELS, hist_empty);
+-
+-        logical->rate_resampler.reset();
+     }
+ }
+ 
+@@ -111,9 +110,11 @@ bool PlayerModule::process(KernelState &kern, const MemState &mem, const SceUID
      const int32_t granularity = data.parent->rack->system->granularity;
  
      // fix right now because it might be set by default in SceNgsVoiceInit, which we do not support
@@ -4005,7 +4087,7 @@ index 6403d07e..8d030b92 100644
  
      // If decoder hasn't been initialized
      if (!runtime->decoder) {
-@@ -123,10 +126,112 @@ bool PlayerModule::process(KernelState &kern, const MemState &mem, const SceUID
+@@ -123,10 +124,112 @@ bool PlayerModule::process(KernelState &kern, const MemState &mem, const SceUID
  
      logical->decoded_pcm.compact();
  
@@ -4118,6 +4200,239 @@ index 6403d07e..8d030b92 100644
              // Stop processing if no valid buffer is available or if the buffer is empty
              finished = true;
              break;
+diff --git a/vita3k/ngs/src/rate_resampler.cpp b/vita3k/ngs/src/rate_resampler.cpp
+index fed99e85..cba30584 100644
+--- a/vita3k/ngs/src/rate_resampler.cpp
++++ b/vita3k/ngs/src/rate_resampler.cpp
+@@ -18,178 +18,84 @@
+ #include <ngs/rate_resampler.h>
+ #include <util/log.h>
+ 
+-extern "C" {
+-#include <libavutil/channel_layout.h>
+-#include <libavutil/samplefmt.h>
+-#include <libswresample/swresample.h>
+-}
+-
+-#include <algorithm>
+ #include <cstdint>
++#include <cstring>
+ 
+ namespace ngs {
+-namespace {
+-constexpr uint32_t stereo_channels = 2;
+-constexpr uint32_t history_safety_margin_frames = 128;
+-constexpr uint32_t history_compact_threshold_frames = 1024;
+-
+-bool create_stereo_rate_resampler(StereoRateResamplerRuntimeState &runtime, const int source_rate,
+-    const int dest_rate) {
+-    AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
+-    const int alloc_result = swr_alloc_set_opts2(&runtime.context,
+-        &stereo, AV_SAMPLE_FMT_FLT, dest_rate,
+-        &stereo, AV_SAMPLE_FMT_FLT, source_rate,
+-        0, nullptr);
+-    if (alloc_result < 0) {
+-        LOG_ERROR("Failed to allocate stereo rate SwrContext for {} -> {} Hz (error {}).",
+-            source_rate, dest_rate, alloc_result);
+-        runtime.context = nullptr;
+-        return false;
+-    }
+-
+-    const int init_result = swr_init(runtime.context);
+-    if (init_result < 0) {
+-        LOG_ERROR("Failed to initialize stereo rate SwrContext for {} -> {} Hz (error {}).",
+-            source_rate, dest_rate, init_result);
+-        swr_free(&runtime.context);
+-        return false;
+-    }
+-
+-    runtime.source_rate = source_rate;
+-    runtime.dest_rate = dest_rate;
+-    return true;
+-}
+-
+-void compact_history_if_needed(StereoRateResamplerLogicalState &logical) {
+-    if (logical.input_history.read_offset_frames == 0) {
+-        return;
+-    }
+-
+-    const uint32_t total_frames = logical.input_history.total_frames();
+-    if (logical.input_history.read_offset_frames >= history_compact_threshold_frames
+-        || logical.input_history.read_offset_frames >= (total_frames / 2)) {
+-        logical.input_history.compact();
+-    }
+-}
+-
+-void trim_history(StereoRateResamplerRuntimeState &runtime, StereoRateResamplerLogicalState &logical) {
+-    if (!runtime.context) {
+-        logical.input_history.clear();
+-        return;
+-    }
+-
+-    const int64_t delay = swr_get_delay(runtime.context, runtime.source_rate);
+-    const uint32_t keep_frames = static_cast<uint32_t>(std::max<int64_t>(delay, 0)) + history_safety_margin_frames;
+-    const uint32_t available_frames = logical.input_history.available_frames();
+-
+-    if (available_frames > keep_frames) {
+-        logical.input_history.consume_frames(available_frames - keep_frames);
+-        compact_history_if_needed(logical);
+-    }
+-}
+-
+-bool replay_history(StereoRateResamplerRuntimeState &runtime, StereoRateResamplerLogicalState &logical) {
+-    logical.input_history.compact();
+-
+-    const uint32_t history_frames = logical.input_history.available_frames();
+-    if (history_frames == 0) {
+-        return true;
+-    }
+-
+-    const int out_samples = swr_get_out_samples(runtime.context, static_cast<int>(history_frames));
+-    if (out_samples < 0) {
+-        LOG_ERROR("Failed to query stereo rate resampler replay output size for {} history frames (error {}).",
+-            history_frames, out_samples);
+-        return false;
+-    }
+-
+-    runtime.scratch_buffer.resize(static_cast<size_t>(out_samples) * sizeof(float) * stereo_channels);
+-
+-    uint8_t *discard_output = runtime.scratch_buffer.empty() ? nullptr : runtime.scratch_buffer.data();
+-    const uint8_t *history_input = logical.input_history.read_bytes();
+-    const int result = swr_convert(runtime.context, &discard_output, out_samples, &history_input,
+-        static_cast<int>(history_frames));
+-    if (result < 0) {
+-        LOG_ERROR("Failed to replay {} history frames into stereo rate resampler (error {}).",
+-            history_frames, result);
+-        return false;
+-    }
+-    return true;
+-}
+-} // namespace
+ 
+ void destroy_stereo_rate_resampler(StereoRateResamplerRuntimeState &runtime) {
+-    if (runtime.context) {
+-        swr_free(&runtime.context);
+-    }
+-
+     runtime.source_rate = 0;
+     runtime.dest_rate = 0;
+-    runtime.scratch_buffer.clear();
+ }
+ 
+ bool ensure_stereo_rate_resampler(StereoRateResamplerRuntimeState &runtime, StereoRateResamplerLogicalState &logical,
+     const int source_rate, const int dest_rate) {
+     if (source_rate <= 0 || dest_rate <= 0) {
+         LOG_ERROR("Invalid stereo rate resampler configuration {} -> {} Hz.", source_rate, dest_rate);
+-        return false;
+-    }
+-
+-    const bool needs_recreate = logical.needs_reset || !runtime.context || runtime.source_rate != source_rate
+-        || runtime.dest_rate != dest_rate;
+-
+-    if (!needs_recreate) {
+-        return true;
+-    }
+-
+-    destroy_stereo_rate_resampler(runtime);
+-    if (!create_stereo_rate_resampler(runtime, source_rate, dest_rate)) {
+-        return false;
+-    }
+-
+-    if (!replay_history(runtime, logical)) {
+         destroy_stereo_rate_resampler(runtime);
+         return false;
+     }
+ 
+-    logical.needs_reset = false;
++    // (a new rate goes on from where the voice is)
++    runtime.source_rate = source_rate;
++    runtime.dest_rate = dest_rate;
+     return true;
+ }
+ 
+ uint32_t process_stereo_rate_resampler(StereoRateResamplerRuntimeState &runtime, StereoRateResamplerLogicalState &logical,
+     const uint8_t *input, const uint32_t input_frames, PCMFrameQueue &output) {
+-    if (!input || input_frames == 0 || !runtime.context) {
+-        return 0;
+-    }
+-
+-    const int out_samples = swr_get_out_samples(runtime.context, static_cast<int>(input_frames));
+-    if (out_samples < 0) {
+-        LOG_ERROR("Failed to query stereo rate resampler output size for {} input frames (error {}).",
+-            input_frames, out_samples);
++    if (!input || input_frames == 0 || runtime.source_rate <= 0 || runtime.dest_rate <= 0) {
+         return 0;
+     }
+ 
+-    const size_t old_samples = output.samples.size();
+-    output.samples.resize(old_samples + static_cast<size_t>(out_samples) * stereo_channels);
+-
+-    uint8_t *output_bytes = reinterpret_cast<uint8_t *>(output.samples.data() + old_samples);
+-    const uint8_t *input_bytes = input;
+-    const int produced_samples = swr_convert(runtime.context, &output_bytes, out_samples, &input_bytes,
+-        static_cast<int>(input_frames));
+-
+-    if (produced_samples < 0) {
+-        LOG_ERROR("Stereo rate resampler failed while converting {} input frames (error {}).",
+-            input_frames, produced_samples);
+-        output.samples.resize(old_samples);
+-        return 0;
++    const float *in = reinterpret_cast<const float *>(input);
++    if (!logical.primed) {
++        // a start: the frames before the first are the first
++        for (auto &frame : logical.tail) {
++            frame[0] = in[0];
++            frame[1] = in[1];
++        }
++        logical.position = 3.0;
++        logical.primed = true;
+     }
+ 
+-    output.samples.resize(old_samples + static_cast<size_t>(produced_samples) * stereo_channels);
+-
+-    logical.input_history.append_bytes(input, input_frames);
+-    trim_history(runtime, logical);
++    // the frames in order: the 3 kept, then this input's
++    const auto frame = [&](const uint32_t k) -> const float * {
++        return k < 3 ? logical.tail[k] : in + static_cast<size_t>(k - 3) * 2;
++    };
++    const uint32_t last = input_frames + 2;
++    const double step = static_cast<double>(runtime.source_rate) / runtime.dest_rate;
+ 
+-    return static_cast<uint32_t>(produced_samples);
++    // an output frame between frames i and i + 1 takes i - 1 to i + 2
++    const size_t old_samples = output.samples.size();
++    output.samples.resize(old_samples + (static_cast<size_t>((input_frames + 1) / step) + 2) * 2);
++    float *out = output.samples.data() + old_samples;
++    uint32_t produced = 0;
++    double position = logical.position;
++    for (uint32_t i = static_cast<uint32_t>(position); i + 2 <= last; i = static_cast<uint32_t>(position)) {
++        const float f = static_cast<float>(position - i);
++        const float *y0 = frame(i - 1), *y1 = frame(i), *y2 = frame(i + 1), *y3 = frame(i + 2);
++        for (int c = 0; c < 2; c++) {
++            const float c1 = 0.5f * (y2[c] - y0[c]);
++            const float c2 = y0[c] - 2.5f * y1[c] + 2.f * y2[c] - 0.5f * y3[c];
++            const float c3 = 0.5f * (y3[c] - y0[c]) + 1.5f * (y1[c] - y2[c]);
++            out[produced * 2 + c] = ((c3 * f + c2) * f + c1) * f + y1[c];
++        }
++        produced++;
++        position += step;
++    }
++    output.samples.resize(old_samples + static_cast<size_t>(produced) * 2);
++
++    // the last 3 frames for the next input, the place counted from the first of them
++    float kept[3][2];
++    for (uint32_t k = 0; k < 3; k++) {
++        const float *f = frame(input_frames + k);
++        kept[k][0] = f[0];
++        kept[k][1] = f[1];
++    }
++    std::memcpy(logical.tail, kept, sizeof(kept));
++    logical.position = position - input_frames;
++    return produced;
+ }
+ 
+ } // namespace ngs
 diff --git a/vita3k/overlay/CMakeLists.txt b/vita3k/overlay/CMakeLists.txt
 index 7bce266f..c18ac372 100644
 --- a/vita3k/overlay/CMakeLists.txt
@@ -11380,10 +11695,10 @@ index 00000000..800318b2
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..66ca2c82
+index 00000000..8d2bb5b9
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
-@@ -0,0 +1,636 @@
+@@ -0,0 +1,639 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -11591,9 +11906,12 @@ index 00000000..66ca2c82
 +        if (started) {
 +            LOG_INFO("perf: {} fps, {:.0f} vblanks/s; render thread: waits for the game {} ms/s, shows frames {} ms/s, waits for the GPU {} ms/s; frames wait for the renderer {} ms/s; the game waits for vblanks {} ms/s; busy: {}",
 +                emuenv.fps, (vblank_count - vblanks) / seconds, ms[1], ms[2], ms[3], ms[4], ms[0], busy);
-+            // a thread in one call for 15 s: the waits behind it, a few times
++            // a freeze (the render thread neither showed a frame nor waited for the game all that
++            // time): the waits behind it, a few times. (A thread in one call for 15 s was the sign:
++            // threads that always wait used the three up at the start.)
 +            static int wait_logs = 0;
-+            if (ps4perf::report(seconds, (tsc - last_tsc) / (seconds * 1000.0)) >= 15.0 && wait_logs < 3 && ps4settings::prefs().freeze_log) {
++            ps4perf::report(seconds, (tsc - last_tsc) / (seconds * 1000.0));
++            if (ms[1] == 0 && ms[2] == 0 && wait_logs < 3 && ps4settings::prefs().freeze_log) {
 +                wait_logs++;
 +                ps4_log_waits(emuenv.kernel);
 +            }
@@ -15838,6 +16156,31 @@ index e983487e..6ebbcc23 100644
          result->second(renderer, mem, config, helper, render_context);
      } else {
          LOG_ERROR("Unknown state set command {}", static_cast<uint16_t>(gxm_state_to_set));
+diff --git a/vita3k/renderer/src/sync.cpp b/vita3k/renderer/src/sync.cpp
+index 684c12ca..99d778e0 100644
+--- a/vita3k/renderer/src/sync.cpp
++++ b/vita3k/renderer/src/sync.cpp
+@@ -58,7 +58,20 @@ COMMAND(handle_wait_sync_object) {
+     SceGxmSyncObject *sync = helper.pop<Ptr<SceGxmSyncObject>>().get(mem);
+     const uint32_t timestamp = helper.pop<uint32_t>();
+ 
++#ifdef __PS4__
++    // A wait that only the game can end (its display callback hands a buffer back) gives way after
++    // 100 ms of the game paused: this thread draws the HENkaku menu, which never came when the game
++    // was paused in the middle of that callback (Ratchet & Clank 2 froze)
++    int paused_ms = 0;
++    while (renderer::wishlist(sync, timestamp, 10000) == renderer::SyncWaitResult::TimedOut) {
++        if (!renderer.paused.load(std::memory_order_relaxed))
++            paused_ms = 0;
++        else if ((paused_ms += 10) >= 100)
++            break;
++    }
++#else
+     renderer::wishlist(sync, timestamp);
++#endif
+ }
+ 
+ COMMAND(handle_notification) {
 diff --git a/vita3k/renderer/src/texture/cache.cpp b/vita3k/renderer/src/texture/cache.cpp
 index 955648eb..d681387d 100644
 --- a/vita3k/renderer/src/texture/cache.cpp
