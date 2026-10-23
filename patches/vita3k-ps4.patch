@@ -738,6 +738,52 @@ index 54e89f88..e3308cfc 100644
      config.enable_cycle_counting = false;
  
      return std::make_unique<Dynarmic::A32::Jit>(config);
+diff --git a/vita3k/ctrl/src/ctrl.cpp b/vita3k/ctrl/src/ctrl.cpp
+index 6183ffb4..9c2b220f 100644
+--- a/vita3k/ctrl/src/ctrl.cpp
++++ b/vita3k/ctrl/src/ctrl.cpp
+@@ -25,6 +25,31 @@
+ #include <kernel/state.h>
+ #include <util/log.h>
+ 
++#ifdef __PS4__
++#include <cmath>
++
++extern "C" bool ps4_input_log(); // ps4/ps4_settings.cpp
++
++// The input log (HENkaku > Diagnostics): the left stick as the game read it each time its direction
++// (one of 8, or the middle) changes, the first 60 times a run: whether diagonals reach the game
++static void log_stick_read(const CtrlState &state, const SceCtrlData2 &data, const bool is_peek, const bool is_v2, const bool from_ext) {
++    static int logged = 0;
++    static int last_sector = -2;
++    if (logged >= 60 || !ps4_input_log())
++        return;
++    const int dx = data.lx - 128, dy = data.ly - 128;
++    const int sector = std::max(std::abs(dx), std::abs(dy)) < 48 ? -1 : static_cast<int>(std::lround(std::atan2(-dy, dx) / 0.7853981633974483)) & 7;
++    if (sector == last_sector)
++        return;
++    last_sector = sector;
++    logged++;
++    static const char *const NAMES[] = { "east", "north-east", "north", "north-west", "west", "south-west", "south", "south-east" };
++    const SceCtrlPadInputMode mode = from_ext ? state.input_mode_ext : state.input_mode;
++    LOG_INFO("PS4 input: the game read the left stick {} ({}, {}), mode {}, by {}{}{}", sector < 0 ? "in the middle" : NAMES[sector], data.lx, data.ly,
++        static_cast<int>(mode), is_peek ? "peek" : "read", is_v2 ? " v2" : "", from_ext ? " ext" : "");
++}
++#endif
++
+ static int reserve_port(CtrlState &state) {
+     for (int i = 0; i < SCE_CTRL_MAX_WIRELESS_NUM; i++) {
+         if (state.free_ports[i]) {
+@@ -311,6 +336,9 @@ int ctrl_get(const SceUID thread_id, EmuEnvState &emuenv, int port, SceCtrlData2
+     uint64_t timestamp = std::chrono::duration_cast<std::chrono::microseconds>(ts.time_since_epoch()).count();
+     pData->timeStamp = timestamp;
+     retrieve_ctrl_data(emuenv, port, is_v2, negative, from_ext, pData->buttons, pData->lx, pData->ly, pData->rx, pData->ry);
++#ifdef __PS4__
++    log_stick_read(state, *pData, is_peek, is_v2, from_ext);
++#endif
+ 
+     for (int i = 1; i < nb_returned_data; i++) {
+         memcpy(&pData[i], &pData[0], sizeof(SceCtrlData2));
 diff --git a/vita3k/display/include/display/state.h b/vita3k/display/include/display/state.h
 index 6bf8833c..e0480df8 100644
 --- a/vita3k/display/include/display/state.h
@@ -1937,10 +1983,22 @@ index 1222b690..6697043c 100644
  SceSize get_directory_used_size(const VitaIoDevice device, const std::string &vfs_path, const fs::path &vita_fs_path);
  } // namespace vfs
 diff --git a/vita3k/io/src/io.cpp b/vita3k/io/src/io.cpp
-index 006cf39f..f13d3fab 100644
+index 006cf39f..1e6107b6 100644
 --- a/vita3k/io/src/io.cpp
 +++ b/vita3k/io/src/io.cpp
-@@ -64,9 +64,41 @@ constexpr bool log_file_stat = false;
+@@ -37,9 +37,11 @@
+ #endif
+ 
+ #include <cassert>
++#include <chrono>
+ #include <iostream>
+ #include <iterator>
+ #include <string>
++#include <thread>
+ 
+ #if defined(__aarch64__) && defined(__APPLE__)
+ #define stat64 stat
+@@ -64,9 +66,41 @@ constexpr bool log_file_stat = false;
  
  namespace vfs {
  
@@ -1983,7 +2041,7 @@ index 006cf39f..f13d3fab 100644
  }
  
  bool read_app_file(FileBuffer &buf, const fs::path &vita_fs_path, const std::string &app_path, const fs::path &vfs_file_path) {
-@@ -116,6 +148,8 @@ bool init(IOState &io, const fs::path &cache_path, const fs::path &log_path, con
+@@ -116,6 +150,8 @@ bool init(IOState &io, const fs::path &cache_path, const fs::path &log_path, con
      fs::create_directories(ux0 / "theme");
      fs::create_directories(ux0 / "video");
      fs::create_directories(ux0 / "user");
@@ -1992,6 +2050,23 @@ index 006cf39f..f13d3fab 100644
      fs::create_directories(uma0 / "data");
      fs::create_directories(vd0 / "registry");
      fs::create_directories(vd0 / "network");
+@@ -409,9 +445,16 @@ int read_file(void *data, IOState &io, const SceUID fd, const SceSize size, cons
+     const auto tty_file = io.tty_files.find(fd);
+     if (tty_file != io.tty_files.end()) {
+         if (tty_file->second == TTY_IN) {
++#ifdef __PS4__
++            // The PS4 has no terminal: nothing comes, now and then. (std::cin blocked for good, and
++            // the thread with it, so the game's exit waited forever: Ratchet & Clank 2's FluxTTY)
++            std::this_thread::sleep_for(std::chrono::milliseconds(100));
++            return 0;
++#else
+             std::cin.read(static_cast<char *>(data), size);
+             LOG_TRACE_IF(log_file_op && log_file_read, "{}: Reading terminal fd: {}, size: {}", export_name, log_hex(fd), size);
+             return size;
++#endif
+         }
+         return IO_ERROR_UNK();
+     }
 diff --git a/vita3k/io/src/state_functions.cpp b/vita3k/io/src/state_functions.cpp
 index df98d3a3..0584fc7e 100644
 --- a/vita3k/io/src/state_functions.cpp
@@ -2112,7 +2187,7 @@ index 051d616a..b205a814 100644
      SceSize size;
      SceUInt32 flags;
 diff --git a/vita3k/kernel/src/kernel.cpp b/vita3k/kernel/src/kernel.cpp
-index 97794b3d..fa68ee27 100644
+index 97794b3d..492222e3 100644
 --- a/vita3k/kernel/src/kernel.cpp
 +++ b/vita3k/kernel/src/kernel.cpp
 @@ -23,6 +23,7 @@
@@ -2183,7 +2258,24 @@ index 97794b3d..fa68ee27 100644
      const ThreadStatePtr thread = lock_and_find(thread_id, threads, mutex);
      // A deleted thread stays in threads until its host thread ends, but guest calls can't find it
      if (thread && thread->is_deleted())
-@@ -326,3 +352,58 @@ SceKernelModuleInfo *KernelState::find_module_by_addr(Address address) {
+@@ -229,7 +255,16 @@ void KernelState::process_exit() {
+     }
+ 
+     std::unique_lock<std::mutex> lock(mutex);
++#ifdef __PS4__
++    // A thread that can't end (in a host call that never returns) froze the app at a game's exit:
++    // after 5 s the ones left are logged and the exit goes on (the app starts over anyway)
++    if (!thread_deleted_cond.wait_for(lock, std::chrono::seconds(5), [this] { return threads.empty(); })) {
++        for (const auto &[id, thread] : threads)
++            LOG_WARN("Exit: the game's thread {} ({}) didn't end", thread->name, id);
++    }
++#else
+     thread_deleted_cond.wait(lock, [this] { return threads.empty(); });
++#endif
+ }
+ 
+ void KernelState::pause_threads() {
+@@ -326,3 +361,58 @@ SceKernelModuleInfo *KernelState::find_module_by_addr(Address address) {
      }
      return nullptr;
  }
@@ -13198,10 +13290,10 @@ index 00000000..4291971e
 +} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_settings.cpp b/vita3k/ps4/ps4_settings.cpp
 new file mode 100644
-index 00000000..9f17fba6
+index 00000000..20eed81a
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.cpp
-@@ -0,0 +1,715 @@
+@@ -0,0 +1,725 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -13643,6 +13735,9 @@ index 00000000..9f17fba6
 +    items.push_back(pref_choice("Freeze log", { "Off", "On" },
 +        [](const Prefs &p) { return p.freeze_log ? 1 : 0; },
 +        [](Prefs &p, int value) { p.freeze_log = value == 1; }));
++    items.push_back(pref_choice("Input log", { "Off", "On" },
++        [](const Prefs &p) { return p.input_log ? 1 : 0; },
++        [](Prefs &p, int value) { p.input_log = value == 1; }));
 +    items.push_back(pref_choice("Format log", { "Off", "On" },
 +        [](const Prefs &p) { return p.format_log ? 1 : 0; },
 +        [](Prefs &p, int value) { p.format_log = value == 1; }));
@@ -13703,6 +13798,8 @@ index 00000000..9f17fba6
 +            g_prefs.host_profiler = value == "on";
 +        else if (key == "freeze-log")
 +            g_prefs.freeze_log = value == "on";
++        else if (key == "input-log")
++            g_prefs.input_log = value == "on";
 +        else if (key == "format-log")
 +            g_prefs.format_log = value == "on";
 +        else if (key == "theme")
@@ -13731,6 +13828,7 @@ index 00000000..9f17fba6
 +    std::fprintf(f, "profiler = %s\n", g_prefs.profiler ? "on" : "off");
 +    std::fprintf(f, "renderer-profiler = %s\n", g_prefs.host_profiler ? "on" : "off");
 +    std::fprintf(f, "freeze-log = %s\n", g_prefs.freeze_log ? "on" : "off");
++    std::fprintf(f, "input-log = %s\n", g_prefs.input_log ? "on" : "off");
 +    std::fprintf(f, "format-log = %s\n", g_prefs.format_log ? "on" : "off");
 +    std::fprintf(f, "theme = %d\n", g_prefs.theme);
 +    std::fprintf(f, "moving-wallpaper = %s\n", g_prefs.moving_wallpaper ? "on" : "off");
@@ -13770,6 +13868,10 @@ index 00000000..9f17fba6
 +
 +extern "C" bool ps4_freeze_log() {
 +    return ps4settings::prefs().freeze_log;
++}
++
++extern "C" bool ps4_input_log() {
++    return ps4settings::prefs().input_log;
 +}
 +
 +extern "C" bool ps4_format_log() {
@@ -13919,10 +14021,10 @@ index 00000000..9f17fba6
 +} // namespace ps4settings
 diff --git a/vita3k/ps4/ps4_settings.h b/vita3k/ps4/ps4_settings.h
 new file mode 100644
-index 00000000..746a6340
+index 00000000..40f9a39b
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.h
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,97 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -13984,6 +14086,8 @@ index 00000000..746a6340
 +    bool host_profiler = true;
 +    // a thread stuck in one call for seconds: the call, and every thread's wait and lock holders
 +    bool freeze_log = true;
++    // the left stick as games read it, each time its direction changes (the first 60 times a run)
++    bool input_log = true;
 +    // each vertex and texture format a game uses, once
 +    bool format_log = false;
 +    // the home screen's look: a theme (its colours, theme_names()), its wave moving, and the
