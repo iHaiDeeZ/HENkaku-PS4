@@ -157,7 +157,8 @@ Change them for all games in HENkaku > Controls, or for one game in its own sett
 DualShock 4 button can be any Vita button, a PS TV button, a touch at one of nine places of the front screen or the
 rear touch pad, or nothing. **Sticks** sets their range: **Square** (the default) makes a full diagonal full on both
 axes, as on the PS2's and PS3's pads the games were made for (Ratchet & Clank needs it for diagonals); **Round** gives
-the DualShock 4's own range.
+the DualShock 4's own range. The touch pad is the front touch screen, and a circle shows where each finger is
+(HENkaku > Display > Touch markers).
 
 ## The HENkaku menu
 

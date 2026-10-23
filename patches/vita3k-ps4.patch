@@ -4526,22 +4526,24 @@ index fed99e85..cba30584 100644
  
  } // namespace ngs
 diff --git a/vita3k/overlay/CMakeLists.txt b/vita3k/overlay/CMakeLists.txt
-index 7bce266f..c18ac372 100644
+index 7bce266f..52fb7ecb 100644
 --- a/vita3k/overlay/CMakeLists.txt
 +++ b/vita3k/overlay/CMakeLists.txt
-@@ -13,6 +13,7 @@ add_library(
+@@ -13,6 +13,8 @@ add_library(
      include/overlay/input.h
      include/overlay/display_manager.h
      include/overlay/shader_compile_notice.h
 +    include/overlay/download_notice.h
++    include/overlay/touch_indicator.h
      include/overlay/perf_overlay.h
      include/overlay/trophy_notification.h
      include/overlay/common_dialog.h
-@@ -28,6 +29,7 @@ add_library(
+@@ -28,6 +30,8 @@ add_library(
      src/input.cpp
      src/display_manager.cpp
      src/shader_compile_notice.cpp
 +    src/download_notice.cpp
++    src/touch_indicator.cpp
      src/perf_overlay.cpp
      src/trophy_notification.cpp
      src/common_dialog.cpp
@@ -4775,6 +4777,58 @@ index 6c5147b7..404c7c97 100644
      static constexpr color4f k_color_focus_ring{ 0.180f, 0.765f, 0.878f, 1.f };
      static constexpr uint8_t k_focus_ring_thickness = 2;
  };
+diff --git a/vita3k/overlay/include/overlay/touch_indicator.h b/vita3k/overlay/include/overlay/touch_indicator.h
+new file mode 100644
+index 00000000..b318564f
+--- /dev/null
++++ b/vita3k/overlay/include/overlay/touch_indicator.h
+@@ -0,0 +1,46 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#pragma once
++
++#include <overlay/controls.h>
++#include <overlay/overlay.h>
++
++#include <array>
++
++namespace overlay {
++
++// PS4: where the fingers are on the front screen (the DualShock 4's touch pad shows no picture of
++// its own): a soft circle on each, as a finger on a PS Vita's screen
++struct touch_indicator : public overlay {
++    touch_indicator();
++
++    // up to 4 points, x and y from 0 to 1 of the screen
++    void set_points(const float *xy, int count);
++
++    compiled_resource get_compiled() override;
++
++private:
++    static constexpr int k_max_points = 4;
++    static constexpr uint16_t k_outer = 34; // across, in virtual pixels
++    static constexpr uint16_t k_inner = 22;
++    std::array<ellipse, k_max_points> m_outer;
++    std::array<ellipse, k_max_points> m_inner;
++    int m_count = 0;
++};
++
++} // namespace overlay
 diff --git a/vita3k/overlay/src/common_dialog.cpp b/vita3k/overlay/src/common_dialog.cpp
 index 9490418e..83cb3b59 100644
 --- a/vita3k/overlay/src/common_dialog.cpp
@@ -5589,6 +5643,67 @@ index b5b30616..f0e13b5d 100644
              m_avg_fps, m_min_fps, m_max_fps,
              m_ram_used / MiB(1));
          break;
+diff --git a/vita3k/overlay/src/touch_indicator.cpp b/vita3k/overlay/src/touch_indicator.cpp
+new file mode 100644
+index 00000000..b1fe7e79
+--- /dev/null
++++ b/vita3k/overlay/src/touch_indicator.cpp
+@@ -0,0 +1,55 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#include <overlay/touch_indicator.h>
++
++#include <algorithm>
++
++namespace overlay {
++
++touch_indicator::touch_indicator() {
++    visible = true;
++    for (int i = 0; i < k_max_points; i++) {
++        m_outer[i].back_color = { 1.f, 1.f, 1.f, 0.45f };
++        m_outer[i].set_size(k_outer, k_outer);
++        m_inner[i].back_color = { 0.f, 0.f, 0.f, 0.25f };
++        m_inner[i].set_size(k_inner, k_inner);
++    }
++}
++
++void touch_indicator::set_points(const float *xy, const int count) {
++    m_count = std::clamp(count, 0, k_max_points);
++    for (int i = 0; i < m_count; i++) {
++        const float x = std::clamp(xy[i * 2], 0.f, 1.f) * virtual_width;
++        const float y = std::clamp(xy[i * 2 + 1], 0.f, 1.f) * virtual_height;
++        m_outer[i].set_pos(static_cast<int16_t>(x - k_outer / 2), static_cast<int16_t>(y - k_outer / 2));
++        m_inner[i].set_pos(static_cast<int16_t>(x - k_inner / 2), static_cast<int16_t>(y - k_inner / 2));
++    }
++}
++
++compiled_resource touch_indicator::get_compiled() {
++    compiled_resource result;
++    if (!visible)
++        return result;
++    for (int i = 0; i < m_count; i++) {
++        result.add(m_outer[i].get_compiled());
++        result.add(m_inner[i].get_compiled());
++    }
++    return result;
++}
++
++} // namespace overlay
 diff --git a/vita3k/packages/CMakeLists.txt b/vita3k/packages/CMakeLists.txt
 index f3985580..396d151a 100644
 --- a/vita3k/packages/CMakeLists.txt
@@ -13334,10 +13449,10 @@ index 00000000..4291971e
 +} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_settings.cpp b/vita3k/ps4/ps4_settings.cpp
 new file mode 100644
-index 00000000..20eed81a
+index 00000000..4c9ead8e
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.cpp
-@@ -0,0 +1,725 @@
+@@ -0,0 +1,741 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -13637,6 +13752,7 @@ index 00000000..20eed81a
 +}
 +
 +Item frame_generation_choice();
++Item touch_markers_choice();
 +
 +std::vector<Item> display_items(EmuEnvState &emuenv, const std::shared_ptr<Scope> &scope, bool global) {
 +    std::vector<Item> items;
@@ -13650,6 +13766,7 @@ index 00000000..20eed81a
 +    if (global) {
 +        items.push_back(fsr_sharpness(emuenv));
 +        items.push_back(frame_generation_choice());
++        items.push_back(touch_markers_choice());
 +    }
 +    items.push_back(choice<int>(scope, "Texture filtering", { "Standard", "2x", "4x", "8x", "16x" }, { 1, 2, 4, 8, 16 }, &Config::CurrentConfig::anisotropic_filtering));
 +    return items;
@@ -13714,6 +13831,12 @@ index 00000000..20eed81a
 +    return pref_choice("Frame generation", { "Off", "On" },
 +        [](const Prefs &p) { return p.frame_generation ? 1 : 0; },
 +        [](Prefs &p, int value) { p.frame_generation = value == 1; });
++}
++
++Item touch_markers_choice() {
++    return pref_choice("Touch markers", { "Off", "On" },
++        [](const Prefs &p) { return p.touch_markers ? 1 : 0; },
++        [](Prefs &p, int value) { p.touch_markers = value == 1; });
 +}
 +
 +Item frame_queue_choice() {
@@ -13834,6 +13957,8 @@ index 00000000..20eed81a
 +            g_prefs.frame_overlap = value != "vita3k";
 +        else if (key == "frame-generation")
 +            g_prefs.frame_generation = value == "on";
++        else if (key == "touch-markers")
++            g_prefs.touch_markers = value == "on";
 +        else if (key == "vita-cores")
 +            g_prefs.vita_cores = value != "parallel";
 +        else if (key == "profiler")
@@ -13869,6 +13994,7 @@ index 00000000..20eed81a
 +    std::fprintf(f, "frame-queue = %s\n", g_prefs.frame_overlap ? "vita" : "vita3k");
 +    std::fprintf(f, "vita-cores = %s\n", g_prefs.vita_cores ? "vita" : "parallel");
 +    std::fprintf(f, "frame-generation = %s\n", g_prefs.frame_generation ? "on" : "off");
++    std::fprintf(f, "touch-markers = %s\n", g_prefs.touch_markers ? "on" : "off");
 +    std::fprintf(f, "profiler = %s\n", g_prefs.profiler ? "on" : "off");
 +    std::fprintf(f, "renderer-profiler = %s\n", g_prefs.host_profiler ? "on" : "off");
 +    std::fprintf(f, "freeze-log = %s\n", g_prefs.freeze_log ? "on" : "off");
@@ -13889,6 +14015,10 @@ index 00000000..20eed81a
 +// SceGxm (sceGxmDisplayQueueAddEntry) asks
 +extern "C" bool ps4_frame_generation() {
 +    return ps4settings::prefs().frame_generation;
++}
++
++extern "C" bool ps4_touch_markers() {
++    return ps4settings::prefs().touch_markers;
 +}
 +
 +// frame generation is making in-between frames now (renderer.cpp): the FPS overlay's "on screen"
@@ -14027,6 +14157,7 @@ index 00000000..20eed81a
 +    display.push_back(choice<std::string>(live, "Screen filter", FILTER_NAMES, FILTERS, &Config::CurrentConfig::screen_filter));
 +    display.push_back(fsr_sharpness(emuenv));
 +    display.push_back(frame_generation_choice());
++    display.push_back(touch_markers_choice());
 +    display.push_back(choice<int>(live, "Texture filtering", { "Standard", "2x", "4x", "8x", "16x" }, { 1, 2, 4, 8, 16 }, &Config::CurrentConfig::anisotropic_filtering));
 +
 +    std::vector<Item> sound;
@@ -14065,10 +14196,10 @@ index 00000000..20eed81a
 +} // namespace ps4settings
 diff --git a/vita3k/ps4/ps4_settings.h b/vita3k/ps4/ps4_settings.h
 new file mode 100644
-index 00000000..40f9a39b
+index 00000000..b89113ce
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.h
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,99 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -14120,6 +14251,8 @@ index 00000000..40f9a39b
 +    // frame generation: in-between frames for games at 30 to 40 fps, which the screen then shows at
 +    // 60 (renderer/vulkan/frame_generation.h); a vblank more of delay
 +    bool frame_generation = false;
++    // a circle where each finger is on the front screen (the touch pad shows no picture)
++    bool touch_markers = true;
 +    // the threads a game pins to one Vita core run one at a time, switching when one blocks, as on
 +    // the Vita (some games deadlock when they run side by side), or all side by side
 +    bool vita_cores = true;
@@ -15436,10 +15569,10 @@ index 3860cced..17284694 100644
      void refresh_available_textures();
 diff --git a/vita3k/renderer/include/renderer/vulkan/frame_generation.h b/vita3k/renderer/include/renderer/vulkan/frame_generation.h
 new file mode 100644
-index 00000000..283ee3fa
+index 00000000..87777396
 --- /dev/null
 +++ b/vita3k/renderer/include/renderer/vulkan/frame_generation.h
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,135 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -15570,6 +15703,8 @@ index 00000000..283ee3fa
 +    // are put on that point (the few ms they move around it are the game's work, not its motion)
 +    bool steady = false;
 +    double latency = 0.0;
++    // the game gives about a frame a vblank: its newest is shown as it is (image_for)
++    bool full_rate = false;
 +};
 +
 +} // namespace renderer::vulkan
@@ -16107,29 +16242,32 @@ index c92e2983..42bd7c26 100644
          glBindTexture(GL_TEXTURE_2D, info.gl_ping_pong_texture[0]);
      }
 diff --git a/vita3k/renderer/src/renderer.cpp b/vita3k/renderer/src/renderer.cpp
-index 24a868b9..17b7f4ad 100644
+index 24a868b9..f89215a6 100644
 --- a/vita3k/renderer/src/renderer.cpp
 +++ b/vita3k/renderer/src/renderer.cpp
-@@ -26,6 +26,7 @@
+@@ -26,6 +26,8 @@
  #include <overlay/font.h>
  #include <overlay/pause_overlay.h>
  #include <overlay/perf_overlay.h>
 +#include <overlay/download_notice.h>
++#include <overlay/touch_indicator.h>
  #include <overlay/shader_compile_notice.h>
  #include <renderer/gl/state.h>
  #include <renderer/gl/types.h>
-@@ -34,6 +35,10 @@
+@@ -34,6 +36,12 @@
  #include <gxm/functions.h>
  #include <util/log.h>
  
 +#ifdef __PS4__
 +std::string ps4_bgdl_notice(); // vita3k/ps4/ps4_bgdl.cpp
++extern "C" int ps4_touch_front(float *xy, int max); // touch/src/touch.cpp
++extern "C" bool ps4_touch_markers(); // vita3k/ps4/ps4_settings.cpp
 +#endif
 +
  namespace renderer {
  
  // The higher on this list the higher the priority of input
-@@ -76,6 +81,21 @@ void State::update_overlays() {
+@@ -76,6 +84,34 @@ void State::update_overlays() {
          }
      }
  
@@ -16144,6 +16282,19 @@ index 24a868b9..17b7f4ad 100644
 +            notice->set_text(text);
 +        } else if (notice) {
 +            overlay_manager->remove<overlay::download_notice>();
++        }
++    }
++    // where the fingers are on the front screen (HENkaku > Display > Touch markers)
++    {
++        float xy[8];
++        const int count = ps4_touch_markers() ? ps4_touch_front(xy, 4) : 0;
++        auto markers = overlay_manager->get<overlay::touch_indicator>();
++        if (count > 0) {
++            if (!markers)
++                markers = overlay_manager->create<overlay::touch_indicator>();
++            markers->set_points(xy, count);
++        } else if (markers) {
++            overlay_manager->remove<overlay::touch_indicator>();
 +        }
 +    }
 +#endif
@@ -16638,10 +16789,10 @@ index d89da55d..ebae243d 100644
          std::fill_n(vertex_stream_buffers, SCE_GXM_MAX_VERTEX_STREAMS, state.default_buffer.buffer);
 diff --git a/vita3k/renderer/src/vulkan/frame_generation.cpp b/vita3k/renderer/src/vulkan/frame_generation.cpp
 new file mode 100644
-index 00000000..573d60bc
+index 00000000..5a9e95c7
 --- /dev/null
 +++ b/vita3k/renderer/src/vulkan/frame_generation.cpp
-@@ -0,0 +1,546 @@
+@@ -0,0 +1,552 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -17092,12 +17243,18 @@ index 00000000..573d60bc
 +            order[count++] = i;
 +    }
 +
++    // A game giving about a frame a vblank (48 fps and up) needs none made between two: its newest
++    // is shown at once. (Its late frames were filled with made ones, split where two blocks' motions
++    // met: Uncharted's menu at 59 fps.)
++    full_rate = interval < (full_rate ? 1.3 : 1.2);
 +    // the moment shown: the frame of that moment, or one made between the two around it
-+    const double moment = vblank - latency_for_screen();
++    const double moment = full_rate ? 0.0 : vblank - latency_for_screen();
 +    int show = order[count - 1]; // past the newest (the next frame is late): the newest
 +    int first = -1, second = -1;
 +    double phase = 0.0;
-+    if (moment <= history[order[0]].time) {
++    if (full_rate) {
++        // (the newest, as it is)
++    } else if (moment <= history[order[0]].time) {
 +        show = order[0];
 +    } else {
 +        for (int k = 0; k + 1 < count; k++) {
@@ -19736,7 +19893,7 @@ index 043c2c78..ffc8d726 100644
 +void ps4_set_touches(TouchState &state, const std::vector<Ps4TouchPoint> (&points)[2]);
 +#endif
 diff --git a/vita3k/touch/src/touch.cpp b/vita3k/touch/src/touch.cpp
-index ec982f49..5526466f 100644
+index ec982f49..4106329f 100644
 --- a/vita3k/touch/src/touch.cpp
 +++ b/vita3k/touch/src/touch.cpp
 @@ -27,7 +27,9 @@
@@ -19749,7 +19906,7 @@ index ec982f49..5526466f 100644
  
  void set_rear_touchscreen(TouchState &state, bool is_back) {
      state.touchscreen_port = static_cast<SceTouchPortType>(is_back);
-@@ -89,10 +91,49 @@ static SceTouchData recover_touchpad_events(const EmuEnvState &emuenv) {
+@@ -89,10 +91,63 @@ static SceTouchData recover_touchpad_events(const EmuEnvState &emuenv) {
      return touch_data;
  }
  
@@ -19763,6 +19920,20 @@ index ec982f49..5526466f 100644
 +    const std::lock_guard<std::mutex> lock(ps4_touch_mutex);
 +    ps4_touch_points[0] = points[0];
 +    ps4_touch_points[1] = points[1];
++}
++
++// The front screen's fingers for the touch markers (renderer.cpp): x, y pairs, at most `max`
++extern "C" int ps4_touch_front(float *xy, const int max) {
++    const std::lock_guard<std::mutex> lock(ps4_touch_mutex);
++    int count = 0;
++    for (const Ps4TouchPoint &point : ps4_touch_points[0]) {
++        if (count >= max)
++            break;
++        xy[count * 2] = point.x;
++        xy[count * 2 + 1] = point.y;
++        count++;
++    }
++    return count;
 +}
 +#endif
 +
