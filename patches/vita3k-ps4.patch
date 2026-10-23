@@ -7558,7 +7558,7 @@ index 00000000..6f5ad8c6
 +} // namespace ps4ui
 diff --git a/vita3k/ps4/ps4_controls.cpp b/vita3k/ps4/ps4_controls.cpp
 new file mode 100644
-index 00000000..22b4ca32
+index 00000000..492d1957
 --- /dev/null
 +++ b/vita3k/ps4/ps4_controls.cpp
 @@ -0,0 +1,319 @@
@@ -7620,7 +7620,7 @@ index 00000000..22b4ca32
 +const float PLACES[9][2] = { { 0.5f, 0.5f }, { 0.2f, 0.5f }, { 0.8f, 0.5f }, { 0.5f, 0.2f }, { 0.5f, 0.8f }, { 0.2f, 0.2f }, { 0.8f, 0.2f },
 +    { 0.2f, 0.8f }, { 0.8f, 0.8f } };
 +
-+const char *const TOUCHPAD_NAMES[TouchpadUseCount] = { "Front", "Rear", "Both halves", "Off", "Pointer" };
++const char *const TOUCHPAD_NAMES[TouchpadUseCount] = { "Direct", "Rear", "Both halves", "Off", "Hover" };
 +const char *const TOUCHPAD_KEYS[TouchpadUseCount] = { "front", "back", "split", "off", "pointer" };
 +const char *const STICKS_NAMES[SticksRangeCount] = { "Square", "Round (the DS4's)" };
 +const char *const STICKS_KEYS[SticksRangeCount] = { "square", "round" };
@@ -13548,10 +13548,10 @@ index 00000000..4291971e
 +} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_settings.cpp b/vita3k/ps4/ps4_settings.cpp
 new file mode 100644
-index 00000000..85946125
+index 00000000..01fb8765
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.cpp
-@@ -0,0 +1,748 @@
+@@ -0,0 +1,759 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -13882,6 +13882,10 @@ index 00000000..85946125
 +        items.push_back(pref_choice("GPU compression", { "Off", "On" },
 +            [](const Prefs &p) { return p.gpu_compression ? 1 : 0; },
 +            [](Prefs &p, int value) { p.gpu_compression = value == 1; }, next_start));
++    if (global)
++        items.push_back(pref_choice("Ordered blending", { "Off", "On" },
++            [](const Prefs &p) { return p.ordered_blending ? 1 : 0; },
++            [](Prefs &p, int value) { p.ordered_blending = value == 1; }));
 +    items.push_back(section("Shaders and textures"));
 +    items.push_back(choice<bool>(scope, "Shader compiling", { "Background", "Before drawing" }, { true, false }, &Config::CurrentConfig::async_pipeline_compilation));
 +    if (global)
@@ -14064,6 +14068,8 @@ index 00000000..85946125
 +            g_prefs.touch_markers = value == "on";
 +        else if (key == "gpu-compression")
 +            g_prefs.gpu_compression = value == "on";
++        else if (key == "ordered-blending")
++            g_prefs.ordered_blending = value == "on";
 +        else if (key == "vita-cores")
 +            g_prefs.vita_cores = value != "parallel";
 +        else if (key == "profiler")
@@ -14101,6 +14107,7 @@ index 00000000..85946125
 +    std::fprintf(f, "frame-generation = %s\n", g_prefs.frame_generation ? "on" : "off");
 +    std::fprintf(f, "touch-markers = %s\n", g_prefs.touch_markers ? "on" : "off");
 +    std::fprintf(f, "gpu-compression = %s\n", g_prefs.gpu_compression ? "on" : "off");
++    std::fprintf(f, "ordered-blending = %s\n", g_prefs.ordered_blending ? "on" : "off");
 +    std::fprintf(f, "profiler = %s\n", g_prefs.profiler ? "on" : "off");
 +    std::fprintf(f, "renderer-profiler = %s\n", g_prefs.host_profiler ? "on" : "off");
 +    std::fprintf(f, "freeze-log = %s\n", g_prefs.freeze_log ? "on" : "off");
@@ -14125,6 +14132,10 @@ index 00000000..85946125
 +
 +extern "C" bool ps4_touch_markers() {
 +    return ps4settings::prefs().touch_markers;
++}
++
++extern "C" bool ps4_ordered_blending() {
++    return ps4settings::prefs().ordered_blending;
 +}
 +
 +// frame generation is making in-between frames now (renderer.cpp): the FPS overlay's "on screen"
@@ -14302,10 +14313,10 @@ index 00000000..85946125
 +} // namespace ps4settings
 diff --git a/vita3k/ps4/ps4_settings.h b/vita3k/ps4/ps4_settings.h
 new file mode 100644
-index 00000000..875fc7ef
+index 00000000..c40f8597
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.h
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,103 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -14361,6 +14372,8 @@ index 00000000..875fc7ef
 +    bool touch_markers = true;
 +    // AMD's tile compression of depth (HiZ) and colour fast clears (ps4_main.cpp: RADV_DEBUG)
 +    bool gpu_compression = false;
++    // a draw reading the framebuffer drawn a primitive at a time (renderer/vulkan/scene.cpp)
++    bool ordered_blending = true;
 +    // the threads a game pins to one Vita core run one at a time, switching when one blocks, as on
 +    // the Vita (some games deadlock when they run side by side), or all side by side
 +    bool vita_cores = true;
@@ -17826,7 +17839,7 @@ index ed8c71ad..7ebc233b 100644
          dispatch.init();
  #endif
 diff --git a/vita3k/renderer/src/vulkan/scene.cpp b/vita3k/renderer/src/vulkan/scene.cpp
-index acd85ab5..0ce23524 100644
+index acd85ab5..4d921872 100644
 --- a/vita3k/renderer/src/vulkan/scene.cpp
 +++ b/vita3k/renderer/src/vulkan/scene.cpp
 @@ -19,6 +19,10 @@
@@ -17882,7 +17895,48 @@ index acd85ab5..0ce23524 100644
                  context.vertex_stream_offsets[i] = context.vertex_stream_ring_buffer.data_offset;
  
  #ifdef __APPLE__
-@@ -469,6 +491,10 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
+@@ -394,6 +416,10 @@ static OrderedMaskIndices prepare_ordered_mask_indices(VKContext &context, SceGx
+     return { buffer, 0, output_count };
+ }
+ 
++#ifdef __PS4__
++extern "C" bool ps4_ordered_blending(); // vita3k/ps4/ps4_settings.cpp
++#endif
++
+ static void framebuffer_fetch_barrier(VKContext &context) {
+     const vk::MemoryBarrier barrier{
+         .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+@@ -417,7 +443,28 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
+         && context.record.front_side_fragment_program_mode != SCE_GXM_FRAGMENT_PROGRAM_DISABLED && !fragment_program_gxp.has_no_effect();
+     const bool masked_fetch = uses_framebuffer_fetch && context.state.features.should_use_shader_interlock()
+         && context.state.features.use_mask_bit && context.render_target->mask_may_reject;
+-    const bool ordered_fetch = masked_fetch && !context.state.support_rasterized_order_access;
++    bool ordered_fetch = masked_fetch && !context.state.support_rasterized_order_access;
++#ifdef __PS4__
++    // PS4 (GCN 1.1: neither fragment shader interlock nor rasterization-order attachment access): a
++    // draw reading the framebuffer (programmable blending) has its primitives drawn one at a time, a
++    // barrier before each, or overlapping ones race and leave tiles and streaks of garbage (Uncharted's
++    // waterfall and explosions, as on AMD GPUs everywhere). Up to 512 primitives a draw (HENkaku >
++    // Graphics > Ordered blending)
++    if (!ordered_fetch && uses_framebuffer_fetch && context.state.features.direct_fragcolor
++        && !context.state.support_rasterized_order_access && ps4_ordered_blending()) {
++        const size_t primitives = (type == SCE_GXM_PRIMITIVE_TRIANGLE_STRIP || type == SCE_GXM_PRIMITIVE_TRIANGLE_FAN) ? (count > 2 ? count - 2 : 0)
++            : type == SCE_GXM_PRIMITIVE_LINES                                                                      ? count / 2
++            : type == SCE_GXM_PRIMITIVE_POINTS                                                                     ? count
++                                                                                                                   : count / 3;
++        if (primitives * instance_count <= 512) {
++            ordered_fetch = primitives * instance_count > 1;
++            if (ordered_fetch)
++                LOG_INFO_ONCE("PS4: draws reading the framebuffer are drawn a primitive at a time (this GPU has no rasterization order)");
++        } else {
++            LOG_INFO_ONCE("PS4: a draw reading the framebuffer has {} primitives: left in one piece", primitives * instance_count);
++        }
++    }
++#endif
+     if (context.shader_hints.masked_framebuffer_fetch != masked_fetch) {
+         context.shader_hints.masked_framebuffer_fetch = masked_fetch;
+         context.refresh_pipeline = true;
+@@ -469,6 +516,10 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
          context.begin_visibility_query();
      }
  
@@ -17893,7 +17947,7 @@ index acd85ab5..0ce23524 100644
      // do we need to check for a pipeline change?
      if (context.refresh_pipeline || type != context.last_primitive) {
          context.refresh_pipeline = false;
-@@ -501,6 +527,9 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
+@@ -501,6 +552,9 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
      }
  
      const bool use_memory_mapping = context.state.features.enable_memory_mapping;
@@ -17903,7 +17957,7 @@ index acd85ab5..0ce23524 100644
  
      // update uniforms if needed
      // first update the buffer and texture count
-@@ -549,8 +578,14 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
+@@ -549,8 +603,14 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
          memcpy(&context.prev_frag_ublock, &frag_ublock, sizeof(frag_ublock));
      }
  
@@ -17918,7 +17972,7 @@ index acd85ab5..0ce23524 100644
  
      // Upload index data.
      vk::IndexType index_type = (format == SCE_GXM_INDEX_FORMAT_U16) ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
-@@ -576,12 +611,50 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
+@@ -576,12 +636,50 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
          context.render_cmd.bindIndexBuffer(buffer, offset, index_type);
      } else if (!ordered_indices) {
          const size_t index_buffer_size = index_size * count;

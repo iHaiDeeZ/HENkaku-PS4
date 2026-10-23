@@ -159,11 +159,14 @@ rear touch pad, or nothing. **Sticks** sets their range: **Square** (the default
 axes, as on the PS2's and PS3's pads the games were made for (Ratchet & Clank needs it for diagonals); **Round** gives
 the DualShock 4's own range.
 
-The touch pad is a **pointer** on the front screen (**Touch pad**: Pointer, the default): your finger moves it as on
-a laptop's touch pad (lifting the finger leaves it where it is), a **tap** touches the screen where it is, and a tap
-then your finger down again and moving drags a touch (a swipe). A ring shows the pointer, filled while it touches
-(HENkaku > Display > Touch markers). **Front** makes the touch pad the screen itself instead (where you touch is
-where it touches, with two fingers too).
+The touch pad has two modes (**Touch pad**, for all games or one, also in the HENkaku menu's Controls):
+
+- **Hover** (the default): your finger moves a pointer as on a laptop's touch pad (lifting it leaves the pointer
+  where it is), a **tap** touches the screen there, and a tap then your finger down again and moving drags a touch
+  (a swipe). A ring shows the pointer, filled while it touches.
+- **Direct**: the touch pad is the screen itself: where you touch is where it touches, with two fingers too.
+
+The rings can be turned off in HENkaku > Display > Touch markers.
 
 ## The HENkaku menu
 
