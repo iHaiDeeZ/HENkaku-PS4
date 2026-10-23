@@ -43,6 +43,35 @@ index 2d6d6ea6..29ce6995 100644
      if (sigaction(SIGBUS, &sa, &old_sa_bus) != 0) {
          fmt::print(stderr, "dynarmic: POSIX SigHandler: could not set SIGBUS handler\n");
          supports_fast_mem = false;
+diff --git a/src/dynarmic/backend/x64/a32_emit_x64.cpp b/src/dynarmic/backend/x64/a32_emit_x64.cpp
+index fc8e8bae..63770c07 100644
+--- a/src/dynarmic/backend/x64/a32_emit_x64.cpp
++++ b/src/dynarmic/backend/x64/a32_emit_x64.cpp
+@@ -755,8 +755,12 @@ void A32EmitX64::EmitA32CallSupervisor(A32EmitContext& ctx, IR::Inst* inst) {
+         Devirtualize<&A32::UserCallbacks::GetTicksRemaining>(conf.callbacks).EmitCall(code);
+         code.mov(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_to_run)], code.ABI_RETURN);
+         code.mov(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], code.ABI_RETURN);
+-        code.SwitchMxcsrOnEntry();
+     }
++    // Back to the guest's MXCSR in every case (it was only with cycle counting): the code after a
++    // call that doesn't halt (HENkaku's fast imports) runs with it, and a halt's way out saves it
++    // once. It ran with the host's after every call, and the halt saved the host's over the guest's:
++    // the game's flush-to-zero (FPSCR.FZ) was lost at its first import.
++    code.SwitchMxcsrOnEntry();
+ }
+ 
+ void A32EmitX64::EmitA32ExceptionRaised(A32EmitContext& ctx, IR::Inst* inst) {
+@@ -783,8 +787,9 @@ void A32EmitX64::EmitA32ExceptionRaised(A32EmitContext& ctx, IR::Inst* inst) {
+         Devirtualize<&A32::UserCallbacks::GetTicksRemaining>(conf.callbacks).EmitCall(code);
+         code.mov(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_to_run)], code.ABI_RETURN);
+         code.mov(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], code.ABI_RETURN);
+-        code.SwitchMxcsrOnEntry();
+     }
++    // (as after a supervisor call: the guest's MXCSR back in every case)
++    code.SwitchMxcsrOnEntry();
+ }
+ 
+ static u32 GetFpscrImpl(A32JitState* jit_state) {
 diff --git a/src/dynarmic/backend/x64/block_of_code.cpp b/src/dynarmic/backend/x64/block_of_code.cpp
 index 22d9868f..ef435fe5 100644
 --- a/src/dynarmic/backend/x64/block_of_code.cpp
@@ -217,4 +246,164 @@ index 3f7573af..b4463440 100644
 +#if defined(_WIN32) || defined(__PS4__)
      size_t committed_size = 0;
  #endif
+ 
+diff --git a/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h b/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h
+index 44ac2450..235ffa15 100644
+--- a/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h
++++ b/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h
+@@ -42,6 +42,17 @@ struct TranslatorVisitor final {
+     bool DecodeError();
+     bool RaiseException(Exception exception);
+ 
++    // Whether a hint instruction goes to the host (options.hook_hint_instructions). PS4 (HENkaku): WFI
++    // only, Vita3K's halt sentinel. Vita3K does nothing for the others, and each one hooked ended its
++    // block with a call out and a dispatcher lookup: a PLD in every turn of a copy loop cost both.
++    bool HooksHint([[maybe_unused]] bool wfi) const {
++#ifdef __PS4__
++        return options.hook_hint_instructions && wfi;
++#else
++        return options.hook_hint_instructions;
++#endif
++    }
++
+     struct ImmAndCarry {
+         u32 imm32;
+         IR::U1 carry;
+diff --git a/src/dynarmic/frontend/A32/translate/impl/hint.cpp b/src/dynarmic/frontend/A32/translate/impl/hint.cpp
+index 0ec6aeff..fdf5363f 100644
+--- a/src/dynarmic/frontend/A32/translate/impl/hint.cpp
++++ b/src/dynarmic/frontend/A32/translate/impl/hint.cpp
+@@ -9,7 +9,7 @@
+ namespace Dynarmic::A32 {
+ 
+ bool TranslatorVisitor::arm_PLD_imm(bool /*add*/, bool R, Reg /*n*/, Imm<12> /*imm12*/) {
+-    if (!options.hook_hint_instructions) {
++    if (!HooksHint(false)) {
+         return true;
+     }
+ 
+@@ -18,7 +18,7 @@ bool TranslatorVisitor::arm_PLD_imm(bool /*add*/, bool R, Reg /*n*/, Imm<12> /*i
+ }
+ 
+ bool TranslatorVisitor::arm_PLD_reg(bool /*add*/, bool R, Reg /*n*/, Imm<5> /*imm5*/, ShiftType /*shift*/, Reg /*m*/) {
+-    if (!options.hook_hint_instructions) {
++    if (!HooksHint(false)) {
+         return true;
+     }
+ 
+@@ -27,7 +27,7 @@ bool TranslatorVisitor::arm_PLD_reg(bool /*add*/, bool R, Reg /*n*/, Imm<5> /*im
+ }
+ 
+ bool TranslatorVisitor::arm_SEV() {
+-    if (!options.hook_hint_instructions) {
++    if (!HooksHint(false)) {
+         return true;
+     }
+ 
+@@ -35,7 +35,7 @@ bool TranslatorVisitor::arm_SEV() {
+ }
+ 
+ bool TranslatorVisitor::arm_SEVL() {
+-    if (!options.hook_hint_instructions) {
++    if (!HooksHint(false)) {
+         return true;
+     }
+ 
+@@ -43,7 +43,7 @@ bool TranslatorVisitor::arm_SEVL() {
+ }
+ 
+ bool TranslatorVisitor::arm_WFE() {
+-    if (!options.hook_hint_instructions) {
++    if (!HooksHint(false)) {
+         return true;
+     }
+ 
+@@ -51,7 +51,7 @@ bool TranslatorVisitor::arm_WFE() {
+ }
+ 
+ bool TranslatorVisitor::arm_WFI() {
+-    if (!options.hook_hint_instructions) {
++    if (!HooksHint(true)) {
+         return true;
+     }
+ 
+@@ -59,7 +59,7 @@ bool TranslatorVisitor::arm_WFI() {
+ }
+ 
+ bool TranslatorVisitor::arm_YIELD() {
+-    if (!options.hook_hint_instructions) {
++    if (!HooksHint(false)) {
+         return true;
+     }
+ 
+diff --git a/src/dynarmic/frontend/A32/translate/impl/thumb16.cpp b/src/dynarmic/frontend/A32/translate/impl/thumb16.cpp
+index 67a94a0e..cac058d2 100644
+--- a/src/dynarmic/frontend/A32/translate/impl/thumb16.cpp
++++ b/src/dynarmic/frontend/A32/translate/impl/thumb16.cpp
+@@ -639,7 +639,7 @@ bool TranslatorVisitor::thumb16_SUB_sp(Imm<7> imm7) {
+ 
+ // SEV<c>
+ bool TranslatorVisitor::thumb16_SEV() {
+-    if (!options.hook_hint_instructions) {
++    if (!HooksHint(false)) {
+         return true;
+     }
+     return RaiseException(Exception::SendEvent);
+@@ -647,7 +647,7 @@ bool TranslatorVisitor::thumb16_SEV() {
+ 
+ // SEVL<c>
+ bool TranslatorVisitor::thumb16_SEVL() {
+-    if (!options.hook_hint_instructions) {
++    if (!HooksHint(false)) {
+         return true;
+     }
+     return RaiseException(Exception::SendEventLocal);
+@@ -655,7 +655,7 @@ bool TranslatorVisitor::thumb16_SEVL() {
+ 
+ // WFE<c>
+ bool TranslatorVisitor::thumb16_WFE() {
+-    if (!options.hook_hint_instructions) {
++    if (!HooksHint(false)) {
+         return true;
+     }
+     return RaiseException(Exception::WaitForEvent);
+@@ -663,7 +663,7 @@ bool TranslatorVisitor::thumb16_WFE() {
+ 
+ // WFI<c>
+ bool TranslatorVisitor::thumb16_WFI() {
+-    if (!options.hook_hint_instructions) {
++    if (!HooksHint(true)) {
+         return true;
+     }
+     return RaiseException(Exception::WaitForInterrupt);
+@@ -671,7 +671,7 @@ bool TranslatorVisitor::thumb16_WFI() {
+ 
+ // YIELD<c>
+ bool TranslatorVisitor::thumb16_YIELD() {
+-    if (!options.hook_hint_instructions) {
++    if (!HooksHint(false)) {
+         return true;
+     }
+     return RaiseException(Exception::Yield);
+diff --git a/src/dynarmic/frontend/A32/translate/impl/thumb32_load_byte.cpp b/src/dynarmic/frontend/A32/translate/impl/thumb32_load_byte.cpp
+index 42b2ebf4..6783bec3 100644
+--- a/src/dynarmic/frontend/A32/translate/impl/thumb32_load_byte.cpp
++++ b/src/dynarmic/frontend/A32/translate/impl/thumb32_load_byte.cpp
+@@ -8,7 +8,7 @@
+ 
+ namespace Dynarmic::A32 {
+ static bool PLDHandler(TranslatorVisitor& v, bool W) {
+-    if (!v.options.hook_hint_instructions) {
++    if (!v.HooksHint(false)) {
+         return true;
+     }
+ 
+@@ -18,7 +18,7 @@ static bool PLDHandler(TranslatorVisitor& v, bool W) {
+ }
+ 
+ static bool PLIHandler(TranslatorVisitor& v) {
+-    if (!v.options.hook_hint_instructions) {
++    if (!v.HooksHint(false)) {
+         return true;
+     }
  

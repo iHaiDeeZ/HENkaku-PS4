@@ -8,8 +8,10 @@ PSB="${PSB:-$HOME/vita3k-build}"
 mkdir -p "$PSB/src" "$PSB/build" "$PSB/out" "$PSB/logs" "$PSB/oelf"
 [ -d "$PSB/sysroot" ] || cp -a "$M33/sysroot" "$PSB/sysroot"
 [ -d "$PSB/host-compat" ] || cp -a "$M33/host-compat" "$PSB/host-compat"
-# Mesa: the whole build directory (its static libraries are thin archives)
-[ -d "$PSB/build/mesa" ] || cp -a "$M33/build/mesa" "$PSB/build/mesa"
+# Mesa: the whole build directory (its static libraries are thin archives). Since 1.08 the newer PS4
+# RADV of Crema's tree (as TOTK's, Oct 17: GPU submissions on their own thread), not M33's (Oct 6)
+MESA="${MESA:-$HOME/totk-build/build/mesa}"
+[ -d "$PSB/build/mesa" ] || cp -a "$MESA" "$PSB/build/mesa"
 # The PS4's signal context layout in the libc overlay (dynarmic's and Vita3K's fault handlers read it)
 PSB="$PSB" bash "$(dirname "$0")/../toolchain/ucontext-overlay.sh"
 # Space-free path to this repo: toolchain flags (linker script paths) break on "PS4 Projects".

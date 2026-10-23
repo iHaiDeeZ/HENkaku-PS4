@@ -88,9 +88,10 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
   right after such a shader, and a loop counting with one never ends: every translated loop also
   stops after 4096 turns on the PS4 (a GPU that never finishes gets the app killed, with no
   trace). PS4 shader cache version 1401, so older translations are made again. A GPU hang is
-  logged by the RADV winsys in `/data/DolphinPS4/radv-ps4.log` and `gpu-hang.txt` (its paths are
-  DolphinPS4's); an empty `/data/HENkaku/radv-trace` file turns on its flight recorder
-  (`/data/DolphinPS4/flight`) and RADV's per-draw trace ids (`RADV_DEBUG=hang`, slower; it also
+  logged by the RADV winsys in `/data/Crema/gpu/radv-ps4.log` and `gpu-hang.txt` (its paths are
+  Crema's; DolphinPS4's `/data/DolphinPS4` before 1.08, whose winsys submitted on the render thread);
+  an empty `/data/HENkaku/radv-trace` file turns on its flight recorder
+  (`/data/Crema/gpu/flight`) and RADV's per-draw trace ids (`RADV_DEBUG=hang`, slower; it also
   ends the app on a hang instead of the PS4 freezing) to find the draw: `gpu-hang.txt`'s last
   trace write that was done is just before it.
 - **Guest memory** (`mem/src/mem.cpp`): the Vita's 4 GiB address space is a virtual range

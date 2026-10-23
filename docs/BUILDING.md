@@ -13,5 +13,6 @@ Run the scripts from WSL through `~/vita3k` (the space in "PS4 Projects" breaks 
 Upload from Windows (Git Bash): `scripts/upload-to-console.sh out/HENkaku-vXX.YY.pkg`.
 
 The build starts from M33's build tree in WSL (`~/m33-build`: its libc++ 21 sysroot with Boost 1.89, OpenSSL,
-curl, zlib, zstd, glslang and FFmpeg 7.1, and its RADV/GNM Mesa build), which `scripts/seed-build-tree.sh` copies
+curl, zlib, zstd, glslang and FFmpeg 7.1) and the RADV/GNM Mesa build of Crema's tree as TOTK uses it
+(`~/totk-build/build/mesa`, Oct 17: GPU submissions on their own thread), which `scripts/seed-build-tree.sh` copies
 into `~/vita3k-build` once. How the port itself works is in [PORT.md](PORT.md).

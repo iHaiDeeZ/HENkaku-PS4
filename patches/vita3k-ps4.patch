@@ -707,11 +707,57 @@ index 78542d3f..8e8491ed 100644
  
      return Success;
  }
+diff --git a/vita3k/cpu/include/cpu/state.h b/vita3k/cpu/include/cpu/state.h
+index c815a802..2c940ecc 100644
+--- a/vita3k/cpu/include/cpu/state.h
++++ b/vita3k/cpu/include/cpu/state.h
+@@ -42,3 +42,10 @@ struct CPUState {
+     std::atomic<uint32_t> abort_fault_addr{ 0 };
+     std::atomic<bool> abort_is_write{ false };
+ };
++
++#ifdef __PS4__
++// PS4: runs the import a supervisor call makes from inside the JIT's callback, if it's one that never
++// waits, calls back into the game nor changes its thread (modules/module_parent.cpp sets it): true
++// if it ran
++extern bool (*g_fast_import)(CPUState &state);
++#endif
+diff --git a/vita3k/cpu/src/cpu.cpp b/vita3k/cpu/src/cpu.cpp
+index 0b51c46b..da28d9e1 100644
+--- a/vita3k/cpu/src/cpu.cpp
++++ b/vita3k/cpu/src/cpu.cpp
+@@ -26,6 +26,10 @@
+ #include <memory>
+ #include <string>
+ 
++#ifdef __PS4__
++bool (*g_fast_import)(CPUState &state) = nullptr;
++#endif
++
+ static void delete_cpu_state(CPUState *state) {
+     delete state;
+ }
 diff --git a/vita3k/cpu/src/dynarmic_cpu.cpp b/vita3k/cpu/src/dynarmic_cpu.cpp
-index 54e89f88..e3308cfc 100644
+index 54e89f88..6ffb8a53 100644
 --- a/vita3k/cpu/src/dynarmic_cpu.cpp
 +++ b/vita3k/cpu/src/dynarmic_cpu.cpp
-@@ -367,6 +367,26 @@ std::unique_ptr<Dynarmic::A32::Jit> DynarmicCPU::make_jit() {
+@@ -338,6 +338,15 @@ public:
+     }
+ 
+     void CallSVC(uint32_t svc) override {
++#ifdef __PS4__
++        // an import that never waits nor calls back into the game runs right here and the JIT goes
++        // on: no stop, and no trip through the thread's loop and back in (about a microsecond each;
++        // Uncharted's thread library makes 280,000 a second). Leaving the kernel clears the monitor.
++        if (g_fast_import && g_fast_import(*parent)) {
++            cpu->jit->ClearExclusiveState();
++            return;
++        }
++#endif
+         parent->svc_called = true;
+         parent->svc = svc;
+         cpu->jit->HaltExecution(Dynarmic::HaltReason::UserDefined8);
+@@ -367,6 +376,26 @@ std::unique_ptr<Dynarmic::A32::Jit> DynarmicCPU::make_jit() {
      config.coprocessors[15] = cp15;
      config.processor_id = core_id;
      config.optimizations = cpu_opt ? Dynarmic::all_safe_optimizations : Dynarmic::no_optimizations;
@@ -3993,6 +4039,97 @@ index 38e1ab97..8d4f11bf 100644
  }
  
  EXPORT(int, _vshSblSsCreatePassPhrase) {
+diff --git a/vita3k/modules/include/modules/module_parent.h b/vita3k/modules/include/modules/module_parent.h
+index f6877fd1..74d18f31 100644
+--- a/vita3k/modules/include/modules/module_parent.h
++++ b/vita3k/modules/include/modules/module_parent.h
+@@ -28,6 +28,11 @@ struct KernelState;
+ void init_libraries(EmuEnvState &emuenv);
+ void init_exported_vars(EmuEnvState &emuenv);
+ void call_import(EmuEnvState &emuenv, CPUState &cpu, uint32_t nid, SceUID thread_id);
++#ifdef __PS4__
++// Runs the import the CPU's supervisor call makes if it never waits, calls back into the game nor
++// changes its thread (the JIT then goes on): true if it ran
++bool call_fast_import(EmuEnvState &emuenv, CPUState &cpu);
++#endif
+ 
+ // Returns true if the NID has an HLE (C++) implementation in nids.inc.
+ // Used to determine if an LLE export should be overridden with HLE dispatch.
+diff --git a/vita3k/modules/module_parent.cpp b/vita3k/modules/module_parent.cpp
+index 0d6f62ec..334be567 100644
+--- a/vita3k/modules/module_parent.cpp
++++ b/vita3k/modules/module_parent.cpp
+@@ -22,6 +22,7 @@
+ #include <modules/module_parent.h>
+ 
+ #include <cpu/functions.h>
++#include <cpu/state.h>
+ #include <emuenv/state.h>
+ #include <io/device.h>
+ #include <io/state.h>
+@@ -176,6 +177,51 @@ void call_import(EmuEnvState &emuenv, CPUState &cpu, uint32_t nid, SceUID thread
+     }
+ }
+ 
++#ifdef __PS4__
++extern "C" void ps4_perf_fast_import(uint32_t nid, uint64_t ticks); // vita3k/ps4/ps4_perf.cpp
++extern "C" bool ps4_fast_calls(); // vita3k/ps4/ps4_settings.cpp
++
++// The imports the JIT runs inside its callback (cpu/src/dynarmic_cpu.cpp): they never wait, call
++// back into the game or change the thread, so the JIT needn't stop for them. A thread library some
++// games use (SceUlt: Uncharted) asks for its thread's ID and TLS on every operation.
++static bool is_fast_import(uint32_t nid) {
++    switch (nid) {
++    case 0xB295EB61: // sceKernelGetTLSAddr
++    case 0x0FB972F9: // sceKernelGetThreadId
++    case 0xA37A6057: // sceKernelGetCurrentThreadVfpException
++    case 0x4C4672BF: // sceKernelGetProcessTime
++    case 0xE9F973B1: // sceKernelGetProcessTimeLow
++    case 0xB110C123: // sceKernelGetProcessTimeWide
++    case 0xF4EE4FA9: // sceKernelGetSystemTimeWide
++    case 0x23F79274: // sceRtcGetCurrentTick
++    case 0x91FA6614: // sceKernelUnlockLwMutex (wakes a waiter, never waits)
++    case 0x120AFC8C: // sceKernelUnlockLwMutex2
++    case 0x65DD0C84: // sceGxmSetUniformDataF
++    case 0xDBF97ED6: // sceGxmPrecomputedVertexStateSetUniformBuffer
++    case 0xBE5A68EF: // sceGxmPrecomputedVertexStateGetDefaultUniformBuffer
++    case 0xB452F1FB: // sceGxmPrecomputedFragmentStateSetUniformBuffer
++    case 0xCECB584A: // sceGxmPrecomputedFragmentStateGetDefaultUniformBuffer
++        return true;
++    default:
++        return false;
++    }
++}
++
++bool call_fast_import(EmuEnvState &emuenv, CPUState &cpu) {
++    // the stub is "svc #0; mov pc, lr; .word nid", and the pc is past the svc
++    const uint32_t nid = *Ptr<uint32_t>(read_pc(cpu) + 4).get(emuenv.mem);
++    if (!is_fast_import(nid) || emuenv.kernel.debugger.watch_import_calls || !ps4_fast_calls())
++        return false;
++    const ImportFn *fn = resolve_import(nid);
++    if (!fn)
++        return false;
++    const uint64_t start = __builtin_ia32_rdtsc();
++    (*fn)(emuenv, cpu, cpu.thread_id);
++    ps4_perf_fast_import(nid, __builtin_ia32_rdtsc() - start);
++    return true;
++}
++#endif
++
+ struct SceKernelBootimageModules {
+     Ptr<const char> path;
+     Ptr<const void> data;
+@@ -467,4 +513,10 @@ void init_libraries(EmuEnvState &emuenv) {
+ #define LIBRARY(name) import_library_init_##name(emuenv);
+ #include <modules/library_init_list.inc>
+ #undef LIBRARY
++#ifdef __PS4__
++    // the imports the JIT runs itself (call_fast_import)
++    static EmuEnvState *fast_import_env;
++    fast_import_env = &emuenv;
++    g_fast_import = [](CPUState &cpu) { return call_fast_import(*fast_import_env, cpu); };
++#endif
+ }
 diff --git a/vita3k/modules/taiHEN/taiHEN.cpp b/vita3k/modules/taiHEN/taiHEN.cpp
 index dfbc92b3..c2a1a4e4 100644
 --- a/vita3k/modules/taiHEN/taiHEN.cpp
@@ -11939,10 +12076,10 @@ index 00000000..800318b2
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..96bf4d79
+index 00000000..0ebf7b8e
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
-@@ -0,0 +1,654 @@
+@@ -0,0 +1,677 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -12030,6 +12167,8 @@ index 00000000..96bf4d79
 +// port/ps4_sampler.cpp: threads' own CPU time and the wait counters
 +extern "C" void ps4_thread_busy_report(char *out, size_t size, int min_percent);
 +extern "C" long long ps4_wait_total(int slot);
++// the Mesa winsys (port/mesa/ac_ps4_drm.c): the GPU's busy time and the time it spans (GPU clock)
++extern "C" void ac_ps4_get_gpu_busy(uint64_t *busy_ticks, uint64_t *span_ticks);
 +
 +// kernel/src/kernel.cpp: every guest thread's wait, and who holds what it waits for
 +void ps4_log_waits(KernelState &kernel);
@@ -12090,6 +12229,20 @@ index 00000000..96bf4d79
 +    LOG_INFO("renderer: {:.0f} draws/s, {:.1f} us each ({}; us); commands: {}; state: {}; surface copies {:.0f}/s ({:.0f}/s typeless), "
 +             "textures over a surface read from memory {:.0f}/s",
 +        draws, draws > 0 ? draw_ms * 1000.0 / draws : 0.0, draw_parts, biggest(command_parts, 6), biggest(state_parts, 5), copies, typeless, misses);
++
++    // a scene's start and end, part by part, and the draws reading the framebuffer
++    static const char *const scene_names[] = { "begin", "mask", "surfaces", "end", "submit" };
++    static uint64_t last_scene_ticks[st::ScenePartCount], last_scenes, last_fetch, last_ordered, last_ordered_primitives;
++    const double scenes = take(st::scenes, last_scenes) / seconds;
++    std::string scene_parts;
++    for (int i = 0; i < st::ScenePartCount; i++) {
++        const double part_ms = ms(take(st::scene_ticks[i], last_scene_ticks[i]));
++        scene_parts += fmt::format("{}{} {:.0f}", i ? ", " : "", scene_names[i], scenes > 0 ? part_ms * 1000.0 / scenes : 0.0);
++    }
++    const double fetch = take(st::fetch_draws, last_fetch) / seconds, ordered = take(st::ordered_draws, last_ordered) / seconds;
++    const double ordered_primitives = take(st::ordered_primitives, last_ordered_primitives) / seconds;
++    LOG_INFO("renderer: {:.0f} scenes/s ({}; us each); draws reading the framebuffer {:.0f}/s, {:.0f}/s of them a primitive at a time ({:.0f} primitives/s)",
++        scenes, scene_parts, fetch, ordered, ordered_primitives);
 +}
 +
 +// The profiler's hottest places in each busy guest thread's code: the share of its samples, the
@@ -12151,9 +12304,15 @@ index 00000000..96bf4d79
 +        }
 +        const uint64_t vblank_count = emuenv.display.vblank_count.load();
 +        const uint64_t tsc = __builtin_ia32_rdtsc();
++        // the GPU's time on the submissions finished since (their timestamps, in the Mesa winsys)
++        uint64_t gpu_busy = 0, gpu_span = 0;
++        ac_ps4_get_gpu_busy(&gpu_busy, &gpu_span);
++        const double gpu_percent = gpu_span > last_gpu_span ? 100.0 * (gpu_busy - last_gpu_busy) / (gpu_span - last_gpu_span) : 0.0;
++        last_gpu_busy = gpu_busy;
++        last_gpu_span = gpu_span;
 +        if (started) {
-+            LOG_INFO("perf: {} fps, {:.0f} vblanks/s; render thread: waits for the game {} ms/s, shows frames {} ms/s, waits for the GPU {} ms/s; frames wait for the renderer {} ms/s; the game waits for vblanks {} ms/s; busy: {}",
-+                emuenv.fps, (vblank_count - vblanks) / seconds, ms[1], ms[2], ms[3], ms[4], ms[0], busy);
++            LOG_INFO("perf: {} fps, {:.0f} vblanks/s; render thread: waits for the game {} ms/s, shows frames {} ms/s, waits for the GPU {} ms/s; GPU busy {:.0f}%; frames wait for the renderer {} ms/s; the game waits for vblanks {} ms/s; busy: {}",
++                emuenv.fps, (vblank_count - vblanks) / seconds, ms[1], ms[2], ms[3], gpu_percent, ms[4], ms[0], busy);
 +            // a freeze (the render thread neither showed a frame nor waited for the game all that
 +            // time): the waits behind it, a few times. (A thread in one call for 15 s was the sign:
 +            // threads that always wait used the three up at the start.)
@@ -12182,6 +12341,7 @@ index 00000000..96bf4d79
 +    uint64_t vblanks = 0;
 +    uint64_t last_tsc = 0;
 +    long long waits[5] = {};
++    uint64_t last_gpu_busy = 0, last_gpu_span = 0;
 +};
 +
 +// vita3k.prev.log to vita3k.game.log when it's a game's run (it has "Game started:")
@@ -13054,10 +13214,10 @@ index 00000000..eac30bd6
 +} // namespace ps4pad
 diff --git a/vita3k/ps4/ps4_perf.cpp b/vita3k/ps4/ps4_perf.cpp
 new file mode 100644
-index 00000000..0756bfd9
+index 00000000..2843dcb8
 --- /dev/null
 +++ b/vita3k/ps4/ps4_perf.cpp
-@@ -0,0 +1,423 @@
+@@ -0,0 +1,446 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -13119,6 +13279,8 @@ index 00000000..0756bfd9
 +    std::atomic<bool> ready{ false };
 +    std::atomic<uint64_t> code_ticks{ 0 };
 +    std::atomic<uint64_t> code_runs{ 0 };
++    // the imports the JIT ran itself in the current run of guest code (the owner's only)
++    uint64_t fast_ticks = 0;
 +    ImportSlot slots[kSlots];
 +    // the imports it is in now, innermost last (a callback can call imports from inside one)
 +    static constexpr int kDepth = 4;
@@ -13172,6 +13334,9 @@ index 00000000..0756bfd9
 +    GuestThread *const thread = t_thread;
 +    if (!thread)
 +        return;
++    // (the imports the JIT ran itself in this run are imports' time)
++    ticks -= std::min(ticks, thread->fast_ticks);
++    thread->fast_ticks = 0;
 +    add(thread->code_ticks, ticks);
 +    add(thread->code_runs, 1);
 +}
@@ -13246,15 +13411,9 @@ index 00000000..0756bfd9
 +    thread->depth.store(depth + 1, std::memory_order_release);
 +}
 +
-+extern "C" void ps4_perf_import(uint32_t nid, uint64_t ticks) {
-+    GuestThread *const thread = t_thread;
-+    if (!thread)
-+        return;
-+    const int depth = thread->depth.load(std::memory_order_relaxed);
-+    if (depth > 0)
-+        thread->depth.store(depth - 1, std::memory_order_release);
-+    if (nid == 0)
-+        return;
++namespace {
++// An import's time and call in its thread's slots
++void count_import(GuestThread *thread, uint32_t nid, uint64_t ticks) {
 +    const uint32_t start = (nid * 0x9E3779B1u) >> 24;
 +    for (int probe = 0; probe < kSlots; probe++) {
 +        ImportSlot &slot = thread->slots[(start + probe) & (kSlots - 1)];
@@ -13271,6 +13430,30 @@ index 00000000..0756bfd9
 +            return;
 +        }
 +    }
++}
++} // namespace
++
++extern "C" void ps4_perf_import(uint32_t nid, uint64_t ticks) {
++    GuestThread *const thread = t_thread;
++    if (!thread)
++        return;
++    const int depth = thread->depth.load(std::memory_order_relaxed);
++    if (depth > 0)
++        thread->depth.store(depth - 1, std::memory_order_release);
++    if (nid == 0)
++        return;
++    count_import(thread, nid, ticks);
++}
++
++extern "C" void ps4_perf_fast_import(uint32_t nid, uint64_t ticks) {
++    GuestThread *const thread = t_thread;
++    if (!thread)
++        return;
++    thread->fast_ticks += ticks;
++    count_import(thread, nid, ticks);
++    // a thread that calls these in a loop isn't stuck without calls (the spin report)
++    if (thread->code_start.load(std::memory_order_relaxed) != 0)
++        thread->code_start.store(__builtin_ia32_rdtsc(), std::memory_order_relaxed);
 +}
 +
 +namespace ps4perf {
@@ -13483,10 +13666,10 @@ index 00000000..0756bfd9
 +} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_perf.h b/vita3k/ps4/ps4_perf.h
 new file mode 100644
-index 00000000..4291971e
+index 00000000..69e26898
 --- /dev/null
 +++ b/vita3k/ps4/ps4_perf.h
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,66 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -13516,6 +13699,9 @@ index 00000000..4291971e
 +extern "C" void ps4_perf_guest_thread(const char *name);
 +extern "C" void ps4_perf_code(uint64_t ticks);
 +extern "C" void ps4_perf_import(uint32_t nid, uint64_t ticks);
++// An import the JIT ran itself, inside a run of guest code (modules/module_parent.cpp): counted as an
++// import, and its time taken off the run's
++extern "C" void ps4_perf_fast_import(uint32_t nid, uint64_t ticks);
 +// An import starts (its NID and first argument): a thread that stays in one shows in the report
 +extern "C" void ps4_perf_import_begin(uint32_t nid, uint32_t arg0);
 +// A run of guest code starts (the CPU, and how to stop it from another thread), and ends: whether
@@ -13552,10 +13738,10 @@ index 00000000..4291971e
 +} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_settings.cpp b/vita3k/ps4/ps4_settings.cpp
 new file mode 100644
-index 00000000..01fb8765
+index 00000000..1ce95cdb
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.cpp
-@@ -0,0 +1,759 @@
+@@ -0,0 +1,780 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -14036,6 +14222,9 @@ index 00000000..01fb8765
 +        items.push_back(pref_choice("Vita core threads", { "Side by side", "One at a time" },
 +            [](const Prefs &p) { return p.vita_cores ? 1 : 0; },
 +            [](Prefs &p, int value) { p.vita_cores = value == 1; }, {}));
++        items.push_back(pref_choice("Fast system calls", { "Off", "On" },
++            [](const Prefs &p) { return p.fast_calls ? 1 : 0; },
++            [](Prefs &p, int value) { p.fast_calls = value == 1; }, {}));
 +    }
 +    return items;
 +}
@@ -14051,6 +14240,8 @@ index 00000000..01fb8765
 +    if (!f)
 +        return;
 +    char line[256];
++    // the file's settings version: 1.08's is 2 (none before)
++    int version = 1;
 +    while (std::fgets(line, sizeof(line), f)) {
 +        const std::string text = line;
 +        const size_t eq = text.find('=');
@@ -14058,7 +14249,9 @@ index 00000000..01fb8765
 +            continue;
 +        const std::string key = trim(text.substr(0, eq));
 +        const std::string value = trim(text.substr(eq + 1));
-+        if (key == "home")
++        if (key == "settings")
++            version = std::atoi(value.c_str());
++        else if (key == "home")
 +            g_prefs.bubbles = value != "list";
 +        else if (key == "fsr-sharpness")
 +            g_prefs.fsr_sharpness = std::clamp(std::atoi(value.c_str()), 0, static_cast<int>(std::size(SHARPENING_STOPS)) - 1);
@@ -14074,6 +14267,8 @@ index 00000000..01fb8765
 +            g_prefs.gpu_compression = value == "on";
 +        else if (key == "ordered-blending")
 +            g_prefs.ordered_blending = value == "on";
++        else if (key == "fast-calls")
++            g_prefs.fast_calls = value == "on";
 +        else if (key == "vita-cores")
 +            g_prefs.vita_cores = value != "parallel";
 +        else if (key == "profiler")
@@ -14094,6 +14289,12 @@ index 00000000..01fb8765
 +            g_prefs.wallpaper = value == "wave" ? std::string() : value;
 +    }
 +    std::fclose(f);
++    if (version < 2) {
++        // 1.05 and 1.06 turned these two around to find Uncharted's garbage, which 1.07's barriers
++        // fixed: back to the faster defaults once (files from before 1.08 saved them all)
++        g_prefs.gpu_compression = true;
++        g_prefs.ordered_blending = false;
++    }
 +}
 +
 +void save_prefs() {
@@ -14103,6 +14304,7 @@ index 00000000..01fb8765
 +        return;
 +    }
 +    std::fprintf(f, "# HENkaku (Vita3K for PS4): the frontend's own settings (HENkaku > System, Display, CPU)\n");
++    std::fprintf(f, "settings = 2\n");
 +    std::fprintf(f, "home = %s\n", g_prefs.bubbles ? "bubbles" : "list");
 +    std::fprintf(f, "fsr-sharpness = %d\n", g_prefs.fsr_sharpness);
 +    std::fprintf(f, "game-threads = %s\n", g_prefs.cluster_threads ? "cluster" : "all");
@@ -14112,6 +14314,7 @@ index 00000000..01fb8765
 +    std::fprintf(f, "touch-markers = %s\n", g_prefs.touch_markers ? "on" : "off");
 +    std::fprintf(f, "gpu-compression = %s\n", g_prefs.gpu_compression ? "on" : "off");
 +    std::fprintf(f, "ordered-blending = %s\n", g_prefs.ordered_blending ? "on" : "off");
++    std::fprintf(f, "fast-calls = %s\n", g_prefs.fast_calls ? "on" : "off");
 +    std::fprintf(f, "profiler = %s\n", g_prefs.profiler ? "on" : "off");
 +    std::fprintf(f, "renderer-profiler = %s\n", g_prefs.host_profiler ? "on" : "off");
 +    std::fprintf(f, "freeze-log = %s\n", g_prefs.freeze_log ? "on" : "off");
@@ -14140,6 +14343,10 @@ index 00000000..01fb8765
 +
 +extern "C" bool ps4_ordered_blending() {
 +    return ps4settings::prefs().ordered_blending;
++}
++
++extern "C" bool ps4_fast_calls() {
++    return ps4settings::prefs().fast_calls;
 +}
 +
 +// frame generation is making in-between frames now (renderer.cpp): the FPS overlay's "on screen"
@@ -14317,10 +14524,10 @@ index 00000000..01fb8765
 +} // namespace ps4settings
 diff --git a/vita3k/ps4/ps4_settings.h b/vita3k/ps4/ps4_settings.h
 new file mode 100644
-index 00000000..c40f8597
+index 00000000..7340f555
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.h
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,106 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -14375,9 +14582,12 @@ index 00000000..c40f8597
 +    // a circle where each finger is on the front screen (the touch pad shows no picture)
 +    bool touch_markers = true;
 +    // AMD's tile compression of depth (HiZ) and colour fast clears (ps4_main.cpp: RADV_DEBUG)
-+    bool gpu_compression = false;
-+    // a draw reading the framebuffer drawn a primitive at a time (renderer/vulkan/scene.cpp)
-+    bool ordered_blending = true;
++    bool gpu_compression = true;
++    // a draw reading the framebuffer drawn a primitive at a time (renderer/vulkan/scene.cpp): each
++    // with a barrier, which on this GPU writes back and drops its caches
++    bool ordered_blending = false;
++    // the imports that never wait run inside the JIT instead of stopping it (module_parent.cpp)
++    bool fast_calls = true;
 +    // the threads a game pins to one Vita core run one at a time, switching when one blocks, as on
 +    // the Vita (some games deadlock when they run side by side), or all side by side
 +    bool vita_cores = true;
@@ -15535,10 +15745,10 @@ index c45a74c4..4fbfd672 100644
  // Assume fmt is a bcn format
 diff --git a/vita3k/renderer/include/renderer/ps4_render_stats.h b/vita3k/renderer/include/renderer/ps4_render_stats.h
 new file mode 100644
-index 00000000..a2923348
+index 00000000..26701315
 --- /dev/null
 +++ b/vita3k/renderer/include/renderer/ps4_render_stats.h
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,111 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -15593,6 +15803,25 @@ index 00000000..a2923348
 +inline std::atomic<uint64_t> typeless_copies{ 0 };
 +// the textures over a surface sampled from memory instead (which the GPU never wrote on the PS4)
 +inline std::atomic<uint64_t> surface_misses{ 0 };
++
++// The parts of a scene's start and end (vulkan/context.cpp): its command buffers begun, the mask
++// cleared, its surfaces and framebuffer found; its render pass and command buffers ended, and its
++// submission to the GPU
++enum ScenePart {
++    SceneBegin,
++    SceneMask,
++    SceneSurfaces,
++    SceneEnd,
++    SceneSubmit,
++    ScenePartCount
++};
++inline std::atomic<uint64_t> scene_ticks[ScenePartCount];
++inline std::atomic<uint64_t> scenes{ 0 };
++// the draws reading the framebuffer (programmable blending), and those of them drawn a primitive at
++// a time (HENkaku > Graphics > Ordered blending) with their primitives
++inline std::atomic<uint64_t> fetch_draws{ 0 };
++inline std::atomic<uint64_t> ordered_draws{ 0 };
++inline std::atomic<uint64_t> ordered_primitives{ 0 };
 +
 +inline void add(std::atomic<uint64_t> &counter, uint64_t value) {
 +    counter.store(counter.load(std::memory_order_relaxed) + value, std::memory_order_relaxed);
@@ -16766,22 +16995,23 @@ index fe04180a..3af3fe76 100644
  
  renderer::TextureCache::~TextureCache() {
 diff --git a/vita3k/renderer/src/vulkan/context.cpp b/vita3k/renderer/src/vulkan/context.cpp
-index 689060fb..14229ec2 100644
+index 689060fb..62ee270e 100644
 --- a/vita3k/renderer/src/vulkan/context.cpp
 +++ b/vita3k/renderer/src/vulkan/context.cpp
-@@ -28,6 +28,11 @@
+@@ -28,6 +28,12 @@
  #include <util/log.h>
  #include <util/overloaded.h>
  
 +#ifdef __PS4__
 +#include <chrono>
++#include <renderer/ps4_render_stats.h>
 +extern "C" void ps4_wait_add(int slot, long long ns); // port/ps4_sampler.cpp
 +#endif
 +
  namespace renderer::vulkan {
  
  void VKContext::wait_thread_function(const MemState &mem) {
-@@ -156,8 +161,15 @@ void set_context(VKContext &context, MemState &mem, VKRenderTarget *rt, const Fe
+@@ -156,8 +162,15 @@ void set_context(VKContext &context, MemState &mem, VKRenderTarget *rt, const Fe
  
      if (rt->multisample_mode && !context.record.color_surface.downscale) {
          // using MSAA without downscaling, emulate this as best as we can by multiplying the width and height of the render target by 2
@@ -16799,7 +17029,35 @@ index 689060fb..14229ec2 100644
      }
  
      SceGxmDepthStencilSurface *ds_surface_fin = &context.record.depth_stencil_surface;
-@@ -222,6 +234,8 @@ void set_context(VKContext &context, MemState &mem, VKRenderTarget *rt, const Fe
+@@ -170,8 +183,17 @@ void set_context(VKContext &context, MemState &mem, VKRenderTarget *rt, const Fe
+     VKState &state = context.state;
+     state.surface_cache.set_render_target(rt);
+ 
++#ifdef __PS4__
++    // (the renderer profiler: the parts of a scene's start)
++    if (ps4stats::enabled.load(std::memory_order_relaxed))
++        ps4stats::add(ps4stats::scenes, 1);
++    ps4stats::Timer part(ps4stats::scene_ticks[ps4stats::SceneBegin]);
++#endif
+     context.start_recording(true);
+ 
++#ifdef __PS4__
++    part.next(ps4stats::scene_ticks[ps4stats::SceneMask]);
++#endif
+     if (features.use_mask_bit) {
+         const bool initialized = rt->mask.layout != vkutil::ImageLayout::Undefined;
+         vk::ImageMemoryBarrier mask_barrier{
+@@ -211,6 +233,9 @@ void set_context(VKContext &context, MemState &mem, VKRenderTarget *rt, const Fe
+     if (context.state.features.support_shader_interlock || features.use_mask_bit)
+         // Preserve depth/stencil when a mask update splits the scene.
+         force_store = true;
++#ifdef __PS4__
++    part.next(ps4stats::scene_ticks[ps4stats::SceneSurfaces]);
++#endif
+     context.current_render_pass = context.state.pipeline_cache.retrieve_render_pass(vk_format, force_load, force_store, color_surface_fin == nullptr);
+     context.initial_render_pass = context.current_render_pass;
+     context.initial_depth_stencil_clear = force_load ? vk::ImageAspectFlags() : vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+@@ -222,6 +247,8 @@ void set_context(VKContext &context, MemState &mem, VKRenderTarget *rt, const Fe
      context.current_framebuffer = framebuffer.standard;
      context.current_shader_interlock_framebuffer = framebuffer.shader_interlock;
      context.current_color_base_image = framebuffer.base_image;
@@ -16808,7 +17066,7 @@ index 689060fb..14229ec2 100644
  
      // make sure we are not keeping any texture from the previous pass
      // (textures can be still bound even though they are not used)
-@@ -393,7 +407,7 @@ void VKContext::start_render_pass(bool create_descriptor_set, bool maskupdate) {
+@@ -393,7 +420,7 @@ void VKContext::start_render_pass(bool create_descriptor_set, bool maskupdate) {
      } else {
          curr_renderpass_info.renderArea = vk::Rect2D{
              .offset = { 0, 0 },
@@ -16817,7 +17075,18 @@ index 689060fb..14229ec2 100644
          };
      }
  
-@@ -640,21 +654,23 @@ void VKContext::stop_recording(const SceGxmNotification &notif1, const SceGxmNot
+@@ -617,6 +644,10 @@ void VKContext::stop_recording(const SceGxmNotification &notif1, const SceGxmNot
+         return;
+     }
+ 
++#ifdef __PS4__
++    // (the renderer profiler: the parts of a scene's end)
++    ps4stats::Timer part(ps4stats::scene_ticks[ps4stats::SceneEnd]);
++#endif
+     if (in_renderpass)
+         stop_render_pass();
+ 
+@@ -640,21 +671,29 @@ void VKContext::stop_recording(const SceGxmNotification &notif1, const SceGxmNot
      if (!submit)
          return;
  
@@ -16834,12 +17103,18 @@ index 689060fb..14229ec2 100644
      submit_info.setCommandBuffers(cmdbuffers_to_submit);
  
 -    state.general_queue.submit(submit_info, fence);
++#ifdef __PS4__
++    part.next(ps4stats::scene_ticks[ps4stats::SceneSubmit]);
++#endif
 +    try {
 +        state.general_queue.submit(submit_info, fence);
 +    } catch (const vk::SystemError &error) {
 +        LOG_ERROR("Vulkan queue submit failed: {}", error.what());
 +        throw;
 +    }
++#ifdef __PS4__
++    part.stop();
++#endif
      cmdbuffers_to_submit.clear();
      state.frame().rendered_fences.push_back(fence);
 +    // the ring buffers (info uniforms in every mode) release this work's data once the fence signals
@@ -16848,7 +17123,7 @@ index 689060fb..14229ec2 100644
  
      if (state.features.enable_memory_mapping) {
          // send it to the wait queue
-@@ -721,6 +737,17 @@ void VKContext::check_for_macroblock_change(bool is_draw) {
+@@ -721,6 +760,17 @@ void VKContext::check_for_macroblock_change(bool is_draw) {
      }
  }
  
@@ -16866,7 +17141,7 @@ index 689060fb..14229ec2 100644
  void new_frame(VKContext &context) {
      if (context.state.features.enable_memory_mapping) {
          FrameDoneRequest request = { context.frame_timestamp };
-@@ -750,7 +777,14 @@ void new_frame(VKContext &context) {
+@@ -750,7 +800,14 @@ void new_frame(VKContext &context) {
                  return context.last_frame_waited >= previous_frame_timestamp;
              });
          } else {
@@ -16881,7 +17156,7 @@ index 689060fb..14229ec2 100644
              if (result != vk::Result::eSuccess) {
                  LOG_ERROR("Could not wait for fences.");
                  assert(false);
-@@ -758,6 +792,13 @@ void new_frame(VKContext &context) {
+@@ -758,6 +815,13 @@ void new_frame(VKContext &context) {
              }
          }
  
@@ -17871,7 +18146,7 @@ index ed8c71ad..7ebc233b 100644
          dispatch.init();
  #endif
 diff --git a/vita3k/renderer/src/vulkan/scene.cpp b/vita3k/renderer/src/vulkan/scene.cpp
-index acd85ab5..4d921872 100644
+index acd85ab5..ce1118c9 100644
 --- a/vita3k/renderer/src/vulkan/scene.cpp
 +++ b/vita3k/renderer/src/vulkan/scene.cpp
 @@ -19,6 +19,10 @@
@@ -18004,7 +18279,7 @@ index acd85ab5..4d921872 100644
  
      // Upload index data.
      vk::IndexType index_type = (format == SCE_GXM_INDEX_FORMAT_U16) ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
-@@ -576,12 +636,50 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
+@@ -576,13 +636,55 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
          context.render_cmd.bindIndexBuffer(buffer, offset, index_type);
      } else if (!ordered_indices) {
          const size_t index_buffer_size = index_size * count;
@@ -18056,8 +18331,26 @@ index acd85ab5..4d921872 100644
 +    phase.next(ps4stats::phase_ticks[ps4stats::PhaseRecord]);
 +#endif
  
++#ifdef __PS4__
++    if (uses_framebuffer_fetch && ps4stats::enabled.load(std::memory_order_relaxed))
++        ps4stats::add(ps4stats::fetch_draws, 1);
++#endif
      if (ordered_fetch) {
          if (ordered_indices) {
+             count = ordered_indices->count;
+@@ -591,6 +693,12 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
+         }
+         const uint32_t vertices_per_primitive = type == SCE_GXM_PRIMITIVE_POINTS ? 1U : type == SCE_GXM_PRIMITIVE_LINES ? 2U
+                                                                                                                         : 3U;
++#ifdef __PS4__
++        if (ps4stats::enabled.load(std::memory_order_relaxed)) {
++            ps4stats::add(ps4stats::ordered_draws, 1);
++            ps4stats::add(ps4stats::ordered_primitives, count / vertices_per_primitive * instance_count);
++        }
++#endif
+         for (uint32_t instance = 0; instance < instance_count; ++instance) {
+             for (size_t first = 0; first + vertices_per_primitive <= count; first += vertices_per_primitive) {
+                 framebuffer_fetch_barrier(context);
 diff --git a/vita3k/renderer/src/vulkan/screen_filters.cpp b/vita3k/renderer/src/vulkan/screen_filters.cpp
 index 192dba99..4ae1b08b 100644
 --- a/vita3k/renderer/src/vulkan/screen_filters.cpp

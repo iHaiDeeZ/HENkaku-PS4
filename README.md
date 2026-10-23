@@ -201,6 +201,12 @@ good guide: a game that doesn't work in Vita3K won't work here either.
 - **FPS hack** (Speed): lets a game that waits two vblanks per frame wait one. Some games run at 60 with it; in
   games whose speed follows their frame rate it makes them run too fast. It's off by default.
 - **FSR 1** (Display, screen filter): upscales the Vita's 960x544 picture to the TV with a sharpening pass.
+- **Fast system calls** (HENkaku > CPU): calls that never wait (the thread's ID and storage, the clocks, a few
+  graphics setters) run inside the translated code instead of stopping it. Some games make hundreds of
+  thousands a second. It's on by default.
+- **Ordered blending** (HENkaku > Graphics): draws that blend with what's already on screen are drawn one triangle
+  at a time. That's exact where triangles overlap, but much slower on the PS4's GPU. It's off by default; turn it on
+  if you see flickering specks in smoke or water effects.
 
 ## Your files
 

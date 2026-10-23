@@ -721,6 +721,14 @@ void* startOnAppCores(void* raw) {
 }
 }  // namespace
 
+// The GPU driver's submission thread (port/mesa: the sceGnmSubmitCommandBuffers calls, ~0.4 ms each,
+// off the render thread) above the default priority (256 highest .. 767 lowest, 700 default), as in
+// Crema: logging, loading and shader compiling never take its time. Audio stays higher.
+extern "C" int scePthreadSetprio(void* thread, int prio);
+extern "C" void ps4_boost_thread() {
+    scePthreadSetprio(scePthreadSelf(), 650);
+}
+
 int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start)(void*), void* arg) {
     // the stack: at least kMinThreadStack
     pthread_attr_t local;
