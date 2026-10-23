@@ -11939,10 +11939,10 @@ index 00000000..800318b2
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..f627a57e
+index 00000000..96bf4d79
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
-@@ -0,0 +1,650 @@
+@@ -0,0 +1,654 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -12084,8 +12084,12 @@ index 00000000..f627a57e
 +        const double phase_ms = ms(take(st::phase_ticks[i], last_phase[i]));
 +        draw_parts += fmt::format("{}{} {:.1f}", i ? ", " : "", phases[i], draws > 0 ? phase_ms * 1000.0 / draws : 0.0);
 +    }
-+    LOG_INFO("renderer: {:.0f} draws/s, {:.1f} us each ({}; us); commands: {}; state: {}", draws, draws > 0 ? draw_ms * 1000.0 / draws : 0.0, draw_parts,
-+        biggest(command_parts, 6), biggest(state_parts, 5));
++    static uint64_t last_copies, last_typeless, last_misses;
++    const double copies = take(st::surface_copies, last_copies) / seconds, typeless = take(st::typeless_copies, last_typeless) / seconds;
++    const double misses = take(st::surface_misses, last_misses) / seconds;
++    LOG_INFO("renderer: {:.0f} draws/s, {:.1f} us each ({}; us); commands: {}; state: {}; surface copies {:.0f}/s ({:.0f}/s typeless), "
++             "textures over a surface read from memory {:.0f}/s",
++        draws, draws > 0 ? draw_ms * 1000.0 / draws : 0.0, draw_parts, biggest(command_parts, 6), biggest(state_parts, 5), copies, typeless, misses);
 +}
 +
 +// The profiler's hottest places in each busy guest thread's code: the share of its samples, the
@@ -15531,10 +15535,10 @@ index c45a74c4..4fbfd672 100644
  // Assume fmt is a bcn format
 diff --git a/vita3k/renderer/include/renderer/ps4_render_stats.h b/vita3k/renderer/include/renderer/ps4_render_stats.h
 new file mode 100644
-index 00000000..ac02fed2
+index 00000000..a2923348
 --- /dev/null
 +++ b/vita3k/renderer/include/renderer/ps4_render_stats.h
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,92 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -15583,6 +15587,12 @@ index 00000000..ac02fed2
 +inline std::atomic<uint64_t> state_ticks[MAX_KINDS];
 +inline std::atomic<uint64_t> state_count[MAX_KINDS];
 +inline std::atomic<uint64_t> phase_ticks[PhaseCount];
++// the surfaces copied for the draws sampling them (vulkan/surface_cache.cpp), and those of them read
++// as another format (through a buffer)
++inline std::atomic<uint64_t> surface_copies{ 0 };
++inline std::atomic<uint64_t> typeless_copies{ 0 };
++// the textures over a surface sampled from memory instead (which the GPU never wrote on the PS4)
++inline std::atomic<uint64_t> surface_misses{ 0 };
 +
 +inline void add(std::atomic<uint64_t> &counter, uint64_t value) {
 +    counter.store(counter.load(std::memory_order_relaxed) + value, std::memory_order_relaxed);
@@ -17483,7 +17493,7 @@ index a7fd4fb8..f5d369e3 100644
      const uint32_t swizzle = format & SCE_GXM_COLOR_SWIZZLE_MASK;
      switch (base_format) {
 diff --git a/vita3k/renderer/src/vulkan/pipeline_cache.cpp b/vita3k/renderer/src/vulkan/pipeline_cache.cpp
-index ff6d0c5b..ab744977 100644
+index ff6d0c5b..fd5d034c 100644
 --- a/vita3k/renderer/src/vulkan/pipeline_cache.cpp
 +++ b/vita3k/renderer/src/vulkan/pipeline_cache.cpp
 @@ -16,6 +16,9 @@
@@ -17525,7 +17535,29 @@ index ff6d0c5b..ab744977 100644
      }
  
      support_coherent_framebuffer_fetch = support_rasterized_order_access;
-@@ -815,12 +833,32 @@ vk::PipelineVertexInputStateCreateInfo PipelineCache::get_vertex_input_state(con
+@@ -646,15 +664,19 @@ vk::RenderPass PipelineCache::retrieve_render_pass(vk::Format format, bool force
+     std::array<vk::SubpassDependency, 5> dependencies;
+ 
+     // external dependency
+-    // we want the previous render pass to be done when we reach the fragment stage / stencil*depth testing
++    // we want the previous render pass to be done when we reach the fragment stage / stencil*depth testing,
++    // and what it drew visible to this one's shaders, which may sample it (an AMD GPU older than Vega,
++    // like the PS4's, draws past its L2 cache: RADV drops the stale lines only for the reads named here)
+     dependencies[0] = {
+         .srcSubpass = VK_SUBPASS_EXTERNAL,
+         .dstSubpass = 0,
+         .srcStageMask = vk::PipelineStageFlagBits::eColorAttachmentOutput | vk::PipelineStageFlagBits::eEarlyFragmentTests | vk::PipelineStageFlagBits::eLateFragmentTests,
+-        .dstStageMask = vk::PipelineStageFlagBits::eColorAttachmentOutput | vk::PipelineStageFlagBits::eEarlyFragmentTests | vk::PipelineStageFlagBits::eLateFragmentTests,
++        .dstStageMask = vk::PipelineStageFlagBits::eColorAttachmentOutput | vk::PipelineStageFlagBits::eEarlyFragmentTests | vk::PipelineStageFlagBits::eLateFragmentTests
++            | vk::PipelineStageFlagBits::eVertexShader | vk::PipelineStageFlagBits::eFragmentShader,
+         .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite | vk::AccessFlagBits::eDepthStencilAttachmentWrite,
+         .dstAccessMask = vk::AccessFlagBits::eColorAttachmentRead | vk::AccessFlagBits::eColorAttachmentWrite
+             | vk::AccessFlagBits::eDepthStencilAttachmentRead | vk::AccessFlagBits::eDepthStencilAttachmentWrite
++            | vk::AccessFlagBits::eShaderRead
+     };
+ 
+     // if an attachment is sampled from, we want it to be done before the next render pass fragment shader
+@@ -815,12 +837,32 @@ vk::PipelineVertexInputStateCreateInfo PipelineCache::get_vertex_input_state(con
              }
          }
  
@@ -17559,7 +17591,7 @@ index ff6d0c5b..ab744977 100644
          }
      }
  
-@@ -834,6 +872,8 @@ vk::PipelineVertexInputStateCreateInfo PipelineCache::get_vertex_input_state(con
+@@ -834,6 +876,8 @@ vk::PipelineVertexInputStateCreateInfo PipelineCache::get_vertex_input_state(con
  
  #ifdef __APPLE__
          const uint32_t stride = align(stream.stride, 4);
@@ -17568,7 +17600,7 @@ index ff6d0c5b..ab744977 100644
  #else
          const uint32_t stride = stream.stride;
  #endif
-@@ -854,7 +894,13 @@ void PipelineCache::compiler_thread(MemState &mem) {
+@@ -854,7 +898,13 @@ void PipelineCache::compiler_thread(MemState &mem) {
  
      // just a single loop, waiting for a pipeline compile request and compiling it
      CompileRequest *request;
@@ -18056,7 +18088,7 @@ index 192dba99..4ae1b08b 100644
      cmd_buffer.pushConstants(pipeline_layout_rcas, vk::ShaderStageFlagBits::eCompute, 0, sizeof(RcasConstant), &rcas_constant);
      cmd_buffer.dispatch(dispatch_x, dispatch_y, 1);
 diff --git a/vita3k/renderer/src/vulkan/screen_renderer.cpp b/vita3k/renderer/src/vulkan/screen_renderer.cpp
-index bbc6ba97..279c7983 100644
+index bbc6ba97..8718d19c 100644
 --- a/vita3k/renderer/src/vulkan/screen_renderer.cpp
 +++ b/vita3k/renderer/src/vulkan/screen_renderer.cpp
 @@ -16,6 +16,7 @@
@@ -18084,11 +18116,240 @@ index bbc6ba97..279c7983 100644
  
      for (auto &img : vita_surface)
          img.destroy();
+@@ -493,6 +497,15 @@ void ScreenRenderer::render(vk::ImageView image_view, vk::ImageLayout layout, co
+     if (swapchain_image_idx == ~0 && !acquire_swapchain_image())
+         return;
+ 
++    // the game's last scenes drew the image sampled here (in submissions of their own): done, and
++    // visible to the filter's and this pass's reads (an AMD GPU reads stale parts of it otherwise)
++    const vk::MemoryBarrier drawn{
++        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite,
++        .dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eTransferRead
++    };
++    current_cmd_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput | vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
++        vk::PipelineStageFlagBits::eFragmentShader | vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer, {}, drawn, {}, {});
++
+     // we need to apply the screen filter at the right moment (before or after we start the render pass depending on it)
+     filter->render(true, image_view, layout, viewport);
+ 
 diff --git a/vita3k/renderer/src/vulkan/surface_cache.cpp b/vita3k/renderer/src/vulkan/surface_cache.cpp
-index 84f14b6a..59999c19 100644
+index 84f14b6a..1bc49833 100644
 --- a/vita3k/renderer/src/vulkan/surface_cache.cpp
 +++ b/vita3k/renderer/src/vulkan/surface_cache.cpp
-@@ -1203,7 +1203,7 @@ Framebuffer &VKSurfaceCache::retrieve_framebuffer_handle(MemState &mem, SceGxmCo
+@@ -18,6 +18,9 @@
+ #include <renderer/vulkan/surface_cache.h>
+ 
+ #include <gxm/functions.h>
++#ifdef __PS4__
++#include <renderer/ps4_render_stats.h>
++#endif
+ #include <renderer/vulkan/gxm_to_vulkan.h>
+ #include <renderer/vulkan/state.h>
+ #include <renderer/vulkan/types.h>
+@@ -26,6 +29,7 @@
+ #include <vulkan/vulkan_format_traits.hpp>
+ 
+ #include <array>
++#include <set>
+ #include <util/align.h>
+ #include <util/log.h>
+ #include <util/vector_utils.h>
+@@ -144,9 +148,14 @@ static void protect_surface(MemState &mem, ColorSurfaceCacheInfo &info) {
+     // Don't track dirty for small surfaces to avoid false positives from unrelated writes
+     std::shared_ptr<bool> dirty = small_surface ? nullptr : info.dirty;
+ 
++    // and only for a write in the surface itself: the protection covers whole host pages (16 KiB on the
++    // PS4) and merges with the ones next to it, whose data the game writes all the time, and a dirty
++    // surface is sampled from memory (which on the PS4, without memory mapping, the GPU never wrote)
++    const Address surface_start = info.data.address();
++    const Address surface_end = surface_start + info.total_bytes;
+     add_protect(mem, addr_start, addr_end - addr_start, perm,
+-        [dirty, need_sync](Address, bool write) {
+-            if (write && dirty)
++        [dirty, need_sync, surface_start, surface_end](Address address, bool write) {
++            if (write && dirty && address >= surface_start && address < surface_end)
+                 *dirty = true;
+             if (need_sync)
+                 *need_sync = true;
+@@ -468,6 +477,57 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
+     return { info_added.texture.view, &info_added.texture };
+ }
+ 
++// The copy of a surface made for the draws sampling it is recorded in the scene's prerender commands,
++// which run before its draws, and needs barriers of its own. Without them an AMD GPU (the PS4's) starts
++// the copy while the scenes that drew the surface are still drawing, runs the two steps of a copy
++// through a buffer at the same time, and the draws while the copy is being made: they read parts not
++// written yet (Uncharted: black boxes and streaks of garbage near water, AMD GPUs and phones only).
++static void barrier_before_surface_copy(vk::CommandBuffer cmd_buffer) {
++    // the earlier scenes: the surface drawn, and this copy's buffer and image read
++    const vk::MemoryBarrier barrier{
++        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite | vk::AccessFlagBits::eDepthStencilAttachmentWrite
++            | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite,
++        .dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite
++    };
++    cmd_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eVertexShader | vk::PipelineStageFlagBits::eFragmentShader
++            | vk::PipelineStageFlagBits::eEarlyFragmentTests | vk::PipelineStageFlagBits::eLateFragmentTests
++            | vk::PipelineStageFlagBits::eColorAttachmentOutput | vk::PipelineStageFlagBits::eTransfer,
++        vk::PipelineStageFlagBits::eTransfer, {}, barrier, {}, {});
++}
++
++// the buffer written by the copy's first step before its second reads it
++static void barrier_between_copy_steps(vk::CommandBuffer cmd_buffer, vk::Buffer buffer) {
++    const vk::BufferMemoryBarrier barrier{
++        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
++        .dstAccessMask = vk::AccessFlagBits::eTransferRead,
++        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .buffer = buffer,
++        .offset = 0,
++        .size = VK_WHOLE_SIZE
++    };
++    cmd_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer, {}, {}, barrier, {});
++}
++
++// the copy done before the scene's shaders sample it (in the layout it's looked up with)
++static void barrier_after_surface_copy(vk::CommandBuffer cmd_buffer, vkutil::Image &image) {
++    const vk::ImageMemoryBarrier barrier{
++        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
++        .dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eInputAttachmentRead
++            | vk::AccessFlagBits::eColorAttachmentRead | vk::AccessFlagBits::eColorAttachmentWrite,
++        .oldLayout = vk::ImageLayout::eTransferDstOptimal,
++        .newLayout = vkutil::get_underlying_layout(vkutil::ImageLayout::ColorAttachmentReadWrite),
++        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++        .image = image.image,
++        .subresourceRange = vkutil::color_subresource_range
++    };
++    cmd_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
++        vk::PipelineStageFlagBits::eVertexShader | vk::PipelineStageFlagBits::eFragmentShader | vk::PipelineStageFlagBits::eColorAttachmentOutput,
++        {}, {}, {}, barrier);
++    image.layout = vkutil::ImageLayout::ColorAttachmentReadWrite;
++}
++
+ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_texture(const SceGxmTexture &texture, const SceGxmColorBaseFormat base_format, TextureViewport *texture_viewport) {
+     // Create the key to access the cache struct
+     const uint32_t address = (texture.data_addr << 2);
+@@ -493,9 +553,30 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
+     if (!overlap)
+         return std::nullopt;
+ 
+-    if (*ite->second->dirty)
++#ifdef __PS4__
++    // (renderer profiler on: a texture over a surface drawn here sampled from memory instead, which the
++    // GPU never wrote on the PS4: counted, and the first of each surface and reason logged)
++    const auto missed = [&](const char *reason) {
++        if (!ps4stats::enabled.load(std::memory_order_relaxed))
++            return;
++        ps4stats::add(ps4stats::surface_misses, 1);
++        static std::set<std::pair<uint32_t, const char *>> logged;
++        if (logged.size() >= 48 || !logged.emplace(ite->first, reason).second)
++            return;
++        const ColorSurfaceCacheInfo &surface = *ite->second;
++        LOG_WARN("PS4: texture at 0x{:X} ({}x{}, format 0x{:X}, type 0x{:X}) over the surface at 0x{:X} ({}x{}, {} bytes a row, format 0x{:X}) read from memory: {}",
++            address, original_width, original_height, static_cast<uint32_t>(gxm::get_format(texture)), static_cast<uint32_t>(texture.texture_type()),
++            ite->first, surface.original_width, surface.original_height, surface.stride_bytes, static_cast<uint32_t>(surface.format), reason);
++    };
++#else
++    const auto missed = [](const char *) {};
++#endif
++
++    if (*ite->second->dirty) {
+         // Guest wrote to the surface backing memory since it was rendered, so GPU data is stale.
++        missed("written by the CPU since drawn");
+         return std::nullopt;
++    }
+ 
+     const vk::ComponentMapping swizzle = texture::translate_swizzle(gxm::get_format(texture));
+     vk::Format vk_format = color::translate_surface_format(base_format,
+@@ -544,28 +625,36 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
+         || (base_format == SCE_GXM_COLOR_BASE_FORMAT_U4U4U4U4 && vk_format != vk::Format::eR4G4B4A4UnormPack16);
+     if ((base_format == SCE_GXM_COLOR_BASE_FORMAT_U8U8U8 || info.format == SCE_GXM_COLOR_BASE_FORMAT_U8U8U8
+             || expanded_rgba4)
+-        && base_format != info.format)
++        && base_format != info.format) {
+         // Expanded surfaces cannot be reinterpreted as a different guest format.
++        missed("an expanded format read as another");
+         return std::nullopt;
++    }
+ 
+-    if (tiling != info.tiling || info.stride_bytes != stride_bytes)
++    if (tiling != info.tiling || info.stride_bytes != stride_bytes) {
+         // if the tiling is different, also don't try to match them
+         // about the strides, I've yet to see a case where the byte stride is different
++        missed(tiling != info.tiling ? "another tiling" : "another stride");
+         return std::nullopt;
++    }
+ 
+     // Check if we can use this surface
+     bool addr_in_range_of_cache = ((address + total_surface_size) <= (ite->first + info.total_bytes + 4));
+ 
+-    if (ite->first != address && !addr_in_range_of_cache)
++    if (ite->first != address && !addr_in_range_of_cache) {
+         // persona 4 sample from the top of a texture while the bottom wasn't rendered to, the fact that both the surface and
+         // the texture start at the same location should be enough
++        missed("past its end");
+         return std::nullopt;
++    }
+ 
+     uint32_t bytes_per_pixel_requested = gxm::bits_per_pixel(base_format) / 8;
+     uint32_t bytes_per_pixel_in_store = gxm::bits_per_pixel(info.format) / 8;
+ 
+-    if (std::max(bytes_per_pixel_requested, bytes_per_pixel_in_store) % std::min(bytes_per_pixel_requested, bytes_per_pixel_in_store) != 0)
++    if (std::max(bytes_per_pixel_requested, bytes_per_pixel_in_store) % std::min(bytes_per_pixel_requested, bytes_per_pixel_in_store) != 0) {
++        missed("pixel sizes that don't divide");
+         return std::nullopt;
++    }
+ 
+     // TODO: this is true only for linear textures (and also kind of for tiled textures) (and in this case start_x = 0),
+     // for swizzled textures this is different
+@@ -656,6 +745,7 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
+         // use prerender cmd as we can't copy an image or use pipeline barriers in a render pass
+         VKContext *context = reinterpret_cast<VKContext *>(state.context);
+         vk::CommandBuffer cmd_buffer = context->prerender_cmd;
++        barrier_before_surface_copy(cmd_buffer);
+ 
+         if (casted == nullptr) {
+             // Try to crop + cast
+@@ -690,6 +780,13 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
+         }
+ 
+         casted->scene_timestamp = scene_timestamp;
++#ifdef __PS4__
++        if (ps4stats::enabled.load(std::memory_order_relaxed)) {
++            ps4stats::add(ps4stats::surface_copies, 1);
++            if (bytes_per_pixel_requested != bytes_per_pixel_in_store)
++                ps4stats::add(ps4stats::typeless_copies, 1);
++        }
++#endif
+ 
+         if (bytes_per_pixel_requested == bytes_per_pixel_in_store) {
+             vk::ImageCopy image_copy{
+@@ -730,6 +827,7 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
+                 .imageExtent = { info.width, height, 1 }
+             };
+             cmd_buffer.copyImageToBuffer(info.texture.image, vk::ImageLayout::eGeneral, casted->transition_buffer.buffer, copy_image_buffer);
++            barrier_between_copy_steps(cmd_buffer, casted->transition_buffer.buffer);
+ 
+             // then the buffer to the image
+             const uint32_t dst_pixel_stride = (stride_bytes / bytes_per_pixel_requested) * state.res_multiplier;
+@@ -740,7 +838,7 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
+                 .setImageExtent({ width, height, 1 });
+             cmd_buffer.copyBufferToImage(casted->transition_buffer.buffer, casted->texture.image, vk::ImageLayout::eTransferDstOptimal, copy_image_buffer);
+         }
+-        casted->texture.transition_to(cmd_buffer, vkutil::ImageLayout::ColorAttachmentReadWrite);
++        barrier_after_surface_copy(cmd_buffer, casted->texture);
+ 
+         return TextureLookupResult{
+             casted->texture.view,
+@@ -1112,6 +1210,7 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_depth_stencil_as_tex
+     delta_row_samples *= state.res_multiplier;
+     delta_col_samples *= state.res_multiplier;
+ 
++    barrier_before_surface_copy(cmd_buffer);
+     read_only.depth_view.transition_to_discard(cmd_buffer, vkutil::ImageLayout::TransferDst, vkutil::ds_subresource_range);
+ 
+     cached_info.texture.transition_to(cmd_buffer, vkutil::ImageLayout::TransferSrc, vkutil::ds_subresource_range);
+@@ -1203,7 +1302,7 @@ Framebuffer &VKSurfaceCache::retrieve_framebuffer_handle(MemState &mem, SceGxmCo
          fb_interlock = state.device.createFramebuffer(fb_info);
      }
  
