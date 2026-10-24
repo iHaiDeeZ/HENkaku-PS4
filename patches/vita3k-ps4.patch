@@ -7414,10 +7414,10 @@ index 00000000..0574701a
 +} // namespace ps4bgdl
 diff --git a/vita3k/ps4/ps4_canvas.cpp b/vita3k/ps4/ps4_canvas.cpp
 new file mode 100644
-index 00000000..bf1078f1
+index 00000000..8bee2f7f
 --- /dev/null
 +++ b/vita3k/ps4/ps4_canvas.cpp
-@@ -0,0 +1,710 @@
+@@ -0,0 +1,904 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -7450,11 +7450,14 @@ index 00000000..bf1078f1
 +#include <stb_truetype.h>
 +
 +#include <algorithm>
++#include <atomic>
 +#include <cmath>
++#include <condition_variable>
 +#include <cstdio>
 +#include <cstring>
 +#include <memory>
 +#include <mutex>
++#include <thread>
 +#include <unordered_map>
 +
 +extern "C" void ps4_boot_trace(const char *line); // port/ps4_crashlog.cpp
@@ -7617,6 +7620,102 @@ index 00000000..bf1078f1
 +    return static_cast<uint8_t>(std::clamp(v, 0.f, 1.f) * 255.f + 0.5f);
 +}
 +
++// x * a / 255, rounded, without a division
++inline uint32_t mul255(uint32_t x, uint32_t a) {
++    const uint32_t t = x * a + 128;
++    return (t + (t >> 8)) >> 8;
++}
++
++// Three threads and the caller share a job's rows, in eight parts so they finish together. Waking
++// them costs some tens of microseconds, so small jobs don't. One job at a time: a second caller
++// meanwhile does its own alone.
++class RowPool {
++public:
++    static constexpr int THREADS = 3;
++    static constexpr int PARTS = 8;
++
++    RowPool() {
++        for (int i = 0; i < THREADS; i++)
++            std::thread([this] { work(); }).detach();
++    }
++
++    bool try_run(int y0, int y1, const std::function<void(int, int)> &fn) {
++        std::unique_lock<std::mutex> busy(run_mutex, std::try_to_lock);
++        if (!busy.owns_lock())
++            return false;
++        {
++            const std::lock_guard<std::mutex> lock(mutex);
++            job = &fn;
++            first = y0;
++            last = y1;
++            next.store(0);
++            done.store(0);
++            generation++;
++        }
++        wake.notify_all();
++        take_parts();
++        std::unique_lock<std::mutex> lock(mutex);
++        finished.wait(lock, [this] { return done.load() == PARTS; });
++        job = nullptr;
++        return true;
++    }
++
++private:
++    void take_parts() {
++        int ran = 0;
++        for (int part; (part = next.fetch_add(1)) < PARTS;) {
++            const int a = first + (last - first) * part / PARTS, b = first + (last - first) * (part + 1) / PARTS;
++            if (a < b)
++                (*job)(a, b);
++            ran++;
++        }
++        if (ran > 0 && done.fetch_add(ran) + ran == PARTS) {
++            const std::lock_guard<std::mutex> lock(mutex);
++            finished.notify_all();
++        }
++    }
++
++    void work() {
++        uint64_t seen = 0;
++        for (;;) {
++            {
++                std::unique_lock<std::mutex> lock(mutex);
++                wake.wait(lock, [&] { return generation != seen; });
++                seen = generation;
++            }
++            take_parts();
++        }
++    }
++
++    std::mutex run_mutex;
++    std::mutex mutex;
++    std::condition_variable wake;
++    std::condition_variable finished;
++    const std::function<void(int, int)> *job = nullptr;
++    int first = 0;
++    int last = 0;
++    std::atomic<int> next{ 0 };
++    std::atomic<int> done{ 0 };
++    uint64_t generation = 0;
++};
++
++thread_local bool t_serial = false;
++
++} // namespace
++
++void parallel_rows(int y0, int y1, size_t pixels, const std::function<void(int, int)> &fn) {
++    // (made once, and kept: its threads wait for work for as long as the app runs)
++    static RowPool *const pool = new RowPool;
++    if (y1 - y0 < 16 || pixels < 100000 || t_serial || !pool->try_run(y0, y1, fn))
++        fn(y0, y1);
++}
++
++void set_serial(bool serial) {
++    t_serial = serial;
++}
++
++namespace {
++
 +} // namespace
 +
 +bool fonts_loaded() {
@@ -7775,10 +7874,13 @@ index 00000000..bf1078f1
 +    if (src.w != w || src.h != h)
 +        return;
 +    const int x0 = std::max(0, dx), x1 = std::min(w, w + dx);
-+    if (x1 <= x0)
++    const int y0 = std::max(0, dy), y1 = std::min(h, h + dy);
++    if (x1 <= x0 || y1 <= y0)
 +        return;
-+    for (int y = std::max(0, dy); y < std::min(h, h + dy); y++)
-+        std::memcpy(&pixels[static_cast<size_t>(y) * w + x0], &src.pixels[static_cast<size_t>(y - dy) * w + (x0 - dx)], static_cast<size_t>(x1 - x0) * 4);
++    parallel_rows(y0, y1, static_cast<size_t>(y1 - y0) * (x1 - x0), [&](int a, int b) {
++        for (int y = a; y < b; y++)
++            std::memcpy(&pixels[static_cast<size_t>(y) * w + x0], &src.pixels[static_cast<size_t>(y - dy) * w + (x0 - dx)], static_cast<size_t>(x1 - x0) * 4);
++    });
 +}
 +
 +namespace {
@@ -7799,23 +7901,34 @@ index 00000000..bf1078f1
 +    const uint32_t ag = ((((p >> 8) & 0x00FF00FFu) * alpha + 0x00800080u) >> 8) & 0x00FF00FFu;
 +    return rb | (ag << 8);
 +}
++
++// between two pixels, per channel, f in 0..256
++inline uint32_t lerp(uint32_t a, uint32_t b, uint32_t f) {
++    const uint32_t rb = ((((a & 0x00FF00FFu) * (256 - f)) + ((b & 0x00FF00FFu) * f)) >> 8) & 0x00FF00FFu;
++    const uint32_t ag = (((((a >> 8) & 0x00FF00FFu) * (256 - f)) + (((b >> 8) & 0x00FF00FFu) * f)) >> 8) & 0x00FF00FFu;
++    return rb | (ag << 8);
++}
 +} // namespace
 +
 +void Canvas::blit(const Image &sprite, int x, int y, uint8_t alpha) {
 +    const int x0 = std::max(0, x), x1 = std::min(w, x + sprite.width);
 +    const int y0 = std::max(0, y), y1 = std::min(h, y + sprite.height);
-+    for (int yy = y0; yy < y1; yy++) {
-+        const uint32_t *src = &sprite.pixels[static_cast<size_t>(yy - y) * sprite.width + (x0 - x)];
-+        uint32_t *dst = &pixels[static_cast<size_t>(yy) * w + x0];
-+        for (int xx = x0; xx < x1; xx++, src++, dst++) {
-+            uint32_t p = *src;
-+            if (alpha != 255)
-+                p = fade(p, alpha + 1u);
-+            if ((p >> 24) == 0)
-+                continue;
-+            *dst = over(*dst, p);
++    if (x0 >= x1 || y0 >= y1)
++        return;
++    parallel_rows(y0, y1, static_cast<size_t>(y1 - y0) * (x1 - x0), [&](int a, int b) {
++        for (int yy = a; yy < b; yy++) {
++            const uint32_t *src = &sprite.pixels[static_cast<size_t>(yy - y) * sprite.width + (x0 - x)];
++            uint32_t *dst = &pixels[static_cast<size_t>(yy) * w + x0];
++            for (int xx = x0; xx < x1; xx++, src++, dst++) {
++                uint32_t p = *src;
++                if (alpha != 255)
++                    p = fade(p, alpha + 1u);
++                if ((p >> 24) == 0)
++                    continue;
++                *dst = over(*dst, p);
++            }
 +        }
-+    }
++    });
 +}
 +
 +void Canvas::blit_scaled(const Image &sprite, float cx, float cy, float scale, uint8_t alpha) {
@@ -7828,74 +7941,93 @@ index 00000000..bf1078f1
 +    const float half_w = sprite.width * scale / 2, half_h = sprite.height * scale / 2;
 +    const int x0 = std::max(0, static_cast<int>(cx - half_w)), x1 = std::min(w, static_cast<int>(cx + half_w) + 1);
 +    const int y0 = std::max(0, static_cast<int>(cy - half_h)), y1 = std::min(h, static_cast<int>(cy + half_h) + 1);
++    if (x0 >= x1 || y0 >= y1)
++        return;
 +    const float inv = 1.f / scale;
 +    // 16.16 fixed point source coordinates, bilinear
 +    const int32_t step = static_cast<int32_t>(inv * 65536.f);
 +    const int sw = sprite.width, sh = sprite.height;
-+    for (int yy = y0; yy < y1; yy++) {
-+        const float sy = (yy + 0.5f - cy) * inv + sh / 2.f - 0.5f;
-+        if (sy < -1.f || sy >= sh)
-+            continue;
-+        const int iy = static_cast<int>(std::floor(sy));
-+        const uint32_t fy = static_cast<uint32_t>((sy - iy) * 256.f);
-+        const bool top_in = iy >= 0, bottom_in = iy + 1 < sh;
-+        int32_t sx = static_cast<int32_t>(((x0 + 0.5f - cx) * inv + sw / 2.f - 0.5f) * 65536.f);
-+        uint32_t *dst = &pixels[static_cast<size_t>(yy) * w];
-+        for (int xx = x0; xx < x1; xx++, sx += step) {
-+            const int ix = sx >> 16;
-+            if (ix < -1 || ix >= sw)
++    const uint32_t *const sp = sprite.pixels.data();
++    parallel_rows(y0, y1, static_cast<size_t>(y1 - y0) * (x1 - x0), [&](int a, int b) {
++        for (int yy = a; yy < b; yy++) {
++            const float sy = (yy + 0.5f - cy) * inv + sh / 2.f - 0.5f;
++            if (sy < -1.f || sy >= sh)
 +                continue;
-+            const uint32_t fx = (static_cast<uint32_t>(sx) >> 8) & 0xFF;
-+            const auto at = [&](int px, int py, bool row_in) -> uint32_t {
-+                return row_in && px >= 0 && px < sw ? sprite.pixels[static_cast<size_t>(py) * sw + px] : 0u;
-+            };
-+            const uint32_t p00 = at(ix, iy, top_in), p10 = at(ix + 1, iy, top_in);
-+            const uint32_t p01 = at(ix, iy + 1, bottom_in), p11 = at(ix + 1, iy + 1, bottom_in);
-+            if ((p00 | p10 | p01 | p11) == 0)
-+                continue;
-+            const auto lerp = [](uint32_t a, uint32_t b, uint32_t f) {
-+                // per channel, f in 0..256
-+                const uint32_t rb = ((((a & 0x00FF00FFu) * (256 - f)) + ((b & 0x00FF00FFu) * f)) >> 8) & 0x00FF00FFu;
-+                const uint32_t ag = (((((a >> 8) & 0x00FF00FFu) * (256 - f)) + (((b >> 8) & 0x00FF00FFu) * f)) >> 8) & 0x00FF00FFu;
-+                return rb | (ag << 8);
-+            };
-+            uint32_t p = lerp(lerp(p00, p10, fx), lerp(p01, p11, fx), fy);
-+            if (alpha != 255)
-+                p = fade(p, alpha + 1u);
-+            if ((p >> 24) == 0)
-+                continue;
-+            dst[xx] = over(dst[xx], p);
++            const int iy = static_cast<int>(std::floor(sy));
++            const uint32_t fy = static_cast<uint32_t>((sy - iy) * 256.f);
++            const bool top_in = iy >= 0, bottom_in = iy + 1 < sh;
++            const uint32_t *const row0 = sp + static_cast<size_t>(std::max(iy, 0)) * sw;
++            const uint32_t *const row1 = sp + static_cast<size_t>(std::min(iy + 1, sh - 1)) * sw;
++            int32_t sx = static_cast<int32_t>(((x0 + 0.5f - cx) * inv + sw / 2.f - 0.5f) * 65536.f);
++            uint32_t *dst = &pixels[static_cast<size_t>(yy) * w];
++            for (int xx = x0; xx < x1; xx++, sx += step) {
++                const int ix = sx >> 16;
++                if (ix < -1 || ix >= sw)
++                    continue;
++                const uint32_t fx = (static_cast<uint32_t>(sx) >> 8) & 0xFF;
++                uint32_t p00, p10, p01, p11;
++                if (top_in && bottom_in && ix >= 0 && ix + 1 < sw) {
++                    // (inside the picture, as nearly all of them are)
++                    p00 = row0[ix];
++                    p10 = row0[ix + 1];
++                    p01 = row1[ix];
++                    p11 = row1[ix + 1];
++                } else {
++                    const bool left_in = ix >= 0, right_in = ix + 1 < sw;
++                    p00 = top_in && left_in ? row0[ix] : 0u;
++                    p10 = top_in && right_in ? row0[ix + 1] : 0u;
++                    p01 = bottom_in && left_in ? row1[ix] : 0u;
++                    p11 = bottom_in && right_in ? row1[ix + 1] : 0u;
++                }
++                if ((p00 | p10 | p01 | p11) == 0)
++                    continue;
++                uint32_t p = lerp(lerp(p00, p10, fx), lerp(p01, p11, fx), fy);
++                if (alpha != 255)
++                    p = fade(p, alpha + 1u);
++                if ((p >> 24) == 0)
++                    continue;
++                dst[xx] = over(dst[xx], p);
++            }
 +        }
-+    }
++    });
 +}
 +
 +void Canvas::blend(int x, int y, Color c, uint8_t cov) {
 +    if (x < 0 || y < 0 || x >= w || y >= h || cov == 0)
 +        return;
-+    const uint32_t a = (static_cast<uint32_t>(c.a) * cov + 127) / 255;
++    const uint32_t a = mul255(c.a, cov);
++    if (a == 0)
++        return;
 +    uint32_t &dst = pixels[static_cast<size_t>(y) * w + x];
 +    if (a == 255) {
 +        dst = pack(Color{ c.r, c.g, c.b, 255 });
 +        return;
 +    }
++    // (d * (255 - a) + c * a) / 255, rounded, without a division
 +    const uint32_t ia = 255 - a;
-+    const uint32_t r = ((dst & 0xFF) * ia + c.r * a + 127) / 255;
-+    const uint32_t g = (((dst >> 8) & 0xFF) * ia + c.g * a + 127) / 255;
-+    const uint32_t b = (((dst >> 16) & 0xFF) * ia + c.b * a + 127) / 255;
++    const auto mix = [](uint32_t d, uint32_t s, uint32_t sa, uint32_t sia) {
++        const uint32_t t = d * sia + s * sa + 128;
++        return (t + (t >> 8)) >> 8;
++    };
++    const uint32_t r = mix(dst & 0xFF, c.r, a, ia);
++    const uint32_t g = mix((dst >> 8) & 0xFF, c.g, a, ia);
++    const uint32_t b = mix((dst >> 16) & 0xFF, c.b, a, ia);
 +    dst = r | (g << 8) | (b << 16) | 0xFF000000u;
 +}
 +
 +void Canvas::clear_gradient(Color top, Color bottom) {
-+    for (int y = 0; y < h; y++) {
-+        const float t = static_cast<float>(y) / (h - 1);
-+        const Color c{
-+            static_cast<uint8_t>(top.r + (bottom.r - top.r) * t),
-+            static_cast<uint8_t>(top.g + (bottom.g - top.g) * t),
-+            static_cast<uint8_t>(top.b + (bottom.b - top.b) * t),
-+            255
-+        };
-+        std::fill_n(&pixels[static_cast<size_t>(y) * w], w, pack(c));
-+    }
++    parallel_rows(0, h, static_cast<size_t>(w) * h, [&](int a, int b) {
++        for (int y = a; y < b; y++) {
++            const float t = static_cast<float>(y) / std::max(1, h - 1);
++            const Color c{
++                static_cast<uint8_t>(top.r + (bottom.r - top.r) * t),
++                static_cast<uint8_t>(top.g + (bottom.g - top.g) * t),
++                static_cast<uint8_t>(top.b + (bottom.b - top.b) * t),
++                255
++            };
++            std::fill_n(&pixels[static_cast<size_t>(y) * w], w, pack(c));
++        }
++    });
 +}
 +
 +void Canvas::fill_rect(int x, int y, int width, int height, Color c) {
@@ -7905,25 +8037,72 @@ index 00000000..bf1078f1
 +        return;
 +    const uint32_t a = c.a;
 +    const uint32_t src = a == 255 ? pack(c) : ((c.r * a / 255) | ((c.g * a / 255) << 8) | ((c.b * a / 255) << 16) | (a << 24));
-+    for (int yy = y0; yy < y1; yy++) {
-+        uint32_t *row = &pixels[static_cast<size_t>(yy) * w];
-+        for (int xx = x0; xx < x1; xx++)
-+            row[xx] = over(row[xx], src);
-+    }
++    if (x0 >= x1 || y0 >= y1)
++        return;
++    parallel_rows(y0, y1, static_cast<size_t>(y1 - y0) * (x1 - x0), [&](int ra, int rb) {
++        for (int yy = ra; yy < rb; yy++) {
++            uint32_t *row = &pixels[static_cast<size_t>(yy) * w];
++            if (a == 255) {
++                std::fill(row + x0, row + x1, src);
++                continue;
++            }
++            for (int xx = x0; xx < x1; xx++)
++                row[xx] = over(row[xx], src);
++        }
++    });
 +}
 +
 +void Canvas::fill_round_rect(int x, int y, int width, int height, int radius, Color c) {
 +    radius = std::min({ radius, width / 2, height / 2 });
-+    for (int yy = std::max(y, 0); yy < std::min(y + height, h); yy++) {
-+        for (int xx = std::max(x, 0); xx < std::min(x + width, w); xx++) {
-+            // distance into the nearest corner's circle
-+            const float px = xx + 0.5f, py = yy + 0.5f;
-+            const float cx = std::clamp(px, static_cast<float>(x + radius), static_cast<float>(x + width - radius));
-+            const float cy = std::clamp(py, static_cast<float>(y + radius), static_cast<float>(y + height - radius));
-+            const float d = std::hypot(px - cx, py - cy);
-+            blend(xx, yy, c, coverage(radius - d + 0.5f));
-+        }
++    if (radius <= 0) {
++        fill_rect(x, y, width, height, c);
++        return;
 +    }
++    if (c.a == 0)
++        return;
++    const uint32_t a = c.a;
++    const uint32_t src = a == 255 ? pack(c) : ((c.r * a / 255) | ((c.g * a / 255) << 8) | ((c.b * a / 255) << 16) | (a << 24));
++    const int x0 = std::max(x, 0), x1 = std::min(x + width, w);
++    const int y0 = std::max(y, 0), y1 = std::min(y + height, h);
++    if (x0 >= x1 || y0 >= y1)
++        return;
++    const float r = static_cast<float>(radius);
++    const float left = static_cast<float>(x + radius), right = static_cast<float>(x + width - radius);
++    const float top = static_cast<float>(y + radius), bottom = static_cast<float>(y + height - radius);
++    // per row: the run fully inside in one go, only the pixels near the corners' arcs worked out
++    // (each pixel's distance to its corner was a hypot and a blend for every pixel of the row)
++    parallel_rows(y0, y1, static_cast<size_t>(y1 - y0) * (x1 - x0), [&](int ra, int rb) {
++        for (int yy = ra; yy < rb; yy++) {
++            uint32_t *row = &pixels[static_cast<size_t>(yy) * w];
++            const float py = yy + 0.5f;
++            const float dy = py - std::clamp(py, top, bottom);
++            // how far from the corners' centres the row is fully inside, and touched at all
++            const float full = (r - 0.5f) * (r - 0.5f) - dy * dy;
++            const float touched = (r + 0.5f) * (r + 0.5f) - dy * dy;
++            if (touched <= 0)
++                continue;
++            const float in = full > 0 ? std::sqrt(full) : -1.f;
++            const float out = std::sqrt(touched);
++            const int full0 = in >= 0 ? std::max(x0, static_cast<int>(std::ceil(left - in - 0.5f))) : x1;
++            const int full1 = in >= 0 ? std::min(x1, static_cast<int>(std::floor(right + in - 0.5f)) + 1) : x1;
++            const int edge0 = std::max(x0, static_cast<int>(std::floor(left - out - 0.5f)));
++            const int edge1 = std::min(x1, static_cast<int>(std::ceil(right + out - 0.5f)) + 1);
++            const auto edge_pixel = [&](int xx) {
++                const float px = xx + 0.5f;
++                const float d = std::hypot(px - std::clamp(px, left, right), dy);
++                blend(xx, yy, c, coverage(r - d + 0.5f));
++            };
++            for (int xx = edge0; xx < std::min(full0, edge1); xx++)
++                edge_pixel(xx);
++            if (a == 255)
++                std::fill(row + std::max(full0, x0), row + std::max(full1, full0), src);
++            else
++                for (int xx = full0; xx < full1; xx++)
++                    row[xx] = over(row[xx], src);
++            for (int xx = std::max(full1, edge0); xx < edge1; xx++)
++                edge_pixel(xx);
++        }
++    });
 +}
 +
 +void Canvas::fill_circle(float cx, float cy, float radius, Color c) {
@@ -7978,13 +8157,28 @@ index 00000000..bf1078f1
 +}
 +
 +void Canvas::draw_image(const Image &image, int x, int y, uint8_t alpha) {
-+    for (int yy = 0; yy < image.height; yy++) {
-+        for (int xx = 0; xx < image.width; xx++) {
-+            const uint32_t p = image.pixels[static_cast<size_t>(yy) * image.width + xx];
-+            const Color c{ static_cast<uint8_t>(p), static_cast<uint8_t>(p >> 8), static_cast<uint8_t>(p >> 16), static_cast<uint8_t>(p >> 24) };
-+            blend(x + xx, y + yy, c, alpha);
++    // (a picture's own alpha, not premultiplied: each pixel made so for over(), without a division)
++    const int x0 = std::max(0, x), x1 = std::min(w, x + image.width);
++    const int y0 = std::max(0, y), y1 = std::min(h, y + image.height);
++    if (x0 >= x1 || y0 >= y1)
++        return;
++    parallel_rows(y0, y1, static_cast<size_t>(y1 - y0) * (x1 - x0), [&](int ra, int rb) {
++        for (int yy = ra; yy < rb; yy++) {
++            const uint32_t *src = &image.pixels[static_cast<size_t>(yy - y) * image.width + (x0 - x)];
++            uint32_t *dst = &pixels[static_cast<size_t>(yy) * w + x0];
++            for (int xx = x0; xx < x1; xx++, src++, dst++) {
++                const uint32_t p = *src;
++                const uint32_t a = mul255(p >> 24, alpha);
++                if (a == 0)
++                    continue;
++                if (a == 255) {
++                    *dst = p | 0xFF000000u;
++                    continue;
++                }
++                *dst = over(*dst, mul255(p & 0xFF, a) | (mul255((p >> 8) & 0xFF, a) << 8) | (mul255((p >> 16) & 0xFF, a) << 16) | (a << 24));
++            }
 +        }
-+    }
++    });
 +}
 +
 +void Canvas::draw_image_circle(const Image &image, float cx, float cy, float radius, uint8_t alpha) {
@@ -8130,10 +8324,10 @@ index 00000000..bf1078f1
 +} // namespace ps4ui
 diff --git a/vita3k/ps4/ps4_canvas.h b/vita3k/ps4/ps4_canvas.h
 new file mode 100644
-index 00000000..6f5ad8c6
+index 00000000..141bb4ab
 --- /dev/null
 +++ b/vita3k/ps4/ps4_canvas.h
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,134 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -8156,7 +8350,9 @@ index 00000000..6f5ad8c6
 +
 +#pragma once
 +
++#include <cstddef>
 +#include <cstdint>
++#include <functional>
 +#include <string>
 +#include <string_view>
 +#include <vector>
@@ -8251,6 +8447,12 @@ index 00000000..6f5ad8c6
 +    int h;
 +    std::vector<uint32_t> pixels;
 +};
++
++// The canvas's big jobs run in parts on a few threads of its own and the caller (the launcher has
++// the console to itself): fn over the rows [y0, y1), here at once when the job is small (pixels).
++// A thread drawing in the background (a card being made) does its own work alone: set_serial(true).
++void parallel_rows(int y0, int y1, size_t pixels, const std::function<void(int, int)> &fn);
++void set_serial(bool serial);
 +
 +// Whether there are fonts (the text is missing otherwise)
 +bool fonts_loaded();
@@ -9309,10 +9511,10 @@ index 00000000..26e9a158
 +} // namespace ps4keyboard
 diff --git a/vita3k/ps4/ps4_launcher.cpp b/vita3k/ps4/ps4_launcher.cpp
 new file mode 100644
-index 00000000..2e8fb83c
+index 00000000..05b3b6b9
 --- /dev/null
 +++ b/vita3k/ps4/ps4_launcher.cpp
-@@ -0,0 +1,4153 @@
+@@ -0,0 +1,4441 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -9378,6 +9580,7 @@ index 00000000..2e8fb83c
 +#include <atomic>
 +#include <cctype>
 +#include <chrono>
++#include <condition_variable>
 +#include <cstdint>
 +#include <cstring>
 +#include <ctime>
@@ -9386,6 +9589,7 @@ index 00000000..2e8fb83c
 +#include <map>
 +#include <mutex>
 +#include <optional>
++#include <set>
 +#include <thread>
 +
 +extern "C" {
@@ -9523,7 +9727,13 @@ index 00000000..2e8fb83c
 +    if (!setup_buffers())
 +        return;
 +    wait_flipped();
-+    std::memcpy(buffers[current], canvas.data(), static_cast<size_t>(W) * H * 4);
++    // (by four threads: one alone took a few milliseconds to write the 8 MB to the display's memory)
++    const uint32_t *const src = canvas.data();
++    uint8_t *const dst = buffers[current];
++    ps4ui::parallel_rows(0, H, static_cast<size_t>(W) * H, [&](int a, int b) {
++        std::memcpy(dst + static_cast<size_t>(a) * W * 4, src + static_cast<size_t>(a) * W, static_cast<size_t>(b - a) * W * 4);
++        __builtin_ia32_sfence(); // each thread's write-combined stores out
++    });
 +    __atomic_thread_fence(__ATOMIC_SEQ_CST); // write-combined stores out before the flip
 +    const int flip = sceVideoOutSubmitFlip(ps4wsi_video_handle(), ps4wsi::LAUNCHER_FIRST_BUFFER + current, ORBIS_VIDEO_OUT_FLIP_VSYNC, FLIP_ARG_BASE + ++flips);
 +    if (!splash_hidden) {
@@ -10901,6 +11111,11 @@ index 00000000..2e8fb83c
 +    return look.made.emplace(index, std::move(canvas)).first->second.get();
 +}
 +
++// Whether its picture for a page is made
++bool vita_theme_made(const VitaThemeLook &look, int page) {
++    return !look.pictures.empty() && look.made.count(std::max(0, page) % static_cast<int>(look.pictures.size())) > 0;
++}
++
 +// The focus's colour: the PS Vita theme's, else the theme's
 +uint32_t accent_color() {
 +    const VitaThemeLook &look = vita_theme_look();
@@ -10923,23 +11138,25 @@ index 00000000..2e8fb83c
 +        w.thin_y[x] = static_cast<int>(wave - 46.f + 30.f * std::sin(fx * 8.1f + 2.1f + phase * 1.7f));
 +    }
 +    const int wide_r = static_cast<int>(w.wide.size() / 2), thin_r = static_cast<int>(w.thin.size() / 2);
-+    for (int y = 0; y < H; y++) {
-+        const uint32_t *src = w.base.data() + static_cast<size_t>(y) * W;
-+        uint32_t *dst = w.out.data() + static_cast<size_t>(y) * W;
-+        for (int x = 0; x < W; x++) {
-+            const int d1 = y - w.wide_y[x] + wide_r, d2 = y - w.thin_y[x] + thin_r;
-+            uint32_t light = (d1 >= 0 && d1 < 2 * wide_r ? w.wide[d1] : 0) + (d2 >= 0 && d2 < 2 * thin_r ? w.thin[d2] : 0);
-+            const uint32_t p = src[x];
-+            if (light == 0) {
-+                dst[x] = p;
-+                continue;
++    ps4ui::parallel_rows(0, H, static_cast<size_t>(W) * H, [&](int y_first, int y_last) {
++        for (int y = y_first; y < y_last; y++) {
++            const uint32_t *src = w.base.data() + static_cast<size_t>(y) * W;
++            uint32_t *dst = w.out.data() + static_cast<size_t>(y) * W;
++            for (int x = 0; x < W; x++) {
++                const int d1 = y - w.wide_y[x] + wide_r, d2 = y - w.thin_y[x] + thin_r;
++                uint32_t light = (d1 >= 0 && d1 < 2 * wide_r ? w.wide[d1] : 0) + (d2 >= 0 && d2 < 2 * thin_r ? w.thin[d2] : 0);
++                const uint32_t p = src[x];
++                if (light == 0) {
++                    dst[x] = p;
++                    continue;
++                }
++                light = std::min(light, 255u);
++                const int r = p & 0xFF, g = (p >> 8) & 0xFF, b = (p >> 16) & 0xFF;
++                dst[x] = static_cast<uint32_t>(r + (((tr - r) * static_cast<int>(light)) >> 8)) | (static_cast<uint32_t>(g + (((tg - g) * static_cast<int>(light)) >> 8)) << 8)
++                    | (static_cast<uint32_t>(b + (((tb - b) * static_cast<int>(light)) >> 8)) << 16) | 0xFF000000u;
 +            }
-+            light = std::min(light, 255u);
-+            const int r = p & 0xFF, g = (p >> 8) & 0xFF, b = (p >> 16) & 0xFF;
-+            dst[x] = static_cast<uint32_t>(r + (((tr - r) * static_cast<int>(light)) >> 8)) | (static_cast<uint32_t>(g + (((tg - g) * static_cast<int>(light)) >> 8)) << 8)
-+                | (static_cast<uint32_t>(b + (((tb - b) * static_cast<int>(light)) >> 8)) << 16) | 0xFF000000u;
 +        }
-+    }
++    });
 +    w.phase = phase;
 +}
 +
@@ -10990,20 +11207,22 @@ index 00000000..2e8fb83c
 +        }
 +        const uint32_t opacity = static_cast<uint32_t>(v.opacity * 256.f);
 +        const int top = std::max(0, static_cast<int>(v.y0 * H));
-+        for (int y = top; y < H; y++) {
-+            // (below the picture its last row goes on)
-+            const int row = std::min(wave.height - 1, static_cast<int>(((y + 0.5f) / H - v.y0) / v.h * wave.height));
-+            const uint32_t *src = wave.pixels.data() + static_cast<size_t>(row) * wave.width;
-+            uint32_t *dst = w.out.data() + static_cast<size_t>(y) * W;
-+            for (int x = 0; x < W; x++) {
-+                const uint32_t a = ((src[column[x]] >> 24) * opacity) >> 8;
-+                if (a == 0)
-+                    continue;
-+                const uint32_t p = dst[x];
-+                const uint32_t r = p & 0xFF, g = (p >> 8) & 0xFF, b = (p >> 16) & 0xFF;
-+                dst[x] = (r + (((255 - r) * a) >> 8)) | ((g + (((255 - g) * a) >> 8)) << 8) | ((b + (((255 - b) * a) >> 8)) << 16) | 0xFF000000u;
++        ps4ui::parallel_rows(top, H, static_cast<size_t>(W) * (H - top), [&](int y_first, int y_last) {
++            for (int y = y_first; y < y_last; y++) {
++                // (below the picture its last row goes on)
++                const int row = std::min(wave.height - 1, static_cast<int>(((y + 0.5f) / H - v.y0) / v.h * wave.height));
++                const uint32_t *src = wave.pixels.data() + static_cast<size_t>(row) * wave.width;
++                uint32_t *dst = w.out.data() + static_cast<size_t>(y) * W;
++                for (int x = 0; x < W; x++) {
++                    const uint32_t a = ((src[column[x]] >> 24) * opacity) >> 8;
++                    if (a == 0)
++                        continue;
++                    const uint32_t p = dst[x];
++                    const uint32_t r = p & 0xFF, g = (p >> 8) & 0xFF, b = (p >> 16) & 0xFF;
++                    dst[x] = (r + (((255 - r) * a) >> 8)) | ((g + (((255 - g) * a) >> 8)) << 8) | ((b + (((255 - b) * a) >> 8)) << 16) | 0xFF000000u;
++                }
 +            }
-+        }
++        });
 +    }
 +    w.phase = phase;
 +}
@@ -11043,16 +11262,18 @@ index 00000000..2e8fb83c
 +            const Theme &theme = current_theme();
 +            const Color top = rgb(theme.top), bottom = rgb(theme.bottom);
 +            uint32_t *p = w.base.data();
-+            for (int y = 0; y < H; y++) {
-+                const float fy = static_cast<float>(y) / H;
-+                for (int x = 0; x < W; x++) {
-+                    const float fx = static_cast<float>(x) / W;
-+                    // darker at the top corners
-+                    const float v = 1.f - 0.28f * (1.f - fy) * (std::fabs(fx - 0.5f) * 2.f);
-+                    const float r = (top.r + (bottom.r - top.r) * fy) * v, g = (top.g + (bottom.g - top.g) * fy) * v, b = (top.b + (bottom.b - top.b) * fy) * v;
-+                    p[static_cast<size_t>(y) * W + x] = static_cast<uint32_t>(r) | (static_cast<uint32_t>(g) << 8) | (static_cast<uint32_t>(b) << 16) | 0xFF000000u;
++            ps4ui::parallel_rows(0, H, static_cast<size_t>(W) * H, [&](int y_first, int y_last) {
++                for (int y = y_first; y < y_last; y++) {
++                    const float fy = static_cast<float>(y) / H;
++                    for (int x = 0; x < W; x++) {
++                        const float fx = static_cast<float>(x) / W;
++                        // darker at the top corners
++                        const float v = 1.f - 0.28f * (1.f - fy) * (std::fabs(fx - 0.5f) * 2.f);
++                        const float r = (top.r + (bottom.r - top.r) * fy) * v, g = (top.g + (bottom.g - top.g) * fy) * v, b = (top.b + (bottom.b - top.b) * fy) * v;
++                        p[static_cast<size_t>(y) * W + x] = static_cast<uint32_t>(r) | (static_cast<uint32_t>(g) << 8) | (static_cast<uint32_t>(b) << 16) | 0xFF000000u;
++                    }
 +                }
-+            }
++            });
 +            w.wide.resize(2 * 360);
 +            for (int i = 0; i < 720; i++) {
 +                const float d = (i - 360) / 120.f;
@@ -11177,82 +11398,84 @@ index 00000000..2e8fb83c
 +    const float c = SPRITE / 2.f, R = BUBBLE_R;
 +    // the icon's pixels for one of the bubble's: its shorter side right across the circle
 +    const float k = icon.empty() ? 0.f : std::min(icon.width, icon.height) / (2.f * R);
-+    for (int y = 0; y < SPRITE; y++) {
-+        for (int x = 0; x < SPRITE; x++) {
-+            const float px = x + 0.5f - c, py = y + 0.5f - c;
-+            const float d = std::sqrt(px * px + py * py);
-+            const float cov = std::clamp(R - d + 0.5f, 0.f, 1.f);
-+            float r = fill.r, g = fill.g, b = fill.b;
-+            if (cov > 0) {
-+                if (!icon.empty()) {
-+                    float p[4];
-+                    sample(icon, icon.width / 2.f + px * k - 0.5f, icon.height / 2.f + py * k - 0.5f, p);
-+                    const float a = p[3] / 255.f;
-+                    r = r * (1 - a) + p[0] * a;
-+                    g = g * (1 - a) + p[1] * a;
-+                    b = b * (1 - a) + p[2] * a;
++    ps4ui::parallel_rows(0, SPRITE, static_cast<size_t>(SPRITE) * SPRITE, [&](int y_first, int y_last) {
++        for (int y = y_first; y < y_last; y++) {
++            for (int x = 0; x < SPRITE; x++) {
++                const float px = x + 0.5f - c, py = y + 0.5f - c;
++                const float d = std::sqrt(px * px + py * py);
++                const float cov = std::clamp(R - d + 0.5f, 0.f, 1.f);
++                float r = fill.r, g = fill.g, b = fill.b;
++                if (cov > 0) {
++                    if (!icon.empty()) {
++                        float p[4];
++                        sample(icon, icon.width / 2.f + px * k - 0.5f, icon.height / 2.f + py * k - 0.5f, p);
++                        const float a = p[3] / 255.f;
++                        r = r * (1 - a) + p[0] * a;
++                        g = g * (1 - a) + p[1] * a;
++                        b = b * (1 - a) + p[2] * a;
++                    }
++                    const float nx = px / R, ny = py / R, nd = d / R;
++                    if (lit) {
++                        const float nz = std::sqrt(std::max(0.f, 1.f - nx * nx - ny * ny));
++                        // the light from the top left, the edge darker
++                        const float diffuse = std::clamp(-0.42f * nx - 0.55f * ny + 0.72f * nz, 0.f, 1.f);
++                        const float shade = (0.80f + 0.26f * diffuse) * (1.f - 0.20f * smoothstep(0.70f, 1.f, nd));
++                        r = std::min(255.f, r * shade);
++                        g = std::min(255.f, g * shade);
++                        b = std::min(255.f, b * shade);
++                        // the gloss over its top, a glint, the light coming round its bottom, and the
++                        // rim: light along its top, darker along its bottom
++                        const float gx = nx / 0.80f, gy = (ny + 0.50f) / 0.44f;
++                        const float gloss = 0.30f * smoothstep(1.f, 0.15f, gx * gx + gy * gy) * smoothstep(0.15f, -0.55f, ny);
++                        const float hx = nx + 0.36f, hy = ny + 0.56f;
++                        const float glint = 0.55f * std::exp(-(hx * hx + hy * hy) / 0.006f);
++                        const float bounce = 0.16f * smoothstep(0.78f, 0.98f, nd) * smoothstep(0.2f, 0.9f, ny);
++                        const float rim = std::clamp(2.f - std::fabs(d - (R - 1.8f)), 0.f, 1.f);
++                        const float light = std::min(1.f, gloss + glint + bounce + rim * (0.40f + 0.45f * std::clamp(-ny, 0.f, 1.f)));
++                        r += (255 - r) * light;
++                        g += (255 - g) * light;
++                        b += (255 - b) * light;
++                        const float dark = rim * 0.30f * std::clamp(ny, 0.f, 1.f);
++                        r *= 1 - dark;
++                        g *= 1 - dark;
++                        b *= 1 - dark;
++                    } else {
++                        // its edge a little shaded, lit again just inside the rim (the glass), then the
++                        // rim: a light line along it
++                        const float shade = 0.14f * smoothstep(R * 0.74f, R * 0.94f, d);
++                        r *= 1 - shade;
++                        g *= 1 - shade;
++                        b *= 1 - shade;
++                        const float inner = 0.22f * smoothstep(R - 12.f, R - 2.f, d);
++                        r += (255 - r) * inner;
++                        g += (255 - g) * inner;
++                        b += (255 - b) * inner;
++                        const float rim = std::clamp(2.2f - std::fabs(d - (R - 2.0f)), 0.f, 1.f) * 0.78f;
++                        r += (255 - r) * rim;
++                        g += (255 - g) * rim;
++                        b += (255 - b) * rim;
++                    }
 +                }
-+                const float nx = px / R, ny = py / R, nd = d / R;
++                // around it: the light (white), and in 3D a shadow under it
++                const float out_d = std::max(0.f, d - R);
++                float halo = d > R - 1 ? 0.42f * std::exp(-out_d * out_d / 55.f) : 0.f;
++                float shadow = 0.f;
 +                if (lit) {
-+                    const float nz = std::sqrt(std::max(0.f, 1.f - nx * nx - ny * ny));
-+                    // the light from the top left, the edge darker
-+                    const float diffuse = std::clamp(-0.42f * nx - 0.55f * ny + 0.72f * nz, 0.f, 1.f);
-+                    const float shade = (0.80f + 0.26f * diffuse) * (1.f - 0.20f * smoothstep(0.70f, 1.f, nd));
-+                    r = std::min(255.f, r * shade);
-+                    g = std::min(255.f, g * shade);
-+                    b = std::min(255.f, b * shade);
-+                    // the gloss over its top, a glint, the light coming round its bottom, and the
-+                    // rim: light along its top, darker along its bottom
-+                    const float gx = nx / 0.80f, gy = (ny + 0.50f) / 0.44f;
-+                    const float gloss = 0.30f * smoothstep(1.f, 0.15f, gx * gx + gy * gy) * smoothstep(0.15f, -0.55f, ny);
-+                    const float hx = nx + 0.36f, hy = ny + 0.56f;
-+                    const float glint = 0.55f * std::exp(-(hx * hx + hy * hy) / 0.006f);
-+                    const float bounce = 0.16f * smoothstep(0.78f, 0.98f, nd) * smoothstep(0.2f, 0.9f, ny);
-+                    const float rim = std::clamp(2.f - std::fabs(d - (R - 1.8f)), 0.f, 1.f);
-+                    const float light = std::min(1.f, gloss + glint + bounce + rim * (0.40f + 0.45f * std::clamp(-ny, 0.f, 1.f)));
-+                    r += (255 - r) * light;
-+                    g += (255 - g) * light;
-+                    b += (255 - b) * light;
-+                    const float dark = rim * 0.30f * std::clamp(ny, 0.f, 1.f);
-+                    r *= 1 - dark;
-+                    g *= 1 - dark;
-+                    b *= 1 - dark;
-+                } else {
-+                    // its edge a little shaded, lit again just inside the rim (the glass), then the
-+                    // rim: a light line along it
-+                    const float shade = 0.14f * smoothstep(R * 0.74f, R * 0.94f, d);
-+                    r *= 1 - shade;
-+                    g *= 1 - shade;
-+                    b *= 1 - shade;
-+                    const float inner = 0.22f * smoothstep(R - 12.f, R - 2.f, d);
-+                    r += (255 - r) * inner;
-+                    g += (255 - g) * inner;
-+                    b += (255 - b) * inner;
-+                    const float rim = std::clamp(2.2f - std::fabs(d - (R - 2.0f)), 0.f, 1.f) * 0.78f;
-+                    r += (255 - r) * rim;
-+                    g += (255 - g) * rim;
-+                    b += (255 - b) * rim;
++                    halo *= 0.65f;
++                    const float sd = std::max(0.f, std::hypot(px, py - 13.f) - (R - 4.f));
++                    shadow = 0.40f * std::exp(-sd * sd / 190.f);
 +                }
++                // (premultiplied: the light white, its colour its alpha, over the black shadow, and the
++                // bubble over both)
++                const float around = halo + shadow * (1 - halo);
++                const float a = cov + around * (1 - cov);
++                const float light = 255.f * halo * (1 - cov);
++                out.pixels[static_cast<size_t>(y) * SPRITE + x] = static_cast<uint32_t>(std::min(255.f, r * cov + light) + 0.5f)
++                    | (static_cast<uint32_t>(std::min(255.f, g * cov + light) + 0.5f) << 8)
++                    | (static_cast<uint32_t>(std::min(255.f, b * cov + light) + 0.5f) << 16) | (static_cast<uint32_t>(a * 255 + 0.5f) << 24);
 +            }
-+            // around it: the light (white), and in 3D a shadow under it
-+            const float out_d = std::max(0.f, d - R);
-+            float halo = d > R - 1 ? 0.42f * std::exp(-out_d * out_d / 55.f) : 0.f;
-+            float shadow = 0.f;
-+            if (lit) {
-+                halo *= 0.65f;
-+                const float sd = std::max(0.f, std::hypot(px, py - 13.f) - (R - 4.f));
-+                shadow = 0.40f * std::exp(-sd * sd / 190.f);
-+            }
-+            // (premultiplied: the light white, its colour its alpha, over the black shadow, and the
-+            // bubble over both)
-+            const float around = halo + shadow * (1 - halo);
-+            const float a = cov + around * (1 - cov);
-+            const float light = 255.f * halo * (1 - cov);
-+            out.pixels[static_cast<size_t>(y) * SPRITE + x] = static_cast<uint32_t>(std::min(255.f, r * cov + light) + 0.5f)
-+                | (static_cast<uint32_t>(std::min(255.f, g * cov + light) + 0.5f) << 8)
-+                | (static_cast<uint32_t>(std::min(255.f, b * cov + light) + 0.5f) << 16) | (static_cast<uint32_t>(a * 255 + 0.5f) << 24);
 +        }
-+    }
++    });
 +    return out;
 +}
 +
@@ -11844,25 +12067,27 @@ index 00000000..2e8fb83c
 +        const uint32_t g = (((p & 0x0000FF00u) * keep) >> 8) & 0x0000FF00u;
 +        return rb | g | 0xFF000000u;
 +    };
-+    for (int y = 0; y < H; y++) {
-+        uint32_t *row = dst + static_cast<size_t>(y) * W;
-+        const uint32_t *from = src + static_cast<size_t>(y) * W;
-+        // right of the fold: what's under the card
-+        const int fold = std::clamp(static_cast<int>(W + y - d), 0, W);
-+        const int flap = y <= d ? std::clamp(static_cast<int>(std::max(W + y - 2 * d, W - d)), 0, fold) : fold;
-+        std::memcpy(row, from, static_cast<size_t>(flap) * 4);
-+        // the flap's shadow on the card
-+        for (int x = std::max(0, flap - 22); x < flap; x++)
-+            row[x] = darken(row[x], 150 + (flap - x) * 105 / 22);
-+        for (int x = flap; x < fold; x++) {
-+            const float t = std::clamp((fold - x) / std::max(1.f, d), 0.f, 1.f);
-+            const uint32_t v = static_cast<uint32_t>(246 - 70 * t);
-+            row[x] = v | (v << 8) | (std::min(255u, v + 8) << 16) | 0xFF000000u;
++    ps4ui::parallel_rows(0, H, static_cast<size_t>(W) * H, [&](int y_first, int y_last) {
++        for (int y = y_first; y < y_last; y++) {
++            uint32_t *row = dst + static_cast<size_t>(y) * W;
++            const uint32_t *from = src + static_cast<size_t>(y) * W;
++            // right of the fold: what's under the card
++            const int fold = std::clamp(static_cast<int>(W + y - d), 0, W);
++            const int flap = y <= d ? std::clamp(static_cast<int>(std::max(W + y - 2 * d, W - d)), 0, fold) : fold;
++            std::memcpy(row, from, static_cast<size_t>(flap) * 4);
++            // the flap's shadow on the card
++            for (int x = std::max(0, flap - 22); x < flap; x++)
++                row[x] = darken(row[x], 150 + (flap - x) * 105 / 22);
++            for (int x = flap; x < fold; x++) {
++                const float t = std::clamp((fold - x) / std::max(1.f, d), 0.f, 1.f);
++                const uint32_t v = static_cast<uint32_t>(246 - 70 * t);
++                row[x] = v | (v << 8) | (std::min(255u, v + 8) << 16) | 0xFF000000u;
++            }
++            // the fold's shadow on what's under
++            for (int x = fold; x < std::min(W, fold + 26); x++)
++                row[x] = darken(row[x], 140 + (x - fold) * 115 / 26);
 +        }
-+        // the fold's shadow on what's under
-+        for (int x = fold; x < std::min(W, fold + 26); x++)
-+            row[x] = darken(row[x], 140 + (x - fold) * 115 / 26);
-+    }
++    });
 +}
 +
 +// --- the home screen as LiveArea cards ---
@@ -11921,8 +12146,7 @@ index 00000000..2e8fb83c
 +// A card's face: its LiveArea's background (else the theme's colours, its bubble large and faint),
 +// its bubble and name across the top, and its start gate (HENkaku's own cards: their glyph)
 +void draw_card_face(Canvas &c, const CardPictures &p, const ps4ui::Image &bubble, const std::string &title, const std::string &detail,
-+    TileKind kind, const ps4ui::Image &henkaku_icon) {
-+    const Theme theme = current_theme();
++    TileKind kind, const ps4ui::Image &henkaku_icon, const Theme &theme) {
 +    if (!p.background.empty()) {
 +        ps4ui::Image bg = p.background;
 +        for (uint32_t &px : bg.pixels)
@@ -11976,52 +12200,54 @@ index 00000000..2e8fb83c
 +        return std::hypot(std::max(qx, 0.f), std::max(qy, 0.f)) + std::min(std::max(qx, qy), 0.f) - CARD_RADIUS;
 +    };
 +    constexpr float GAP = 8.f; // between the card and its reflection
-+    for (int y = 0; y < CARD_SPRITE_H; y++) {
-+        const float cy = y + 0.5f - CARD_PAD;
-+        for (int x = 0; x < CARD_SPRITE_W; x++) {
-+            const float cx = x + 0.5f - CARD_PAD;
-+            float r = 0, g = 0, b = 0;
-+            // the shadow, a little lower (black: premultiplied, no colour)
-+            const float sd = std::max(0.f, edge(cx, cy - 18.f));
-+            float a = 0.42f * std::exp(-sd * sd / 500.f);
-+            // the reflection: the card upside down under it, over the shadow
-+            if (cy >= CARD_H + GAP && cx >= 0 && cx < CARD_W) {
-+                const float m = cy - (CARD_H + GAP);
-+                if (m < CARD_REFLECTION) {
-+                    const float sy = CARD_H - 1.f - m;
-+                    const float t = 1.f - m / CARD_REFLECTION;
-+                    const float k = std::clamp(0.5f - edge(cx, sy + 0.5f), 0.f, 1.f) * 0.30f * t * t;
-+                    if (k > 0) {
-+                        const uint32_t p = src[static_cast<size_t>(sy) * CARD_W + static_cast<int>(cx)];
-+                        r = (p & 0xFF) * k;
-+                        g = ((p >> 8) & 0xFF) * k;
-+                        b = ((p >> 16) & 0xFF) * k;
-+                        a = k + a * (1 - k);
++    ps4ui::parallel_rows(0, CARD_SPRITE_H, static_cast<size_t>(CARD_SPRITE_W) * CARD_SPRITE_H, [&](int y_first, int y_last) {
++        for (int y = y_first; y < y_last; y++) {
++            const float cy = y + 0.5f - CARD_PAD;
++            for (int x = 0; x < CARD_SPRITE_W; x++) {
++                const float cx = x + 0.5f - CARD_PAD;
++                float r = 0, g = 0, b = 0;
++                // the shadow, a little lower (black: premultiplied, no colour)
++                const float sd = std::max(0.f, edge(cx, cy - 18.f));
++                float a = 0.42f * std::exp(-sd * sd / 500.f);
++                // the reflection: the card upside down under it, over the shadow
++                if (cy >= CARD_H + GAP && cx >= 0 && cx < CARD_W) {
++                    const float m = cy - (CARD_H + GAP);
++                    if (m < CARD_REFLECTION) {
++                        const float sy = CARD_H - 1.f - m;
++                        const float t = 1.f - m / CARD_REFLECTION;
++                        const float k = std::clamp(0.5f - edge(cx, sy + 0.5f), 0.f, 1.f) * 0.30f * t * t;
++                        if (k > 0) {
++                            const uint32_t p = src[static_cast<size_t>(sy) * CARD_W + static_cast<int>(cx)];
++                            r = (p & 0xFF) * k;
++                            g = ((p >> 8) & 0xFF) * k;
++                            b = ((p >> 16) & 0xFF) * k;
++                            a = k + a * (1 - k);
++                        }
 +                    }
 +                }
++                // the card
++                const float d = edge(cx, cy);
++                const float cov = std::clamp(0.5f - d, 0.f, 1.f);
++                if (cov > 0) {
++                    const int sx = std::clamp(static_cast<int>(cx), 0, CARD_W - 1), sy = std::clamp(static_cast<int>(cy), 0, CARD_H - 1);
++                    const uint32_t p = src[static_cast<size_t>(sy) * CARD_W + sx];
++                    float pr = p & 0xFF, pg = (p >> 8) & 0xFF, pb = (p >> 16) & 0xFF;
++                    const float rim = std::clamp(1.6f - std::fabs(d + 1.6f), 0.f, 1.f) * 0.38f;
++                    const float sheen = 0.10f * std::clamp(1.f - (cy + 0.45f * cx) / (0.85f * CARD_H), 0.f, 1.f);
++                    const float light = std::min(1.f, rim + sheen);
++                    pr += (255 - pr) * light;
++                    pg += (255 - pg) * light;
++                    pb += (255 - pb) * light;
++                    r = pr * cov + r * (1 - cov);
++                    g = pg * cov + g * (1 - cov);
++                    b = pb * cov + b * (1 - cov);
++                    a = cov + a * (1 - cov);
++                }
++                out.pixels[static_cast<size_t>(y) * out.width + x] = static_cast<uint32_t>(std::min(255.f, r) + 0.5f) | (static_cast<uint32_t>(std::min(255.f, g) + 0.5f) << 8)
++                    | (static_cast<uint32_t>(std::min(255.f, b) + 0.5f) << 16) | (static_cast<uint32_t>(std::min(1.f, a) * 255 + 0.5f) << 24);
 +            }
-+            // the card
-+            const float d = edge(cx, cy);
-+            const float cov = std::clamp(0.5f - d, 0.f, 1.f);
-+            if (cov > 0) {
-+                const int sx = std::clamp(static_cast<int>(cx), 0, CARD_W - 1), sy = std::clamp(static_cast<int>(cy), 0, CARD_H - 1);
-+                const uint32_t p = src[static_cast<size_t>(sy) * CARD_W + sx];
-+                float pr = p & 0xFF, pg = (p >> 8) & 0xFF, pb = (p >> 16) & 0xFF;
-+                const float rim = std::clamp(1.6f - std::fabs(d + 1.6f), 0.f, 1.f) * 0.38f;
-+                const float sheen = 0.10f * std::clamp(1.f - (cy + 0.45f * cx) / (0.85f * CARD_H), 0.f, 1.f);
-+                const float light = std::min(1.f, rim + sheen);
-+                pr += (255 - pr) * light;
-+                pg += (255 - pg) * light;
-+                pb += (255 - pb) * light;
-+                r = pr * cov + r * (1 - cov);
-+                g = pg * cov + g * (1 - cov);
-+                b = pb * cov + b * (1 - cov);
-+                a = cov + a * (1 - cov);
-+            }
-+            out.pixels[static_cast<size_t>(y) * out.width + x] = static_cast<uint32_t>(std::min(255.f, r) + 0.5f) | (static_cast<uint32_t>(std::min(255.f, g) + 0.5f) << 8)
-+                | (static_cast<uint32_t>(std::min(255.f, b) + 0.5f) << 16) | (static_cast<uint32_t>(std::min(1.f, a) * 255 + 0.5f) << 24);
 +        }
-+    }
++    });
 +    return out;
 +}
 +
@@ -12032,7 +12258,126 @@ index 00000000..2e8fb83c
 +    Clock::time_point launch_at{};
 +};
 +
-+void draw_cards(Canvas &c, CardsView &v, int count, const std::function<const ps4ui::Image &(int)> &card) {
++// LiveArea cards made on a thread of their own, the nearest to the card in front first: a card
++// takes some 50 ms (its LiveArea's pictures read, its face drawn, its shadow and reflection), which
++// held up the frames each time one came into view. A plain card stands in until it's made.
++class CardBuilder {
++public:
++    struct Job {
++        int index = 0;
++        fs::path app_dir; // a game's or a firmware app's (empty: HENkaku's own cards)
++        std::string title;
++        std::string detail;
++        TileKind kind = TileKind::Game;
++        ps4ui::Image bubble;
++        Theme theme{};
++    };
++
++    explicit CardBuilder(const ps4ui::Image &henkaku_icon)
++        : henkaku_icon(henkaku_icon)
++        , thread([this] { work(); }) {}
++
++    ~CardBuilder() {
++        {
++            const std::lock_guard<std::mutex> lock(mutex);
++            stop = true;
++        }
++        wake.notify_all();
++        thread.join();
++    }
++
++    // a card wanted (asked for once, until it's taken)
++    void request(Job job) {
++        const std::lock_guard<std::mutex> lock(mutex);
++        if (!asked.insert(job.index).second)
++            return;
++        jobs.push_back(std::move(job));
++        wake.notify_one();
++    }
++
++    // the card in front (the nearest ones are made first)
++    void set_front(int index) { front.store(index); }
++
++    // a card made since, if it's this one
++    std::optional<ps4ui::Image> take(int index) {
++        const std::lock_guard<std::mutex> lock(mutex);
++        const auto it = made.find(index);
++        if (it == made.end())
++            return std::nullopt;
++        ps4ui::Image card = std::move(it->second);
++        made.erase(it);
++        asked.erase(index);
++        return card;
++    }
++
++    // whether a card was made since the last time this was asked (a frame to show it)
++    bool arrived() { return made_flag.exchange(false); }
++
++    // the cards asked for and made go (the look or the games changed)
++    void forget() {
++        const std::lock_guard<std::mutex> lock(mutex);
++        generation++;
++        jobs.clear();
++        made.clear();
++        asked.clear();
++    }
++
++private:
++    void work() {
++        // (its canvases work alone: the pool's threads are the frames')
++        ps4ui::set_serial(true);
++        for (;;) {
++            Job job;
++            uint64_t made_for = 0;
++            {
++                std::unique_lock<std::mutex> lock(mutex);
++                wake.wait(lock, [this] { return stop || !jobs.empty(); });
++                if (stop)
++                    return;
++                const int at = front.load();
++                const auto nearest = std::min_element(jobs.begin(), jobs.end(), [at](const Job &a, const Job &b) {
++                    return std::abs(a.index - at) < std::abs(b.index - at);
++                });
++                job = std::move(*nearest);
++                jobs.erase(nearest);
++                made_for = generation;
++            }
++            Canvas face(CARD_W, CARD_H);
++            const CardPictures pictures = job.app_dir.empty() ? CardPictures{} : load_card_pictures(job.app_dir);
++            draw_card_face(face, pictures, job.bubble, job.title, job.detail, job.kind, henkaku_icon, job.theme);
++            ps4ui::Image card = card_sprite(face);
++            {
++                const std::lock_guard<std::mutex> lock(mutex);
++                if (made_for != generation)
++                    continue;
++                made[job.index] = std::move(card);
++            }
++            made_flag.store(true);
++        }
++    }
++
++    const ps4ui::Image &henkaku_icon;
++    std::mutex mutex;
++    std::condition_variable wake;
++    std::vector<Job> jobs;
++    std::set<int> asked;
++    std::map<int, ps4ui::Image> made;
++    std::atomic<int> front{ 0 };
++    std::atomic<bool> made_flag{ false };
++    uint64_t generation = 0;
++    bool stop = false;
++    std::thread thread; // (last: it starts with the rest ready)
++};
++
++// A card not made yet: a plain one, its bubble in the middle
++void card_placeholder(Canvas &c, float x, float scale, const ps4ui::Image &bubble, uint8_t alpha) {
++    const int cw = static_cast<int>(CARD_W * scale), ch = static_cast<int>(CARD_H * scale);
++    c.fill_round_rect(static_cast<int>(x) - cw / 2, static_cast<int>(CARD_Y) - ch / 2, cw, ch, static_cast<int>(CARD_RADIUS * scale), rgb(0x0a1222, static_cast<uint8_t>(alpha * 0.8f)));
++    if (!bubble.empty())
++        c.blit_scaled(bubble, x, CARD_Y, scale * 0.8f, alpha);
++}
++
++void draw_cards(Canvas &c, CardsView &v, int count, const std::function<const ps4ui::Image *(int)> &card, const std::function<TileArt &(int)> &art) {
 +    draw_wallpaper(c, 0, 0.f);
 +    const float pos = v.pos.pos;
 +    std::vector<int> order;
@@ -12050,7 +12395,11 @@ index 00000000..2e8fb83c
 +            continue;
 +        if (v.launching && i == static_cast<int>(std::lround(pos)))
 +            continue;
-+        c.blit_scaled(card(i), x, card_sprite_y(scale), scale, static_cast<uint8_t>(255 - 70 * std::min(1.f, a)));
++        const uint8_t alpha = static_cast<uint8_t>(255 - 70 * std::min(1.f, a));
++        if (const ps4ui::Image *sprite = card(i))
++            c.blit_scaled(*sprite, x, card_sprite_y(scale), scale, alpha);
++        else
++            card_placeholder(c, x, scale, art(i).bubble, alpha);
 +    }
 +    // where it is among them
 +    if (count > 1) {
@@ -12132,6 +12481,69 @@ index 00000000..2e8fb83c
 +    if (item.type != SItem::kind::choice || count == 0 || !item.set)
 +        return;
 +    item.set((std::max(choice_value(item), 0) + step + count) % count);
++}
++
++// The wallpaper picker's pictures, loaded on a thread of their own (a big JPEG took some 60 ms
++// each time the picker moved to one): the one picked shows when it's ready, the last eight kept
++class PreviewLoader {
++public:
++    PreviewLoader()
++        : thread([this] { work(); }) {
++        thread.detach();
++    }
++
++    // the picture, or nothing while it loads (asked for then)
++    std::shared_ptr<const ps4ui::Image> get(const std::string &path) {
++        const std::lock_guard<std::mutex> lock(mutex);
++        const auto it = loaded.find(path);
++        if (it != loaded.end())
++            return it->second;
++        wanted = path;
++        wake.notify_one();
++        return nullptr;
++    }
++
++    // whether a picture came since the last time this was asked (a frame to show it)
++    bool arrived() { return arrived_flag.exchange(false); }
++
++private:
++    void work() {
++        ps4ui::set_serial(true);
++        for (;;) {
++            std::string path;
++            {
++                std::unique_lock<std::mutex> lock(mutex);
++                wake.wait(lock, [this] { return !wanted.empty(); });
++                path = std::move(wanted);
++                wanted.clear();
++                if (loaded.count(path))
++                    continue;
++            }
++            auto picture = std::make_shared<ps4ui::Image>(ps4ui::load_image(path, 640, 360));
++            for (uint32_t &p : picture->pixels)
++                p |= 0xFF000000u;
++            {
++                const std::lock_guard<std::mutex> lock(mutex);
++                if (loaded.size() >= 8)
++                    loaded.clear();
++                loaded.emplace(path, std::move(picture));
++            }
++            arrived_flag.store(true);
++        }
++    }
++
++    std::mutex mutex;
++    std::condition_variable wake;
++    std::string wanted;
++    std::map<std::string, std::shared_ptr<const ps4ui::Image>> loaded;
++    std::atomic<bool> arrived_flag{ false };
++    std::thread thread;
++};
++
++PreviewLoader &preview_loader() {
++    // (made once and kept: its thread waits for pictures for as long as the app runs)
++    static PreviewLoader *const loader = new PreviewLoader;
++    return *loader;
 +}
 +
 +void draw_settings(Canvas &c, SettingsView &view, const ps4ui::Image &henkaku) {
@@ -12243,18 +12655,12 @@ index 00000000..2e8fb83c
 +        c.fill_rect(px, py, PREVIEW_W, PREVIEW_H, rgb(0x000000));
 +        const SItem *picked = level.selected < count ? &items[level.selected] : nullptr;
 +        if (picked && !picked->preview.empty()) {
-+            static std::map<std::string, ps4ui::Image> thumbnails;
-+            auto it = thumbnails.find(picked->preview);
-+            if (it == thumbnails.end()) {
-+                if (thumbnails.size() >= 8)
-+                    thumbnails.clear();
-+                ps4ui::Image picture = ps4ui::load_image(picked->preview, PREVIEW_W, PREVIEW_H);
-+                for (uint32_t &p : picture.pixels)
-+                    p |= 0xFF000000u;
-+                it = thumbnails.emplace(picked->preview, std::move(picture)).first;
++            if (const std::shared_ptr<const ps4ui::Image> picture = preview_loader().get(picked->preview)) {
++                if (!picture->empty())
++                    c.draw_image(*picture, px + (PREVIEW_W - picture->width) / 2, py + (PREVIEW_H - picture->height) / 2);
++            } else {
++                c.text_centered(px + PREVIEW_W / 2, py + PREVIEW_H / 2 + 12, "Loading...", 30, MUTED, Weight::Bold);
 +            }
-+            if (!it->second.empty())
-+                c.draw_image(it->second, px + (PREVIEW_W - it->second.width) / 2, py + (PREVIEW_H - it->second.height) / 2);
 +            c.text(px, py + PREVIEW_H + 50, fs_utils::path_to_utf8(fs::path(picked->preview).filename()), 26, MUTED, Weight::Regular, PREVIEW_W);
 +        } else {
 +            c.text_centered(px + PREVIEW_W / 2, py + PREVIEW_H / 2 + 12, "The theme's own wallpaper", 30, MUTED, Weight::Bold);
@@ -12669,43 +13075,55 @@ index 00000000..2e8fb83c
 +        }
 +        show_card(static_cast<int>(it - cards.begin()) + 1);
 +    };
-+    // the LiveArea cards' pictures (HENkaku > Themes > Style), by tile, made when first needed (or
-+    // ahead, while nothing moves), seven at most
-+    const auto card_art = [&](int index) -> const ps4ui::Image & {
++    // the LiveArea cards (HENkaku > Themes > Style), by tile: made by the card builder, nullptr until
++    // then; seven kept, the farthest from the one in front going
++    CardBuilder card_builder(henkaku_icon);
++    const auto card_art = [&](int index) -> const ps4ui::Image * {
 +        TileArt &t = tile_art(index);
 +        if (!t.card.empty())
-+            return t.card;
++            return &t.card;
++        std::optional<ps4ui::Image> made = card_builder.take(index);
++        if (!made) {
++            const Tile &tl = tiles[index];
++            CardBuilder::Job job;
++            job.index = index;
++            job.kind = tl.kind;
++            job.title = tile_title(tl, items);
++            job.bubble = t.bubble;
++            job.theme = current_theme();
++            if (tl.kind == TileKind::Game) {
++                const Item &item = items[tl.item];
++                job.app_dir = item.dir.empty() ? emuenv.vita_fs_path / "ux0" / "app" / item.entry.path : item.dir;
++                job.detail = item.entry.title_id + (item.entry.app_ver.empty() ? "" : "   v" + item.entry.app_ver);
++            } else {
++                job.detail = tl.kind == TileKind::Henkaku ? "Settings, themes and the firmware" : "Games, updates, DLC and themes";
++            }
++            card_builder.request(std::move(job));
++            return nullptr;
++        }
 +        for (;;) {
-+            int made = 0, farthest = -1;
++            int kept = 0, farthest = -1;
 +            for (auto &[i, a] : art) {
 +                if (a.card.empty() || i == index)
 +                    continue;
-+                made++;
++                kept++;
 +                if (farthest < 0 || std::abs(i - tile) > std::abs(farthest - tile))
 +                    farthest = i;
 +            }
-+            if (made < 6 || farthest < 0)
++            if (kept < 6 || farthest < 0)
 +                break;
 +            art[farthest].card = {};
 +        }
-+        const Tile &tl = tiles[index];
-+        Canvas face(CARD_W, CARD_H);
-+        CardPictures pictures;
-+        std::string detail;
-+        if (tl.kind == TileKind::Game) {
-+            const Item &item = items[tl.item];
-+            pictures = load_card_pictures(item.dir.empty() ? emuenv.vita_fs_path / "ux0" / "app" / item.entry.path : item.dir);
-+            detail = item.entry.title_id + (item.entry.app_ver.empty() ? "" : "   v" + item.entry.app_ver);
-+        } else if (tl.kind == TileKind::Henkaku) {
-+            detail = "Settings, themes and the firmware";
-+        } else {
-+            detail = "Games, updates, DLC and themes";
-+        }
-+        draw_card_face(face, pictures, t.bubble, tile_title(tl, items), detail, tl.kind, henkaku_icon);
-+        t.card = card_sprite(face);
-+        return t.card;
++        t.card = std::move(*made);
++        return &t.card;
 +    };
-+    const std::function<const ps4ui::Image &(int)> card_art_fn = card_art;
++    const std::function<const ps4ui::Image *(int)> card_art_fn = card_art;
++    // what the bubbles and cards are made with (made again when it changes)
++    const auto art_look = [&] {
++        const Theme theme = current_theme();
++        return fmt::format("{}|{}|{:06x}|{:06x}", prefs.bubbles_3d, prefs.vita_theme, theme.top, theme.bottom);
++    };
++    std::string made_look = art_look();
 +    CardsView cards_view;
 +    cards_view.pos.pos = static_cast<float>(tile);
 +
@@ -12850,7 +13268,86 @@ index 00000000..2e8fb83c
 +    auto last_frame = Clock::now();
 +    std::string shown_clock = clock_text();
 +
++    // A frame to the screen: present() waits for the one before to be shown first, which paces the
++    // frames at the TV's refresh (a fixed 16 ms after each one put them one or two refreshes apart:
++    // the stutter). With the renderer profiler on (HENkaku > Diagnostics), the frames' times every
++    // 10 s: how long they took to draw, and how many reached the screen later than the next refresh.
++    bool shown = false;
++    Clock::time_point draw_start{};
++    struct FrameTimes {
++        int frames = 0;
++        int late = 0;
++        double draw = 0;
++        double worst = 0;
++        Clock::time_point since{};
++        Clock::time_point last{};
++    } frame_times;
++    const auto show = [&] {
++        const auto drawn = Clock::now();
++        present(canvas);
++        shown = true;
++        if (!prefs.host_profiler)
++            return;
++        const auto at = Clock::now();
++        FrameTimes &f = frame_times;
++        if (f.frames == 0)
++            f.since = at;
++        else if (const float apart = ms_since(f.last, at); apart > 22.f && apart < 100.f)
++            f.late++;
++        const double ms = std::chrono::duration<double, std::milli>(drawn - draw_start).count();
++        f.frames++;
++        f.draw += ms;
++        f.worst = std::max(f.worst, ms);
++        f.last = at;
++        if (at - f.since >= std::chrono::seconds(10)) {
++            LOG_INFO("launcher: {} frames in {:.0f} s, drawn in {:.1f} ms on average, {:.1f} ms at worst, {} a refresh late or more",
++                f.frames, std::chrono::duration<double>(at - f.since).count(), f.draw / f.frames, f.worst, f.late);
++            f = FrameTimes{};
++        }
++    };
++    // Made ahead while nothing moves, one piece at a time so a button still answers at once: the
++    // bubbles (this page's, then the pages around it, all of them in the end), a PS Vita theme's
++    // pictures of the pages next to this one, the cards next to the one in front (asked of the card
++    // builder). Whether something was made here.
++    const auto make_ahead = [&]() -> bool {
++        if (mode != Mode::Home)
++            return false;
++        if (prefs.home_style == ps4settings::HOME_BUBBLES) {
++            const int count = static_cast<int>(tiles.size());
++            const int pages = (count + PER_PAGE - 1) / PER_PAGE;
++            for (int d = 0; d < pages; d++) {
++                for (const int page : { home.page + d, home.page - d }) {
++                    if (page < 0 || page >= pages || (d == 0 && page != home.page))
++                        continue;
++                    for (int i = page * PER_PAGE; i < std::min(count, (page + 1) * PER_PAGE); i++) {
++                        if (!art.count(i)) {
++                            tile_art(i);
++                            return true;
++                        }
++                    }
++                }
++            }
++            VitaThemeLook &look = vita_theme_look();
++            if (prefs.wallpaper.empty() && !look.pictures.empty()) {
++                for (const int page : { home.page + 1, home.page - 1 }) {
++                    if (page >= 0 && !vita_theme_made(look, page)) {
++                        vita_theme_picture(look, page);
++                        return true;
++                    }
++                }
++            }
++        } else if (prefs.home_style == ps4settings::HOME_CARDS) {
++            card_builder.set_front(tile);
++            for (const int i : { tile, tile + 1, tile - 1, tile + 2, tile - 2 }) {
++                if (i >= 0 && i < static_cast<int>(tiles.size()))
++                    card_art(i);
++            }
++        }
++        return false;
++    };
++
 +    while (true) {
++        shown = false;
 +        const ps4pad::Snapshot pad = ps4pad::read();
 +        uint32_t buttons = pad.buttons;
 +        // the left stick as the D-pad
@@ -12900,6 +13397,7 @@ index 00000000..2e8fb83c
 +                items = load_items(emuenv);
 +                tiles = make_tiles(items);
 +                art.clear();
++                card_builder.forget();
 +                card_pictures.clear();
 +                cards.erase(std::remove_if(cards.begin(), cards.end(), [&](const std::string &path) { return find_item(path) < 0; }), cards.end());
 +                show_card(0);
@@ -13098,7 +13596,12 @@ index 00000000..2e8fb83c
 +                        if (mode == Mode::LiveArea && prefs.home_style != ps4settings::HOME_BUBBLES)
 +                            mode = Mode::Home;
 +                        tiles = make_tiles(items);
-+                        art.clear();
++                        // (made again only when their look changed: making them all held the frames up)
++                        if (art_look() != made_look) {
++                            art.clear();
++                            card_builder.forget();
++                            made_look = art_look();
++                        }
 +                        cards_view.pos = Spring{};
 +                        cards_view.pos.pos = static_cast<float>(tile);
 +                        if (mode == Mode::LiveArea)
@@ -13236,6 +13739,8 @@ index 00000000..2e8fb83c
 +            notice.clear();
 +            dirty = true;
 +        }
++        if (card_builder.arrived() || (mode == Mode::Settings && preview_loader().arrived()))
++            dirty = true;
 +        if (const std::string time = clock_text(); time != shown_clock) {
 +            shown_clock = time;
 +            dirty = true;
@@ -13249,13 +13754,16 @@ index 00000000..2e8fb83c
 +                open_settings(-1);
 +            else if (t.kind == TileKind::Install)
 +                open_browser();
-+            else
++            else {
 +                open_livearea(t.item);
++                card_picture(card);
++                last_frame = Clock::now();
++            }
 +            dirty = true;
 +        }
 +
 +        // the animations, a step for the time since the last frame
-+        const float dt = std::min(0.05f, std::chrono::duration<float>(now - last_frame).count());
++        const float dt = std::clamp(std::chrono::duration<float>(now - last_frame).count(), 0.f, 0.05f);
 +        last_frame = now;
 +        const bool vita_home = prefs.home_style == ps4settings::HOME_BUBBLES && (mode == Mode::Home || mode == Mode::LiveArea);
 +        bool animating = false;
@@ -13280,6 +13788,7 @@ index 00000000..2e8fb83c
 +        }
 +
 +        if (dirty || animating) {
++            draw_start = Clock::now();
 +            std::vector<Hint> hints;
 +            switch (mode) {
 +            case Mode::Home:
@@ -13342,29 +13851,19 @@ index 00000000..2e8fb83c
 +                    draw_notice(canvas, notice);
 +                    if (job.running)
 +                        draw_install(canvas, job);
-+                    present(canvas);
++                    show();
 +                    dirty = false;
-+                    if (!animating) {
-+                        // the bubbles of this page and the ones next to it, made while nothing moves
-+                        const int count = static_cast<int>(tiles.size());
-+                        const int first = std::max(0, (home.page - 1) * PER_PAGE), last = std::min(count, (home.page + 2) * PER_PAGE);
-+                        for (int i = first; i < last; i++) {
-+                            if (!art.count(i)) {
-+                                tile_art(i);
-+                                break;
-+                            }
-+                        }
-+                        std::this_thread::sleep_for(std::chrono::milliseconds(16));
-+                    }
 +                    continue;
 +                } else if (prefs.home_style == ps4settings::HOME_CARDS) {
-+                    draw_cards(canvas, cards_view, static_cast<int>(tiles.size()), card_art_fn);
++                    card_builder.set_front(tile);
++                    draw_cards(canvas, cards_view, static_cast<int>(tiles.size()), card_art_fn, tile_art_fn);
 +                    if (cards_view.launching) {
 +                        // the card in front grows, the screen goes dark, the game starts
 +                        const float t = std::min(1.f, ms_since(cards_view.launch_at, now) / 380.f);
 +                        const float e = smoothstep(0.f, 1.f, t);
 +                        const float scale = 1.f + 0.85f * e;
-+                        canvas.blit_scaled(card_art_fn(tile), W / 2.f, card_sprite_y(scale), scale);
++                        if (const ps4ui::Image *front = card_art_fn(tile))
++                            canvas.blit_scaled(*front, W / 2.f, card_sprite_y(scale), scale);
 +                        canvas.fill_rect(0, 0, W, H, rgb(0x000000, static_cast<uint8_t>(255 * e)));
 +                        if (t >= 1.f) {
 +                            cards_view.launching = false;
@@ -13446,22 +13945,13 @@ index 00000000..2e8fb83c
 +            footer(canvas, hints);
 +            if (job.running)
 +                draw_install(canvas, job);
-+            present(canvas);
++            show();
 +            dirty = false;
 +        }
-+        // the cards next to the one in front, made while nothing moves
-+        if (cards_home && !animating) {
-+            for (const int i : { tile + 1, tile - 1, tile + 2, tile - 2 }) {
-+                if (i < 0 || i >= static_cast<int>(tiles.size()))
-+                    continue;
-+                const auto it = art.find(i);
-+                if (it == art.end() || it->second.card.empty()) {
-+                    card_art(i);
-+                    break;
-+                }
-+            }
-+        }
-+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
++        // nothing shown: what the next frames need is made now, else the buttons are read again soon
++        // (a frame shown: the next one waits for it in present(), at the TV's refresh)
++        if (!shown && !make_ahead())
++            std::this_thread::sleep_for(std::chrono::milliseconds(8));
 +    }
 +}
 +

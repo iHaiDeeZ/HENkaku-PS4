@@ -42,7 +42,15 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
   cards style makes each card once (the LiveArea's background and gate at card size, its shadow and
   reflection) and draws the visible ones scaled; the themes' colours are `ps4settings::theme_colors`,
   and a PS Vita theme (`ux0/theme/<folder>/theme.xml`) gives a picture per page (three made at a
-  time, scrolling with the pages), its status bar's colour and its focus's. The
+  time, scrolling with the pages), its status bar's colour and its focus's. Since 1.12 a frame
+  waits for the one before to reach the screen (`present()`), instead of a fixed 16 ms after it,
+  which put frames one or two refreshes apart; the canvas's big jobs (copies, blits, fills, the
+  frame written to the display's memory, a bubble or card being made) run on three threads of its
+  own and the caller (`ps4ui::parallel_rows`); a rounded rectangle fills its rows in runs (every
+  pixel was a `hypot` and a blend with three divisions: a settings page took some 50 ms); the
+  LiveArea cards and the wallpaper picker's pictures are made on threads of their own, and the
+  bubbles and a theme's pictures while nothing moves. With the renderer profiler on, a
+  `launcher:` line every 10 s gives the frames' drawing times. The
   settings themselves are in `ps4_settings.cpp` as `overlay::pause_menu_item` pages, which the
   in-game HENkaku menu (Vita3K's pause overlay, `overlay/src/pause_overlay.cpp`, now pages and
   sections with an icon) draws on its own. A change is made the way Vita3K's settings dialog
