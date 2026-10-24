@@ -120,12 +120,27 @@ the first time it starts.
 | D-pad, left stick | Move between bubbles |
 | L1 / R1 | A page up or down |
 | Cross | Open: a game's LiveArea (Cross again starts it), the HENkaku bubble's settings, Install |
-| Square | The game's own settings |
+| Square | The game's own settings; on the HENkaku bubble, **Themes** |
 | Triangle | Install games |
 | OPTIONS | HENkaku's settings (Quit is there too) |
 
-The HENkaku bubble (the ensō) opens the settings of all games. Vita3K's own game list is in HENkaku > System >
-Style.
+The HENkaku bubble (the ensō) opens the settings of all games.
+
+### Themes
+
+**HENkaku > Themes** (or Square on the HENkaku bubble) changes how the home screen looks:
+
+- **Style**: **Bubbles** (the PS Vita's home screen), **LiveArea cards** (each game's LiveArea as a card, side by
+  side: left and right move between them, Cross starts the game, L1 / R1 jump five), or **List** (Vita3K's list).
+- **Bubbles**: **3D** (lit like glass, with a gloss and a shadow) or **Flat**.
+- **Theme**: ten built-in themes, **Custom colours**, and every **PS Vita theme** you install. Install official
+  Vita themes with PKGj, or copy a theme's `.pkg` with its `.zrif` to the install folder; a Vita theme brings its
+  own pictures (one per page, scrolling with the pages) and colours.
+- **Colours**: pick the background's top and bottom, the light and the focus from 25 colours. Changing one turns
+  the theme into Custom colours, starting from the theme you had.
+- **Wallpaper**: the theme's own, or a picture: from `/data/HENkaku/wallpapers`, a USB drive (its top folder or a
+  `wallpapers` folder on it), or your PS4 screenshots. Each one shows beside the list before you pick it, and a
+  picked picture is copied to `/data/HENkaku/wallpapers`.
 
 ## PKGj
 

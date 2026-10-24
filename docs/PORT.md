@@ -37,7 +37,12 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
   the SDL frontend's. A session leaves threads, guest memory and the GPU device behind, so when the
   game ends the app restarts itself (`sceSystemServiceLoadExec`) back into the launcher; a game
   starting another executable restarts into it the same way. The home screen of bubbles, the
-  LiveArea and the HENkaku settings pages are drawn the same way (`ps4_launcher.cpp`); the
+  LiveArea and the HENkaku settings pages are drawn the same way (`ps4_launcher.cpp`). Since 1.11
+  the bubbles are lit as glass (or flat), their icon scaled to cover the circle; the LiveArea
+  cards style makes each card once (the LiveArea's background and gate at card size, its shadow and
+  reflection) and draws the visible ones scaled; the themes' colours are `ps4settings::theme_colors`,
+  and a PS Vita theme (`ux0/theme/<folder>/theme.xml`) gives a picture per page (three made at a
+  time, scrolling with the pages), its status bar's colour and its focus's. The
   settings themselves are in `ps4_settings.cpp` as `overlay::pause_menu_item` pages, which the
   in-game HENkaku menu (Vita3K's pause overlay, `overlay/src/pause_overlay.cpp`, now pages and
   sections with an icon) draws on its own. A change is made the way Vita3K's settings dialog

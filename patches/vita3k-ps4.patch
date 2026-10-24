@@ -5279,10 +5279,10 @@ index 00000000..ba2b02cc
 +
 +} // namespace overlay
 diff --git a/vita3k/overlay/include/overlay/pause_overlay.h b/vita3k/overlay/include/overlay/pause_overlay.h
-index 6c5147b7..404c7c97 100644
+index 6c5147b7..cefcdda4 100644
 --- a/vita3k/overlay/include/overlay/pause_overlay.h
 +++ b/vita3k/overlay/include/overlay/pause_overlay.h
-@@ -23,21 +23,51 @@
+@@ -23,21 +23,58 @@
  #include <overlay/overlay.h>
  #include <overlay/user_interface.h>
  
@@ -5321,6 +5321,13 @@ index 6c5147b7..404c7c97 100644
 +    std::vector<pause_menu_item> items;
 +    // an action
 +    std::function<void()> run;
++    // a choice of colours: each value's (0xRRGGBB), a dot beside it (the launcher's; the in-game
++    // menu shows the names)
++    std::vector<uint32_t> swatches;
++    // an action standing for a picture: the picture, shown beside the list while the line is
++    // picked, and whether it's the one in use (the launcher's)
++    std::string preview;
++    std::function<bool()> checked;
  };
  
 -struct pause_overlay_button {
@@ -5341,7 +5348,7 @@ index 6c5147b7..404c7c97 100644
  struct pause_overlay : public user_interface {
      explicit pause_overlay(app::AppSessionController &session_controller);
  
-@@ -47,36 +77,98 @@ struct pause_overlay : public user_interface {
+@@ -47,36 +84,98 @@ struct pause_overlay : public user_interface {
      void on_touch_pressed(float vx, float vy) override;
  
  private:
@@ -9302,10 +9309,10 @@ index 00000000..26e9a158
 +} // namespace ps4keyboard
 diff --git a/vita3k/ps4/ps4_launcher.cpp b/vita3k/ps4/ps4_launcher.cpp
 new file mode 100644
-index 00000000..a1877c1d
+index 00000000..2e8fb83c
 --- /dev/null
 +++ b/vita3k/ps4/ps4_launcher.cpp
-@@ -0,0 +1,3574 @@
+@@ -0,0 +1,4153 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -9733,7 +9740,7 @@ index 00000000..a1877c1d
 +        return;
 +    item.small = ps4ui::load_image(item.entry.icon_path, ICON, ICON);
 +    item.large = ps4ui::load_image(item.entry.icon_path, BIG_ICON, BIG_ICON);
-+    item.bubble = ps4ui::load_image(item.entry.icon_path, 236, 236); // (the home screen's ICON_SIZE)
++    item.bubble = ps4ui::load_image(item.entry.icon_path); // (make_bubble scales it to cover the bubble)
 +}
 +
 +void icon_placeholder(Canvas &c, int x, int y, int size) {
@@ -10654,7 +10661,7 @@ index 00000000..a1877c1d
 +
 +constexpr int PER_PAGE = 10;
 +constexpr float BUBBLE_R = 134.f;
-+constexpr int SPRITE_PAD = 24; // room for the rim's glow and the focus glow
++constexpr int SPRITE_PAD = 30; // room for the rim's glow, the focus glow and the 3D shadow
 +constexpr int SPRITE = 2 * static_cast<int>(BUBBLE_R) + 2 * SPRITE_PAD;
 +constexpr int ICON_SIZE = 2 * static_cast<int>(BUBBLE_R);
 +constexpr float COLUMN = 460.f;
@@ -10758,19 +10765,10 @@ index 00000000..a1877c1d
 +}
 +
 +// The home screen's wallpaper: the theme's colours with a band of light waving across them (the
-+// Vita's, in its blue), or a picture from /data/HENkaku/wallpapers. Made again only when the look
-+// changes, or for each other frame while the wave moves (HENkaku > Look).
++// Vita's, in its blue), a PS Vita theme's pictures, or a picture from /data/HENkaku/wallpapers. Made
++// again only when the look changes, or for each other frame while the wave moves (HENkaku > Themes).
 +struct Theme {
-+    uint32_t top, bottom, light;
-+};
-+// in ps4settings::theme_names()'s order
-+const Theme THEMES[] = {
-+    { 0x123ab0, 0x2662e2, 0xffffff }, // PS Vita blue
-+    { 0x06080f, 0x161d33, 0x7896dc }, // Midnight
-+    { 0x7a2a5c, 0xe48cb4, 0xffebf5 }, // Sakura
-+    { 0x08301f, 0x2a8250, 0xdcffe6 }, // Forest
-+    { 0x46145a, 0xf07a3c, 0xffe6c8 }, // Sunset
-+    { 0x18181a, 0x3c3c42, 0xc8c8d2 }, // Carbon
++    uint32_t top, bottom, light, accent;
 +};
 +
 +struct Wallpaper {
@@ -10791,9 +10789,128 @@ index 00000000..a1877c1d
 +    return w;
 +}
 +
-+const Theme &current_theme() {
-+    const int theme = ps4settings::prefs().theme;
-+    return THEMES[std::clamp(theme, 0, static_cast<int>(std::size(THEMES)) - 1)];
++// The theme in use: its colours (ps4settings::theme_colors)
++Theme current_theme() {
++    const ps4settings::ThemeColors c = ps4settings::theme_colors(ps4settings::prefs());
++    return { c.top, c.bottom, c.light, c.accent };
++}
++
++// An installed PS Vita theme (ux0/theme/<folder>/theme.xml) as its home screen shows it: a picture
++// for each page (they scroll with the pages, and start over when there are more pages than
++// pictures), its status bar's colour and its focus's. Its pictures are made when a page shows
++// them, three kept.
++struct VitaThemeLook {
++    std::string folder; // what it was loaded for ("": no PS Vita theme)
++    std::vector<std::string> pictures;
++    bool has_bar = false;
++    Color bar;
++    bool has_accent = false;
++    uint32_t accent = 0;
++    std::map<int, std::unique_ptr<Canvas>> made;
++};
++fs::path g_theme_root; // the Vita's ux0/theme (run())
++
++// A theme.xml colour: AARRGGBB, or RRGGBB
++bool theme_color(std::string text, Color &out) {
++    text.erase(std::remove_if(text.begin(), text.end(), [](unsigned char ch) { return std::isspace(ch); }), text.end());
++    if (!text.empty() && text[0] == '#')
++        text.erase(0, 1);
++    if (text.empty())
++        return false;
++    char *end = nullptr;
++    const unsigned long value = std::strtoul(text.c_str(), &end, 16);
++    if (!end || *end)
++        return false;
++    out = rgb(static_cast<uint32_t>(value & 0xFFFFFF), text.size() > 6 ? static_cast<uint8_t>(value >> 24) : 255);
++    return true;
++}
++
++void load_vita_theme(VitaThemeLook &look, const fs::path &dir) {
++    pugi::xml_document doc;
++    if (!doc.load_file(fs_utils::path_to_utf8(dir / "theme.xml").c_str()))
++        return;
++    const pugi::xml_node theme = doc.child("theme");
++    for (const pugi::xml_node bg : theme.child("HomeProperty").child("m_bgParam").children()) {
++        const pugi::xml_node param = bg.child("m_imageFilePath") ? bg : bg.child("BackgroundParam");
++        std::string file = param.child("m_imageFilePath").text().as_string();
++        std::replace(file.begin(), file.end(), '\\', '/');
++        while (!file.empty() && (file.front() == '/' || std::isspace(static_cast<unsigned char>(file.front()))))
++            file.erase(0, 1);
++        while (!file.empty() && std::isspace(static_cast<unsigned char>(file.back())))
++            file.pop_back();
++        if (file.empty())
++            continue;
++        fs::path path = dir / file;
++        boost::system::error_code ec;
++        if (!fs::exists(path, ec)) {
++            // (the Vita doesn't tell case apart)
++            path = vfs::find_case_insensitive(dir, file);
++            if (path.empty())
++                continue;
++        }
++        look.pictures.push_back(fs_utils::path_to_utf8(path));
++    }
++    const pugi::xml_node bar = theme.child("InfomationBarProperty");
++    look.has_bar = theme_color(bar.child("m_barColor").text().as_string(), look.bar);
++    Color accent;
++    if (theme_color(bar.child("m_indicatorColor").text().as_string(), accent)) {
++        look.has_accent = true;
++        look.accent = (static_cast<uint32_t>(accent.r) << 16) | (static_cast<uint32_t>(accent.g) << 8) | accent.b;
++    }
++    LOG_INFO("PS4 launcher: PS Vita theme {}, {} pictures", fs_utils::path_to_utf8(dir.filename()), look.pictures.size());
++}
++
++// The PS Vita theme in use (HENkaku > Themes > Theme), loaded again when it changes
++VitaThemeLook &vita_theme_look() {
++    static VitaThemeLook look;
++    const std::string &folder = ps4settings::prefs().vita_theme;
++    if (look.folder != folder) {
++        look = VitaThemeLook{};
++        look.folder = folder;
++        if (!folder.empty() && !g_theme_root.empty())
++            load_vita_theme(look, g_theme_root / folder);
++    }
++    return look;
++}
++
++// Its picture for a page, covering the screen (nullptr without one)
++const Canvas *vita_theme_picture(VitaThemeLook &look, int page) {
++    if (look.pictures.empty())
++        return nullptr;
++    const int index = std::max(0, page) % static_cast<int>(look.pictures.size());
++    if (const auto it = look.made.find(index); it != look.made.end())
++        return it->second.get();
++    // three kept: the one farthest from this one goes
++    while (look.made.size() >= 3) {
++        auto farthest = look.made.begin();
++        for (auto it = look.made.begin(); it != look.made.end(); ++it) {
++            if (std::abs(it->first - index) > std::abs(farthest->first - index))
++                farthest = it;
++        }
++        look.made.erase(farthest);
++    }
++    auto canvas = std::make_unique<Canvas>(W, H);
++    canvas->clear_gradient(rgb(0), rgb(0));
++    ps4ui::Image picture = ps4ui::load_image(look.pictures[index]);
++    if (!picture.empty()) {
++        for (uint32_t &px : picture.pixels)
++            px |= 0xFF000000u;
++        const float scale = std::max(static_cast<float>(W) / picture.width, static_cast<float>(H) / picture.height);
++        canvas->blit_scaled(picture, W / 2.f, H / 2.f, scale);
++    }
++    return look.made.emplace(index, std::move(canvas)).first->second.get();
++}
++
++// The focus's colour: the PS Vita theme's, else the theme's
++uint32_t accent_color() {
++    const VitaThemeLook &look = vita_theme_look();
++    return look.has_accent ? look.accent : current_theme().accent;
++}
++
++// The status bar's: the PS Vita theme's (it may let the picture through), else black
++Color status_bar_color() {
++    const VitaThemeLook &look = vita_theme_look();
++    return look.has_bar ? look.bar : rgb(0x000000);
 +}
 +
 +void wave_light(Wallpaper &w, float phase) {
@@ -10895,7 +11012,8 @@ index 00000000..a1877c1d
 +bool update_wallpaper(Clock::time_point now) {
 +    Wallpaper &w = wallpaper_state();
 +    const ps4settings::Prefs &prefs = ps4settings::prefs();
-+    const std::string key = std::to_string(prefs.theme) + "|" + prefs.wallpaper;
++    const ps4settings::ThemeColors colors = ps4settings::theme_colors(prefs);
++    const std::string key = fmt::format("{}|{}|{}|{:06x}{:06x}{:06x}", prefs.theme, prefs.vita_theme, prefs.wallpaper, colors.top, colors.bottom, colors.light);
 +    if (key != w.key) {
 +        w.key = key;
 +        w.phase = -1.f;
@@ -10911,6 +11029,10 @@ index 00000000..a1877c1d
 +                w.out.blit_scaled(picture, W / 2.f, H / 2.f, scale);
 +                w.wave = false;
 +            }
++        } else if (const Canvas *page = vita_theme_picture(vita_theme_look(), 0)) {
++            // a PS Vita theme's first picture (the home screen draws each page's own)
++            w.out.copy_from(*page);
++            w.wave = false;
 +        }
 +        const ps4ui::Image *vita_wave = ps4shell::picture(ps4shell::Picture::Wave);
 +        w.vita = w.wave && prefs.theme == 0 && vita_wave;
@@ -10969,6 +11091,25 @@ index 00000000..a1877c1d
 +    return w.out;
 +}
 +
++// The wallpaper under the home screen, its left edge at ox: a PS Vita theme's pictures scroll with
++// the pages (page_pos, the page on screen), the other wallpapers stay
++void draw_wallpaper(Canvas &c, int ox, float page_pos) {
++    VitaThemeLook &look = vita_theme_look();
++    if (ps4settings::prefs().wallpaper.empty() && !look.pictures.empty()) {
++        const int first = static_cast<int>(std::floor(page_pos));
++        const int dy = static_cast<int>(std::lround((first - page_pos) * H));
++        for (int k = 0; k < 2; k++) {
++            const int y = dy + k * H;
++            if (y <= -H || y >= H)
++                continue;
++            if (const Canvas *picture = vita_theme_picture(look, first + k))
++                c.copy_from(*picture, ox, y);
++        }
++        return;
++    }
++    c.copy_from(vita_wallpaper(), ox);
++}
++
 +// Text centered on cx, cut to max_width
 +void centered_text(Canvas &c, float cx, int y, const std::string &text, int px, Color color, Weight weight, int max_width) {
 +    const int width = std::min(c.text_width(text, px, weight), max_width);
@@ -11009,76 +11150,134 @@ index 00000000..a1877c1d
 +    c.fill_rect(static_cast<int>(x) - 10, static_cast<int>(y) - 2, 20, 15, color);
 +}
 +
-+// A bubble as the Vita's: the icon in a circle (its edge a little shaded), a thin light rim and a
-+// soft light around it, premultiplied
-+ps4ui::Image make_bubble(const ps4ui::Image &icon, Color fill) {
++// A picture's colour at (x, y) between its pixels (its edge going on outside it), each 0..255
++void sample(const ps4ui::Image &image, float x, float y, float out[4]) {
++    const float cx = std::clamp(x, 0.f, image.width - 1.f), cy = std::clamp(y, 0.f, image.height - 1.f);
++    const int x0 = static_cast<int>(cx), y0 = static_cast<int>(cy);
++    const int x1 = std::min(x0 + 1, image.width - 1), y1 = std::min(y0 + 1, image.height - 1);
++    const float fx = cx - x0, fy = cy - y0;
++    const uint32_t p[4] = { image.pixels[static_cast<size_t>(y0) * image.width + x0], image.pixels[static_cast<size_t>(y0) * image.width + x1],
++        image.pixels[static_cast<size_t>(y1) * image.width + x0], image.pixels[static_cast<size_t>(y1) * image.width + x1] };
++    const float w[4] = { (1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy };
++    for (int ch = 0; ch < 4; ch++) {
++        out[ch] = 0;
++        for (int i = 0; i < 4; i++)
++            out[ch] += w[i] * static_cast<float>((p[i] >> (8 * ch)) & 0xFF);
++    }
++}
++
++// A bubble as the Vita's: the icon covering a circle (it was smaller than the circle, which showed
++// round it), a thin light rim and a soft light around it. In 3D (HENkaku > Themes > Bubbles) it's
++// lit as a glass ball from the top left: shaded toward its lower edge, a gloss over its top and a
++// glint, light coming round its bottom, and a shadow under it. Premultiplied.
++ps4ui::Image make_bubble(const ps4ui::Image &icon, Color fill, bool lit) {
 +    ps4ui::Image out;
 +    out.width = out.height = SPRITE;
 +    out.pixels.resize(static_cast<size_t>(SPRITE) * SPRITE);
 +    const float c = SPRITE / 2.f, R = BUBBLE_R;
-+    const int ix0 = (ICON_SIZE - icon.width) / 2 + SPRITE_PAD, iy0 = (ICON_SIZE - icon.height) / 2 + SPRITE_PAD;
++    // the icon's pixels for one of the bubble's: its shorter side right across the circle
++    const float k = icon.empty() ? 0.f : std::min(icon.width, icon.height) / (2.f * R);
 +    for (int y = 0; y < SPRITE; y++) {
 +        for (int x = 0; x < SPRITE; x++) {
 +            const float px = x + 0.5f - c, py = y + 0.5f - c;
 +            const float d = std::sqrt(px * px + py * py);
-+            // the light around it (white)
-+            const float out_d = std::max(0.f, d - R);
-+            const float halo = d > R - 1 ? 0.42f * std::exp(-out_d * out_d / 55.f) : 0.f;
 +            const float cov = std::clamp(R - d + 0.5f, 0.f, 1.f);
 +            float r = fill.r, g = fill.g, b = fill.b;
 +            if (cov > 0) {
-+                const int sx = x - ix0, sy = y - iy0;
-+                if (!icon.empty() && sx >= 0 && sy >= 0 && sx < icon.width && sy < icon.height) {
-+                    const uint32_t p = icon.pixels[static_cast<size_t>(sy) * icon.width + sx];
-+                    const float a = (p >> 24) / 255.f;
-+                    r = r * (1 - a) + (p & 0xFF) * a;
-+                    g = g * (1 - a) + ((p >> 8) & 0xFF) * a;
-+                    b = b * (1 - a) + ((p >> 16) & 0xFF) * a;
++                if (!icon.empty()) {
++                    float p[4];
++                    sample(icon, icon.width / 2.f + px * k - 0.5f, icon.height / 2.f + py * k - 0.5f, p);
++                    const float a = p[3] / 255.f;
++                    r = r * (1 - a) + p[0] * a;
++                    g = g * (1 - a) + p[1] * a;
++                    b = b * (1 - a) + p[2] * a;
 +                }
-+                // its edge a little shaded, lit again just inside the rim (the glass), then the rim:
-+                // a light line along it
-+                const float shade = 0.14f * smoothstep(R * 0.74f, R * 0.94f, d);
-+                r *= 1 - shade;
-+                g *= 1 - shade;
-+                b *= 1 - shade;
-+                const float inner = 0.22f * smoothstep(R - 12.f, R - 2.f, d);
-+                r += (255 - r) * inner;
-+                g += (255 - g) * inner;
-+                b += (255 - b) * inner;
-+                const float rim = std::clamp(2.2f - std::fabs(d - (R - 2.0f)), 0.f, 1.f) * 0.78f;
-+                r += (255 - r) * rim;
-+                g += (255 - g) * rim;
-+                b += (255 - b) * rim;
++                const float nx = px / R, ny = py / R, nd = d / R;
++                if (lit) {
++                    const float nz = std::sqrt(std::max(0.f, 1.f - nx * nx - ny * ny));
++                    // the light from the top left, the edge darker
++                    const float diffuse = std::clamp(-0.42f * nx - 0.55f * ny + 0.72f * nz, 0.f, 1.f);
++                    const float shade = (0.80f + 0.26f * diffuse) * (1.f - 0.20f * smoothstep(0.70f, 1.f, nd));
++                    r = std::min(255.f, r * shade);
++                    g = std::min(255.f, g * shade);
++                    b = std::min(255.f, b * shade);
++                    // the gloss over its top, a glint, the light coming round its bottom, and the
++                    // rim: light along its top, darker along its bottom
++                    const float gx = nx / 0.80f, gy = (ny + 0.50f) / 0.44f;
++                    const float gloss = 0.30f * smoothstep(1.f, 0.15f, gx * gx + gy * gy) * smoothstep(0.15f, -0.55f, ny);
++                    const float hx = nx + 0.36f, hy = ny + 0.56f;
++                    const float glint = 0.55f * std::exp(-(hx * hx + hy * hy) / 0.006f);
++                    const float bounce = 0.16f * smoothstep(0.78f, 0.98f, nd) * smoothstep(0.2f, 0.9f, ny);
++                    const float rim = std::clamp(2.f - std::fabs(d - (R - 1.8f)), 0.f, 1.f);
++                    const float light = std::min(1.f, gloss + glint + bounce + rim * (0.40f + 0.45f * std::clamp(-ny, 0.f, 1.f)));
++                    r += (255 - r) * light;
++                    g += (255 - g) * light;
++                    b += (255 - b) * light;
++                    const float dark = rim * 0.30f * std::clamp(ny, 0.f, 1.f);
++                    r *= 1 - dark;
++                    g *= 1 - dark;
++                    b *= 1 - dark;
++                } else {
++                    // its edge a little shaded, lit again just inside the rim (the glass), then the
++                    // rim: a light line along it
++                    const float shade = 0.14f * smoothstep(R * 0.74f, R * 0.94f, d);
++                    r *= 1 - shade;
++                    g *= 1 - shade;
++                    b *= 1 - shade;
++                    const float inner = 0.22f * smoothstep(R - 12.f, R - 2.f, d);
++                    r += (255 - r) * inner;
++                    g += (255 - g) * inner;
++                    b += (255 - b) * inner;
++                    const float rim = std::clamp(2.2f - std::fabs(d - (R - 2.0f)), 0.f, 1.f) * 0.78f;
++                    r += (255 - r) * rim;
++                    g += (255 - g) * rim;
++                    b += (255 - b) * rim;
++                }
 +            }
-+            // (the halo is white: premultiplied, its colour is its alpha)
-+            const float halo_a = halo * (1 - cov);
-+            const float a = cov + halo_a;
-+            out.pixels[static_cast<size_t>(y) * SPRITE + x] = static_cast<uint32_t>(r * cov + 255 * halo_a + 0.5f) | (static_cast<uint32_t>(g * cov + 255 * halo_a + 0.5f) << 8)
-+                | (static_cast<uint32_t>(b * cov + 255 * halo_a + 0.5f) << 16) | (static_cast<uint32_t>(a * 255 + 0.5f) << 24);
++            // around it: the light (white), and in 3D a shadow under it
++            const float out_d = std::max(0.f, d - R);
++            float halo = d > R - 1 ? 0.42f * std::exp(-out_d * out_d / 55.f) : 0.f;
++            float shadow = 0.f;
++            if (lit) {
++                halo *= 0.65f;
++                const float sd = std::max(0.f, std::hypot(px, py - 13.f) - (R - 4.f));
++                shadow = 0.40f * std::exp(-sd * sd / 190.f);
++            }
++            // (premultiplied: the light white, its colour its alpha, over the black shadow, and the
++            // bubble over both)
++            const float around = halo + shadow * (1 - halo);
++            const float a = cov + around * (1 - cov);
++            const float light = 255.f * halo * (1 - cov);
++            out.pixels[static_cast<size_t>(y) * SPRITE + x] = static_cast<uint32_t>(std::min(255.f, r * cov + light) + 0.5f)
++                | (static_cast<uint32_t>(std::min(255.f, g * cov + light) + 0.5f) << 8)
++                | (static_cast<uint32_t>(std::min(255.f, b * cov + light) + 0.5f) << 16) | (static_cast<uint32_t>(a * 255 + 0.5f) << 24);
 +        }
 +    }
 +    return out;
 +}
 +
-+// The focus: a soft light-blue glow around a bubble, premultiplied
-+const ps4ui::Image &focus_glow() {
-+    static ps4ui::Image out = [] {
-+        ps4ui::Image img;
++// The focus: a soft glow in the focus colour around a bubble, premultiplied (made again when the
++// colour changes)
++const ps4ui::Image &focus_glow(uint32_t accent) {
++    static ps4ui::Image img;
++    static uint32_t made_for = 0xFFFFFFFFu;
++    if (made_for != accent || img.empty()) {
++        made_for = accent;
 +        img.width = img.height = SPRITE;
-+        img.pixels.resize(static_cast<size_t>(SPRITE) * SPRITE);
++        img.pixels.assign(static_cast<size_t>(SPRITE) * SPRITE, 0);
 +        const float c = SPRITE / 2.f;
++        const uint32_t cr = (accent >> 16) & 0xFF, cg = (accent >> 8) & 0xFF, cb = accent & 0xFF;
 +        for (int y = 0; y < SPRITE; y++) {
 +            for (int x = 0; x < SPRITE; x++) {
 +                const float d = std::hypot(x + 0.5f - c, y + 0.5f - c);
 +                const float k = (d - (BUBBLE_R + 5)) / 7.f;
 +                const float a = d < BUBBLE_R - 1 ? 0.f : std::exp(-k * k) * 0.95f;
 +                const uint32_t A = static_cast<uint32_t>(a * 255);
-+                img.pixels[static_cast<size_t>(y) * SPRITE + x] = (0x9f * A / 255) | ((0xe0 * A / 255) << 8) | ((0xff * A / 255) << 16) | (A << 24);
++                img.pixels[static_cast<size_t>(y) * SPRITE + x] = (cr * A / 255) | ((cg * A / 255) << 8) | ((cb * A / 255) << 16) | (A << 24);
 +            }
 +        }
-+        return img;
-+    }();
-+    return out;
++    }
++    return img;
 +}
 +
 +// What a tile draws with, made the first time it's on screen
@@ -11086,6 +11285,8 @@ index 00000000..a1877c1d
 +    ps4ui::Image bubble;
 +    ps4ui::Image mini; // in the status bar, while its LiveArea is open
 +    ps4ui::TextSprite label;
++    // its LiveArea card (HENkaku > Themes > Style), with its shadow and reflection
++    ps4ui::Image card;
 +};
 +
 +// An animated value pulled toward a target (underdamped: it overshoots a little and settles)
@@ -11191,10 +11392,10 @@ index 00000000..a1877c1d
 +
 +// The home screen, its left edge at ox
 +void draw_home(Canvas &c, HomeView &v, const std::vector<Tile> &tiles, const std::function<TileArt &(int)> &art, int ox, Clock::time_point now) {
-+    c.copy_from(vita_wallpaper(), ox);
++    draw_wallpaper(c, ox, v.rows[1].pos);
 +    const int count = static_cast<int>(tiles.size());
 +    const int pages = std::max(1, (count + PER_PAGE - 1) / PER_PAGE);
-+    const ps4ui::Image &glow = focus_glow();
++    const ps4ui::Image &glow = focus_glow(accent_color());
 +    // the focused bubble last, over its neighbours
 +    for (int pass = 0; pass < 2; pass++) {
 +        for (int slot = 0; slot < PER_PAGE; slot++) {
@@ -11252,7 +11453,7 @@ index 00000000..a1877c1d
 +// the home screen and the open LiveAreas (the one on screen bright), the time at the right (a PS TV's,
 +// without a battery); what's missing of the firmware before the time
 +void status_bar(Canvas &c, const app::FirmwareState &fw, const std::vector<const ps4ui::Image *> &cards, float card_pos) {
-+    c.fill_rect(0, 0, W, STATUS_H, rgb(0x000000));
++    c.fill_rect(0, 0, W, STATUS_H, status_bar_color());
 +    if (const ps4ui::Image *wifi = ps4shell::picture(ps4shell::Picture::Wifi))
 +        c.blit_scaled(*wifi, 44.f, STATUS_H / 2.f, 1.9f);
 +    // home, then the cards, 60 px apart
@@ -11664,6 +11865,208 @@ index 00000000..a1877c1d
 +    }
 +}
 +
++// --- the home screen as LiveArea cards ---
++//
++// HENkaku > Themes > Style: each bubble's LiveArea as a card, side by side as the Vita shows the open
++// ones (its background, its start gate, its bubble and name), the one in front at full size and its
++// neighbours smaller at the sides, sliding along. A card is made once, with its shadow and its
++// reflection, and drawn scaled.
++
++constexpr int CARD_W = 1120; // a LiveArea's 840x500 panel, at 4/3
++constexpr int CARD_H = 666;
++constexpr int CARD_RADIUS = 26;
++constexpr int CARD_PAD = 44; // the shadow's room around it
++constexpr int CARD_REFLECTION = 160;
++constexpr int CARD_SPRITE_W = CARD_W + 2 * CARD_PAD;
++constexpr int CARD_SPRITE_H = CARD_H + 2 * CARD_PAD + CARD_REFLECTION;
++constexpr float CARD_Y = STATUS_H + 70 + CARD_H / 2.f; // the card in front's centre
++constexpr float CARD_NEAR = 1030.f; // its neighbours' centres from its own
++constexpr float CARD_FAR = 880.f; // the next ones' from theirs
++constexpr float CARD_SIDE = 0.72f; // the neighbours' size
++
++// The middle of a card's sprite for its card's centre at CARD_Y, at a scale
++float card_sprite_y(float scale) {
++    return CARD_Y + (CARD_SPRITE_H / 2.f - (CARD_PAD + CARD_H / 2.f)) * scale;
++}
++
++// A LiveArea's background and start gate at a card's size (sce_sys/livearea/contents)
++struct CardPictures {
++    ps4ui::Image background;
++    ps4ui::Image gate;
++};
++
++CardPictures load_card_pictures(const fs::path &app_dir) {
++    const fs::path contents = app_dir / "sce_sys" / "livearea" / "contents";
++    CardPictures p;
++    pugi::xml_document doc;
++    if (doc.load_file(fs_utils::path_to_utf8(contents / "template.xml").c_str())) {
++        const pugi::xml_node livearea = doc.child("livearea");
++        p.background = live_image(contents, pick_language(livearea.child("livearea-background"), "image"), CARD_W, CARD_H);
++        p.gate = live_image(contents, pick_language(livearea.child("gate"), "startup-image"), CARD_W / 3, CARD_H / 3);
++    }
++    boost::system::error_code ec;
++    for (const char *name : { "bg0.png", "bg.png" }) {
++        if (p.background.empty() && fs::exists(contents / name, ec))
++            p.background = live_image(contents, name, CARD_W, CARD_H);
++    }
++    if (p.gate.empty() && fs::exists(contents / "startup.png", ec))
++        p.gate = live_image(contents, "startup.png", CARD_W / 3, CARD_H / 3);
++    return p;
++}
++
++Color darker(Color c, float k) {
++    return { static_cast<uint8_t>(c.r * k), static_cast<uint8_t>(c.g * k), static_cast<uint8_t>(c.b * k), c.a };
++}
++
++// A card's face: its LiveArea's background (else the theme's colours, its bubble large and faint),
++// its bubble and name across the top, and its start gate (HENkaku's own cards: their glyph)
++void draw_card_face(Canvas &c, const CardPictures &p, const ps4ui::Image &bubble, const std::string &title, const std::string &detail,
++    TileKind kind, const ps4ui::Image &henkaku_icon) {
++    const Theme theme = current_theme();
++    if (!p.background.empty()) {
++        ps4ui::Image bg = p.background;
++        for (uint32_t &px : bg.pixels)
++            px |= 0xFF000000u;
++        c.clear_gradient(rgb(0), rgb(0));
++        c.blit_scaled(bg, CARD_W / 2.f, CARD_H / 2.f, std::max(static_cast<float>(CARD_W) / bg.width, static_cast<float>(CARD_H) / bg.height));
++    } else {
++        c.clear_gradient(darker(rgb(theme.top), 0.7f), darker(rgb(theme.bottom), 0.55f));
++        if (!bubble.empty())
++            c.blit_scaled(bubble, CARD_W * 0.74f, CARD_H * 0.56f, 2.3f, 40);
++    }
++    // the top darker, under the name
++    for (int y = 0; y < 180; y++)
++        c.fill_rect(0, y, CARD_W, 1, rgb(0x000000, static_cast<uint8_t>(140 * (1.f - y / 180.f))));
++    if (!bubble.empty())
++        c.blit_scaled(bubble, 100.f, 96.f, 136.f / SPRITE);
++    c.text(188, 100, title, 40, rgb(0x000000, 150), Weight::Bold, CARD_W - 230);
++    c.text(186, 98, title, 40, TEXT, Weight::Bold, CARD_W - 230);
++    c.text(188, 140, detail, 24, rgb(0xd0d8e6), Weight::Regular, CARD_W - 230);
++    const float gx = CARD_W / 2.f, gy = CARD_H * 0.60f;
++    if (!p.gate.empty()) {
++        ps4ui::Image gate = p.gate;
++        ps4ui::premultiply(gate);
++        const int x = static_cast<int>(gx) - gate.width / 2, y = static_cast<int>(gy) - gate.height / 2;
++        c.fill_round_rect(x + 6, y + 10, gate.width, gate.height, 16, rgb(0x000000, 100));
++        c.blit(gate, x, y);
++    } else if (kind == TileKind::Henkaku) {
++        c.fill_circle(gx, gy, 136.f, rgb(0x000000, 130));
++        if (!henkaku_icon.empty())
++            c.draw_image(henkaku_icon, static_cast<int>(gx) - henkaku_icon.width / 2, static_cast<int>(gy) - henkaku_icon.height / 2);
++    } else if (kind == TileKind::Install) {
++        c.fill_circle(gx, gy, 136.f, rgb(0x0b56c4, 220));
++        install_glyph(c, gx, gy, 112.f);
++    } else if (!bubble.empty()) {
++        c.blit_scaled(bubble, gx, gy, 0.9f);
++    }
++}
++
++// A card as a sprite (premultiplied): a soft shadow under it, its round corners with a light edge
++// and a sheen over its top left, and its reflection fading under it
++ps4ui::Image card_sprite(const Canvas &face) {
++    ps4ui::Image out;
++    out.width = CARD_SPRITE_W;
++    out.height = CARD_SPRITE_H;
++    out.pixels.assign(static_cast<size_t>(out.width) * out.height, 0);
++    const uint32_t *src = face.data();
++    // the distance from the card's edge (inside < 0), from its top left
++    const auto edge = [](float x, float y) {
++        const float hx = CARD_W / 2.f, hy = CARD_H / 2.f;
++        const float qx = std::fabs(x - hx) - (hx - CARD_RADIUS), qy = std::fabs(y - hy) - (hy - CARD_RADIUS);
++        return std::hypot(std::max(qx, 0.f), std::max(qy, 0.f)) + std::min(std::max(qx, qy), 0.f) - CARD_RADIUS;
++    };
++    constexpr float GAP = 8.f; // between the card and its reflection
++    for (int y = 0; y < CARD_SPRITE_H; y++) {
++        const float cy = y + 0.5f - CARD_PAD;
++        for (int x = 0; x < CARD_SPRITE_W; x++) {
++            const float cx = x + 0.5f - CARD_PAD;
++            float r = 0, g = 0, b = 0;
++            // the shadow, a little lower (black: premultiplied, no colour)
++            const float sd = std::max(0.f, edge(cx, cy - 18.f));
++            float a = 0.42f * std::exp(-sd * sd / 500.f);
++            // the reflection: the card upside down under it, over the shadow
++            if (cy >= CARD_H + GAP && cx >= 0 && cx < CARD_W) {
++                const float m = cy - (CARD_H + GAP);
++                if (m < CARD_REFLECTION) {
++                    const float sy = CARD_H - 1.f - m;
++                    const float t = 1.f - m / CARD_REFLECTION;
++                    const float k = std::clamp(0.5f - edge(cx, sy + 0.5f), 0.f, 1.f) * 0.30f * t * t;
++                    if (k > 0) {
++                        const uint32_t p = src[static_cast<size_t>(sy) * CARD_W + static_cast<int>(cx)];
++                        r = (p & 0xFF) * k;
++                        g = ((p >> 8) & 0xFF) * k;
++                        b = ((p >> 16) & 0xFF) * k;
++                        a = k + a * (1 - k);
++                    }
++                }
++            }
++            // the card
++            const float d = edge(cx, cy);
++            const float cov = std::clamp(0.5f - d, 0.f, 1.f);
++            if (cov > 0) {
++                const int sx = std::clamp(static_cast<int>(cx), 0, CARD_W - 1), sy = std::clamp(static_cast<int>(cy), 0, CARD_H - 1);
++                const uint32_t p = src[static_cast<size_t>(sy) * CARD_W + sx];
++                float pr = p & 0xFF, pg = (p >> 8) & 0xFF, pb = (p >> 16) & 0xFF;
++                const float rim = std::clamp(1.6f - std::fabs(d + 1.6f), 0.f, 1.f) * 0.38f;
++                const float sheen = 0.10f * std::clamp(1.f - (cy + 0.45f * cx) / (0.85f * CARD_H), 0.f, 1.f);
++                const float light = std::min(1.f, rim + sheen);
++                pr += (255 - pr) * light;
++                pg += (255 - pg) * light;
++                pb += (255 - pb) * light;
++                r = pr * cov + r * (1 - cov);
++                g = pg * cov + g * (1 - cov);
++                b = pb * cov + b * (1 - cov);
++                a = cov + a * (1 - cov);
++            }
++            out.pixels[static_cast<size_t>(y) * out.width + x] = static_cast<uint32_t>(std::min(255.f, r) + 0.5f) | (static_cast<uint32_t>(std::min(255.f, g) + 0.5f) << 8)
++                | (static_cast<uint32_t>(std::min(255.f, b) + 0.5f) << 16) | (static_cast<uint32_t>(std::min(1.f, a) * 255 + 0.5f) << 24);
++        }
++    }
++    return out;
++}
++
++// The cards: the one in front, as a position along them (springing), and a card growing into its game
++struct CardsView {
++    Spring pos;
++    bool launching = false;
++    Clock::time_point launch_at{};
++};
++
++void draw_cards(Canvas &c, CardsView &v, int count, const std::function<const ps4ui::Image &(int)> &card) {
++    draw_wallpaper(c, 0, 0.f);
++    const float pos = v.pos.pos;
++    std::vector<int> order;
++    for (int i = static_cast<int>(std::floor(pos)) - 2; i <= static_cast<int>(std::floor(pos)) + 3; i++) {
++        if (i >= 0 && i < count)
++            order.push_back(i);
++    }
++    // the far ones first, the one in front last (a card growing into its game: run() draws it)
++    std::sort(order.begin(), order.end(), [pos](int a, int b) { return std::fabs(a - pos) > std::fabs(b - pos); });
++    for (int i : order) {
++        const float o = i - pos, a = std::fabs(o);
++        const float x = W / 2.f + (o < 0 ? -1.f : 1.f) * (a <= 1.f ? a * CARD_NEAR : CARD_NEAR + (a - 1.f) * CARD_FAR);
++        const float scale = 1.f - (1.f - CARD_SIDE) * std::min(1.f, a);
++        if (x + CARD_SPRITE_W * scale / 2 < 0 || x - CARD_SPRITE_W * scale / 2 > W)
++            continue;
++        if (v.launching && i == static_cast<int>(std::lround(pos)))
++            continue;
++        c.blit_scaled(card(i), x, card_sprite_y(scale), scale, static_cast<uint8_t>(255 - 70 * std::min(1.f, a)));
++    }
++    // where it is among them
++    if (count > 1) {
++        constexpr float DOTS_Y = 985.f;
++        if (count <= 24) {
++            const float x0 = W / 2.f - (count - 1) * 13.f;
++            for (int i = 0; i < count; i++) {
++                const float near = std::clamp(1.f - std::fabs(pos - i), 0.f, 1.f);
++                c.fill_circle(x0 + i * 26.f, DOTS_Y, 5.f + 3.f * near, rgb(0xffffff, static_cast<uint8_t>(90 + 165 * near)));
++            }
++        } else {
++            centered_text(c, W / 2.f, static_cast<int>(DOTS_Y) + 10, fmt::format("{} / {}", static_cast<int>(std::lround(pos)) + 1, count), 28, TEXT, Weight::Bold, 400);
++        }
++    }
++}
++
 +// --- the HENkaku settings, in the launcher ---
 +
 +using SItem = ps4settings::Item;
@@ -11770,6 +12173,11 @@ index 00000000..a1877c1d
 +    while (level.top < level.selected && span(level.top, level.selected) > SET_H)
 +        level.top++;
 +
++    // a page of pictures: the picked one beside the list
++    constexpr int PREVIEW_W = 640, PREVIEW_H = 360;
++    const bool previews = std::any_of(items.begin(), items.end(), [](const SItem &i) { return !i.preview.empty(); });
++    const int row_w = previews ? W - 2 * MARGIN - PREVIEW_W - 48 : W - 2 * MARGIN;
++
 +    int y = SET_Y;
 +    int last = level.top - 1;
 +    for (int i = level.top; i < count; i++) {
@@ -11779,42 +12187,79 @@ index 00000000..a1877c1d
 +        last = i;
 +        const SItem &item = items[i];
 +        if (item.type == SItem::kind::section) {
-+            c.text(MARGIN + 6, y + 44, item.name, 26, ACCENT, Weight::Bold);
++            c.text(MARGIN + 6, y + 44, item.name, 26, ACCENT, Weight::Bold, row_w - 12);
 +            y += h;
 +            continue;
 +        }
 +        const bool sel = i == level.selected;
-+        c.fill_round_rect(MARGIN, y, W - 2 * MARGIN, h - 10, 18, sel ? rgb(0x2a6fd6, 120) : rgb(0xffffff, 14));
++        c.fill_round_rect(MARGIN, y, row_w, h - 10, 18, sel ? rgb(0x2a6fd6, 120) : rgb(0xffffff, 14));
 +        if (sel)
 +            c.fill_round_rect(MARGIN, y + 16, 6, h - 42, 3, ACCENT);
-+        const int right = W - MARGIN - 38;
++        const int right = MARGIN + row_w - 38;
 +        // the value first: the name, then its note, get the room left of it (cut with "...")
 +        std::string value_text;
 +        int value_px = 30;
++        int value = -1;
 +        if (item.type == SItem::kind::choice) {
-+            const int value = choice_value(item);
++            value = choice_value(item);
 +            value_text = value < 0 ? std::string() : item.set ? "<   " + item.values[value] + "   >" : item.values[value];
 +        } else if (item.type == SItem::kind::page) {
 +            value_text = ">";
 +            value_px = 28;
++        } else if (item.type == SItem::kind::action && item.checked && item.checked()) {
++            value_text = "In use";
 +        }
-+        const int value_w = value_text.empty() ? 0 : std::min(c.text_width(value_text, value_px, Weight::Bold), (W - 2 * MARGIN) / 2);
-+        const int name_room = right - (value_w ? value_w + 40 : 0) - (MARGIN + 38);
++        // a colour: its dot left of its name
++        const bool swatch = item.type == SItem::kind::choice && value >= 0 && value < static_cast<int>(item.swatches.size());
++        const int value_w = value_text.empty() ? 0 : std::min(c.text_width(value_text, value_px, Weight::Bold), row_w / 2);
++        const int value_room = (value_w ? value_w + 40 : 0) + (swatch ? 50 : 0);
++        const int name_room = right - value_room - (MARGIN + 38);
 +        const int name_w = c.text(MARGIN + 38, y + 47, item.name, 32, TEXT, sel ? Weight::Bold : Weight::Regular, name_room);
-+        const int note_x = MARGIN + 38 + name_w + 18, note_room = right - (value_w ? value_w + 40 : 0) - note_x;
-+        if (item.type == SItem::kind::choice && !item.note.empty() && note_room > 120)
++        const int note_x = MARGIN + 38 + name_w + 18, note_room = right - value_room - note_x;
++        if ((item.type == SItem::kind::choice || item.type == SItem::kind::page) && !item.note.empty() && note_room > 120)
 +            c.text(note_x, y + 45, item.note, 24, MUTED, Weight::Regular, note_room);
++        if (swatch) {
++            const float sx = right - value_w - 34.f, sy = y + 33.f;
++            c.fill_circle(sx, sy, 17.f, rgb(0xffffff));
++            c.fill_circle(sx, sy, 14.f, rgb(item.swatches[value]));
++        }
 +        if (item.type == SItem::kind::choice)
 +            c.text(right - value_w, y + 46, value_text, value_px, sel ? TEXT : ACCENT, Weight::Bold, value_w);
 +        else if (item.type == SItem::kind::page)
 +            c.text(right - value_w, y + 46, value_text, value_px, MUTED);
++        else if (!value_text.empty())
++            c.text(right - value_w, y + 46, value_text, value_px, ACCENT, Weight::Bold, value_w);
 +        y += h;
 +    }
 +    // more above or below
 +    if (level.top > 0)
-+        c.text_centered(W / 2, SET_Y - 8, "...", 30, MUTED, Weight::Bold);
++        c.text_centered(MARGIN + row_w / 2, SET_Y - 8, "...", 30, MUTED, Weight::Bold);
 +    if (last + 1 < count)
-+        c.text_centered(W / 2, SET_Y + SET_H + 26, "...", 30, MUTED, Weight::Bold);
++        c.text_centered(MARGIN + row_w / 2, SET_Y + SET_H + 26, "...", 30, MUTED, Weight::Bold);
++    // the picked picture (made when first picked, a few kept)
++    if (previews) {
++        const int px = W - MARGIN - PREVIEW_W, py = SET_Y + 6;
++        c.fill_round_rect(px - 10, py - 10, PREVIEW_W + 20, PREVIEW_H + 20, 20, rgb(0xffffff, 28));
++        c.fill_rect(px, py, PREVIEW_W, PREVIEW_H, rgb(0x000000));
++        const SItem *picked = level.selected < count ? &items[level.selected] : nullptr;
++        if (picked && !picked->preview.empty()) {
++            static std::map<std::string, ps4ui::Image> thumbnails;
++            auto it = thumbnails.find(picked->preview);
++            if (it == thumbnails.end()) {
++                if (thumbnails.size() >= 8)
++                    thumbnails.clear();
++                ps4ui::Image picture = ps4ui::load_image(picked->preview, PREVIEW_W, PREVIEW_H);
++                for (uint32_t &p : picture.pixels)
++                    p |= 0xFF000000u;
++                it = thumbnails.emplace(picked->preview, std::move(picture)).first;
++            }
++            if (!it->second.empty())
++                c.draw_image(it->second, px + (PREVIEW_W - it->second.width) / 2, py + (PREVIEW_H - it->second.height) / 2);
++            c.text(px, py + PREVIEW_H + 50, fs_utils::path_to_utf8(fs::path(picked->preview).filename()), 26, MUTED, Weight::Regular, PREVIEW_W);
++        } else {
++            c.text_centered(px + PREVIEW_W / 2, py + PREVIEW_H / 2 + 12, "The theme's own wallpaper", 30, MUTED, Weight::Bold);
++        }
++    }
 +}
 +
 +// Who made HENkaku: the ensō, the name, the author and where to find them, and what it runs on
@@ -12082,6 +12527,7 @@ index 00000000..a1877c1d
 +Choice run(EmuEnvState &emuenv, const std::string &notice_text) {
 +    // the PS Vita shell's own pictures, from the firmware (the home screen's look as the Vita's)
 +    ps4shell::load(fs_utils::path_to_utf8(emuenv.vita_fs_path / "vs0"));
++    g_theme_root = emuenv.vita_fs_path / "ux0" / "theme";
 +    Canvas canvas(W, H);
 +    std::vector<Item> items = load_items(emuenv);
 +    std::vector<Tile> tiles = make_tiles(items);
@@ -12126,7 +12572,7 @@ index 00000000..a1877c1d
 +            break;
 +        }
 +        TileArt t;
-+        t.bubble = make_bubble(icon, rgb(0x1b2a44));
++        t.bubble = make_bubble(icon, rgb(0x1b2a44), prefs.bubbles_3d);
 +        t.mini = ps4ui::shrink_image(t.bubble, 46, 46);
 +        return art.emplace(index, std::move(t)).first->second;
 +    };
@@ -12223,6 +12669,46 @@ index 00000000..a1877c1d
 +        }
 +        show_card(static_cast<int>(it - cards.begin()) + 1);
 +    };
++    // the LiveArea cards' pictures (HENkaku > Themes > Style), by tile, made when first needed (or
++    // ahead, while nothing moves), seven at most
++    const auto card_art = [&](int index) -> const ps4ui::Image & {
++        TileArt &t = tile_art(index);
++        if (!t.card.empty())
++            return t.card;
++        for (;;) {
++            int made = 0, farthest = -1;
++            for (auto &[i, a] : art) {
++                if (a.card.empty() || i == index)
++                    continue;
++                made++;
++                if (farthest < 0 || std::abs(i - tile) > std::abs(farthest - tile))
++                    farthest = i;
++            }
++            if (made < 6 || farthest < 0)
++                break;
++            art[farthest].card = {};
++        }
++        const Tile &tl = tiles[index];
++        Canvas face(CARD_W, CARD_H);
++        CardPictures pictures;
++        std::string detail;
++        if (tl.kind == TileKind::Game) {
++            const Item &item = items[tl.item];
++            pictures = load_card_pictures(item.dir.empty() ? emuenv.vita_fs_path / "ux0" / "app" / item.entry.path : item.dir);
++            detail = item.entry.title_id + (item.entry.app_ver.empty() ? "" : "   v" + item.entry.app_ver);
++        } else if (tl.kind == TileKind::Henkaku) {
++            detail = "Settings, themes and the firmware";
++        } else {
++            detail = "Games, updates, DLC and themes";
++        }
++        draw_card_face(face, pictures, t.bubble, tile_title(tl, items), detail, tl.kind, henkaku_icon);
++        t.card = card_sprite(face);
++        return t.card;
++    };
++    const std::function<const ps4ui::Image &(int)> card_art_fn = card_art;
++    CardsView cards_view;
++    cards_view.pos.pos = static_cast<float>(tile);
++
 +    home.page = tile / PER_PAGE;
 +    for (int r = 0; r < 3; r++)
 +        home.rows[r].pos = home.row_target[r] = static_cast<float>(home.page);
@@ -12305,6 +12791,17 @@ index 00000000..a1877c1d
 +            settings_open(settings, "All games", std::move(root));
 +        }
 +        mode = Mode::Settings;
++    };
++    // HENkaku > Themes, straight from the home screen (Square on the HENkaku bubble or card)
++    const auto open_themes = [&] {
++        open_settings(-1);
++        for (const SItem &page : settings.root) {
++            if (page.type == SItem::kind::page && page.name == "Themes") {
++                settings.stack.push_back({ &page.items, page.name, 0, 0 });
++                settings_move(settings.stack.back(), 1);
++                break;
++            }
++        }
 +    };
 +    // A firmware app started (from its LiveArea, or the list): HENkaku's screen for it
 +    const auto open_system = [&](const Item &item) {
@@ -12454,7 +12951,7 @@ index 00000000..a1877c1d
 +                repeat_at = now + std::chrono::milliseconds(380);
 +            } else if (key != 0 && now >= repeat_at) {
 +                step = true;
-+                repeat_at = now + std::chrono::milliseconds(mode == Mode::Home && prefs.bubbles ? 150 : 70);
++                repeat_at = now + std::chrono::milliseconds(mode == Mode::Home && prefs.home_style != ps4settings::HOME_LIST ? 150 : 70);
 +            }
 +            repeat_key = key;
 +            if (!step)
@@ -12462,7 +12959,7 @@ index 00000000..a1877c1d
 +
 +            switch (mode) {
 +            case Mode::Home:
-+                if (prefs.bubbles) {
++                if (prefs.home_style == ps4settings::HOME_BUBBLES) {
 +                    const int count = static_cast<int>(tiles.size());
 +                    if (pending_open >= 0 || peeling || launching) {
 +                        // a bubble opening, or a card going: the buttons wait
@@ -12490,6 +12987,44 @@ index 00000000..a1877c1d
 +                    } else if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && t.kind == TileKind::Game && items[t.item].system == SystemApp::None) {
 +                        open_settings(t.item);
 +                        dirty = true;
++                    } else if ((pressed & ORBIS_PAD_BUTTON_SQUARE) && t.kind == TileKind::Henkaku) {
++                        open_themes();
++                        dirty = true;
++                    }
++                } else if (prefs.home_style == ps4settings::HOME_CARDS) {
++                    // left / right a card, L1 / R1 five; Cross starts the game (its card grows into
++                    // it) or opens HENkaku's own; Square a game's settings, or Themes
++                    const int count = static_cast<int>(tiles.size());
++                    if (!cards_view.launching && count > 0) {
++                        int by = dx;
++                        if (pressed & ORBIS_PAD_BUTTON_L1)
++                            by = -5;
++                        if (pressed & ORBIS_PAD_BUTTON_R1)
++                            by = 5;
++                        if (by != 0) {
++                            tile = std::clamp(tile + by, 0, count - 1);
++                            dirty = true;
++                        }
++                        const Tile &t = tiles[tile];
++                        if (pressed & ORBIS_PAD_BUTTON_CROSS) {
++                            if (t.kind == TileKind::Henkaku)
++                                open_settings(-1);
++                            else if (t.kind == TileKind::Install)
++                                open_browser();
++                            else if (items[t.item].system != SystemApp::None)
++                                open_system(items[t.item]);
++                            else {
++                                cards_view.launching = true;
++                                cards_view.launch_at = now;
++                            }
++                            dirty = true;
++                        } else if (pressed & ORBIS_PAD_BUTTON_SQUARE) {
++                            if (t.kind == TileKind::Game && items[t.item].system == SystemApp::None)
++                                open_settings(t.item);
++                            else if (t.kind == TileKind::Henkaku)
++                                open_themes();
++                            dirty = true;
++                        }
 +                    }
 +                } else {
 +                    const int count = static_cast<int>(items.size());
@@ -12513,7 +13048,7 @@ index 00000000..a1877c1d
 +                        dirty = true;
 +                    }
 +                }
-+                if (pending_open >= 0 || peeling || launching) {
++                if (pending_open >= 0 || peeling || launching || cards_view.launching) {
 +                } else if (pressed & ORBIS_PAD_BUTTON_TRIANGLE) {
 +                    open_browser();
 +                    dirty = true;
@@ -12559,9 +13094,13 @@ index 00000000..a1877c1d
 +                        settings.stack.pop_back();
 +                    } else {
 +                        mode = settings_return;
-+                        // the home screen's style may have changed
++                        // the home screen's style may have changed (a LiveArea is the bubbles')
++                        if (mode == Mode::LiveArea && prefs.home_style != ps4settings::HOME_BUBBLES)
++                            mode = Mode::Home;
 +                        tiles = make_tiles(items);
 +                        art.clear();
++                        cards_view.pos = Spring{};
++                        cards_view.pos.pos = static_cast<float>(tile);
 +                        if (mode == Mode::LiveArea)
 +                            card_pictures.clear();
 +                    }
@@ -12718,7 +13257,7 @@ index 00000000..a1877c1d
 +        // the animations, a step for the time since the last frame
 +        const float dt = std::min(0.05f, std::chrono::duration<float>(now - last_frame).count());
 +        last_frame = now;
-+        const bool vita_home = prefs.bubbles && (mode == Mode::Home || mode == Mode::LiveArea);
++        const bool vita_home = prefs.home_style == ps4settings::HOME_BUBBLES && (mode == Mode::Home || mode == Mode::LiveArea);
 +        bool animating = false;
 +        if (vita_home) {
 +            if (update_wallpaper(now)) {
@@ -12731,13 +13270,21 @@ index 00000000..a1877c1d
 +            card_pos.step(static_cast<float>(card), dt, 210.f, 0.86f);
 +            animating |= card_pos.moving(static_cast<float>(card)) || peeling || launching || pending_open >= 0;
 +        }
++        const bool cards_home = prefs.home_style == ps4settings::HOME_CARDS && mode == Mode::Home;
++        if (cards_home) {
++            if (update_wallpaper(now))
++                dirty = true;
++            animating |= prefs.moving_wallpaper && !job.running;
++            cards_view.pos.step(static_cast<float>(tile), dt, 170.f, 0.84f);
++            animating |= cards_view.pos.moving(static_cast<float>(tile)) || cards_view.launching;
++        }
 +
 +        if (dirty || animating) {
 +            std::vector<Hint> hints;
 +            switch (mode) {
 +            case Mode::Home:
 +            case Mode::LiveArea:
-+                if (prefs.bubbles) {
++                if (prefs.home_style == ps4settings::HOME_BUBBLES) {
 +                    if (peeling) {
 +                        // what's under the card shows as it goes
 +                        const int under = card - 1;
@@ -12810,6 +13357,33 @@ index 00000000..a1877c1d
 +                        std::this_thread::sleep_for(std::chrono::milliseconds(16));
 +                    }
 +                    continue;
++                } else if (prefs.home_style == ps4settings::HOME_CARDS) {
++                    draw_cards(canvas, cards_view, static_cast<int>(tiles.size()), card_art_fn);
++                    if (cards_view.launching) {
++                        // the card in front grows, the screen goes dark, the game starts
++                        const float t = std::min(1.f, ms_since(cards_view.launch_at, now) / 380.f);
++                        const float e = smoothstep(0.f, 1.f, t);
++                        const float scale = 1.f + 0.85f * e;
++                        canvas.blit_scaled(card_art_fn(tile), W / 2.f, card_sprite_y(scale), scale);
++                        canvas.fill_rect(0, 0, W, H, rgb(0x000000, static_cast<uint8_t>(255 * e)));
++                        if (t >= 1.f) {
++                            cards_view.launching = false;
++                            if (auto choice = start_game(tiles[tile].item))
++                                return *choice;
++                        }
++                    }
++                    status_bar(canvas, fw, {}, 0.f);
++                    const Tile &t = tiles[tile];
++                    if (t.kind == TileKind::Game && items[t.item].system == SystemApp::None) {
++                        hints.push_back({ Pad::Cross, "Start" });
++                        hints.push_back({ Pad::Square, "Game settings" });
++                    } else {
++                        hints.push_back({ Pad::Cross, "Open" });
++                        if (t.kind == TileKind::Henkaku)
++                            hints.push_back({ Pad::Square, "Themes" });
++                    }
++                    hints.push_back({ Pad::Triangle, "Install games" });
++                    hints.push_back({ Pad::Options, "HENkaku" });
 +                } else {
 +                    // Vita3K's list, as it was
 +                    if (selected < top)
@@ -12874,6 +13448,18 @@ index 00000000..a1877c1d
 +                draw_install(canvas, job);
 +            present(canvas);
 +            dirty = false;
++        }
++        // the cards next to the one in front, made while nothing moves
++        if (cards_home && !animating) {
++            for (const int i : { tile + 1, tile - 1, tile + 2, tile - 2 }) {
++                if (i < 0 || i >= static_cast<int>(tiles.size()))
++                    continue;
++                const auto it = art.find(i);
++                if (it == art.end() || it->second.card.empty()) {
++                    card_art(i);
++                    break;
++                }
++            }
 +        }
 +        std::this_thread::sleep_for(std::chrono::milliseconds(16));
 +    }
@@ -14619,10 +15205,10 @@ index 00000000..69e26898
 +} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_settings.cpp b/vita3k/ps4/ps4_settings.cpp
 new file mode 100644
-index 00000000..8e14fcaf
+index 00000000..4ee093c8
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.cpp
-@@ -0,0 +1,790 @@
+@@ -0,0 +1,1056 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -14669,10 +15255,13 @@ index 00000000..8e14fcaf
 +#include <util/fs.h>
 +#include <util/log.h>
 +
++#include <pugixml.hpp>
++
 +#include <algorithm>
 +#include <atomic>
 +#include <cmath>
 +#include <cstdio>
++#include <ctime>
 +#include <functional>
 +#include <memory>
 +#include <mutex>
@@ -15045,27 +15634,225 @@ index 00000000..8e14fcaf
 +    return items;
 +}
 +
-+// The home screen's theme, its wave moving, and its wallpaper (a picture copied to
-+// /data/HENkaku/wallpapers, or the theme's wave)
-+std::vector<Item> look_items() {
++// The palette the colours are picked from (HENkaku > Themes > Colours)
++struct NamedColor {
++    const char *name;
++    uint32_t rgb;
++};
++const NamedColor PALETTE[] = {
++    { "White", 0xffffff }, { "Silver", 0xc8ccd6 }, { "Grey", 0x767c88 }, { "Charcoal", 0x2c2f36 }, { "Black", 0x050608 },
++    { "Navy", 0x0b1d4f }, { "Blue", 0x1e5bd8 }, { "PS Vita blue", 0x2662e2 }, { "Sky", 0x5fc4ff }, { "Ice", 0x9fe0ff },
++    { "Cyan", 0x22d3e6 }, { "Teal", 0x149c8c }, { "Green", 0x2a8250 }, { "Lime", 0x8ad63c }, { "Olive", 0x6b7a2a },
++    { "Yellow", 0xf2d43c }, { "Gold", 0xd4a017 }, { "Orange", 0xf07a3c }, { "Red", 0xd8322e }, { "Crimson", 0x8c1430 },
++    { "Pink", 0xe48cb4 }, { "Magenta", 0xd33ca8 }, { "Purple", 0x7a3cc8 }, { "Plum", 0x46145a }, { "Brown", 0x6b4426 },
++};
++
++int nearest_color(uint32_t rgb) {
++    int best = 0;
++    long best_distance = -1;
++    for (int i = 0; i < static_cast<int>(std::size(PALETTE)); i++) {
++        const long dr = static_cast<long>((rgb >> 16) & 0xFF) - static_cast<long>((PALETTE[i].rgb >> 16) & 0xFF);
++        const long dg = static_cast<long>((rgb >> 8) & 0xFF) - static_cast<long>((PALETTE[i].rgb >> 8) & 0xFF);
++        const long db = static_cast<long>(rgb & 0xFF) - static_cast<long>(PALETTE[i].rgb & 0xFF);
++        const long distance = dr * dr + dg * dg + db * db;
++        if (best_distance < 0 || distance < best_distance) {
++            best_distance = distance;
++            best = i;
++        }
++    }
++    return best;
++}
++
++// One of a theme's colours (0 top, 1 bottom, 2 light, 3 accent): as the theme in use has it, and
++// changed it makes the theme "Custom colours", starting from the theme's
++Item colour_choice(std::string name, int part) {
++    Item item;
++    item.type = Item::kind::choice;
++    item.name = std::move(name);
++    for (const NamedColor &c : PALETTE) {
++        item.values.push_back(c.name);
++        item.swatches.push_back(c.rgb);
++    }
++    const auto component = [](const ThemeColors &c, int part) {
++        return part == 0 ? c.top : part == 1 ? c.bottom : part == 2 ? c.light : c.accent;
++    };
++    item.get = [part, component] {
++        const std::lock_guard<std::mutex> lock(settings_mutex);
++        return nearest_color(component(theme_colors(g_prefs), part));
++    };
++    item.set = [part](int index) {
++        const std::lock_guard<std::mutex> lock(settings_mutex);
++        if (g_prefs.theme != custom_theme() || !g_prefs.vita_theme.empty()) {
++            const ThemeColors now = theme_colors(g_prefs);
++            g_prefs.custom_top = now.top;
++            g_prefs.custom_bottom = now.bottom;
++            g_prefs.custom_light = now.light;
++            g_prefs.custom_accent = now.accent;
++            g_prefs.theme = custom_theme();
++            g_prefs.vita_theme.clear();
++        }
++        uint32_t &field = part == 0 ? g_prefs.custom_top : part == 1 ? g_prefs.custom_bottom : part == 2 ? g_prefs.custom_light : g_prefs.custom_accent;
++        field = PALETTE[std::clamp(index, 0, static_cast<int>(std::size(PALETTE)) - 1)].rgb;
++        save_prefs();
++    };
++    return item;
++}
++
++// The built-in themes, "Custom colours", then the PS Vita themes installed (their pictures and colours)
++Item theme_choice(EmuEnvState &emuenv) {
++    const std::vector<VitaTheme> installed = vita_themes(fs_utils::path_to_utf8(emuenv.vita_fs_path / "ux0" / "theme"));
++    Item item;
++    item.type = Item::kind::choice;
++    item.name = "Theme";
++    item.values = theme_names();
++    for (const VitaTheme &t : installed)
++        item.values.push_back(t.title);
++    item.get = [installed] {
++        const std::lock_guard<std::mutex> lock(settings_mutex);
++        for (size_t i = 0; i < installed.size(); i++) {
++            if (installed[i].folder == g_prefs.vita_theme)
++                return static_cast<int>(theme_names().size() + i);
++        }
++        return g_prefs.theme;
++    };
++    item.set = [installed](int index) {
++        const std::lock_guard<std::mutex> lock(settings_mutex);
++        const int built_in = static_cast<int>(theme_names().size());
++        if (index < built_in) {
++            g_prefs.theme = index;
++            g_prefs.vita_theme.clear();
++        } else if (index - built_in < static_cast<int>(installed.size())) {
++            g_prefs.vita_theme = installed[index - built_in].folder;
++        }
++        save_prefs();
++    };
++    return item;
++}
++
++bool is_picture(const fs::path &path) {
++    std::string ext = path.extension().string();
++    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
++    return ext == ".png" || ext == ".jpg" || ext == ".jpeg";
++}
++
++// The pictures in a folder (and its subfolders, deep), the newest first, at most `most`
++std::vector<fs::path> pictures_in(const fs::path &dir, bool deep, size_t most) {
++    std::vector<std::pair<std::time_t, fs::path>> found;
++    boost::system::error_code ec;
++    if (!fs::is_directory(dir, ec))
++        return {};
++    const auto add = [&](const fs::path &p) {
++        boost::system::error_code e;
++        if (fs::is_regular_file(p, e) && is_picture(p))
++            found.emplace_back(fs::last_write_time(p, e), p);
++    };
++    if (deep) {
++        for (fs::recursive_directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
++            add(it->path());
++    } else {
++        for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
++            add(it->path());
++    }
++    std::sort(found.begin(), found.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
++    std::vector<fs::path> paths;
++    for (size_t i = 0; i < found.size() && i < most; i++)
++        paths.push_back(found[i].second);
++    return paths;
++}
++
++// A picture as the wallpaper: copied to wallpaper_dir() first when it's elsewhere (a USB drive,
++// the PS4's screenshots), so it stays when that's gone
++void use_wallpaper(const fs::path &picture) {
++    const fs::path dir = wallpaper_dir();
++    const fs::path target = dir / picture.filename();
++    boost::system::error_code ec;
++    if (picture.parent_path() != dir) {
++        fs::create_directories(dir, ec);
++        fs::copy_file(picture, target, fs::copy_options::overwrite_existing, ec);
++        if (ec) {
++            LOG_WARN("PS4: couldn't copy {} to {}: {}", picture.string(), target.string(), ec.message());
++            return;
++        }
++    }
++    const std::lock_guard<std::mutex> lock(settings_mutex);
++    g_prefs.wallpaper = picture.filename().string();
++    save_prefs();
++}
++
++Item picture_item(const fs::path &picture) {
++    Item item = action(picture.filename().string(), [picture] { use_wallpaper(picture); });
++    item.preview = picture.string();
++    item.checked = [file = picture.filename().string()] {
++        const std::lock_guard<std::mutex> lock(settings_mutex);
++        return g_prefs.wallpaper == file;
++    };
++    return item;
++}
++
++// The wallpaper: the theme's own, or a picture: HENkaku's (wallpaper_dir()), a USB drive's (its top
++// folder and a "wallpapers" folder in it), or the PS4's screenshots (the newest 60), each shown
++// beside the list while it's picked
++std::vector<Item> wallpaper_items() {
++    std::vector<Item> items;
++    items.push_back(section("Wallpaper"));
++    Item theme_own = action("The theme's own", [] {
++        const std::lock_guard<std::mutex> lock(settings_mutex);
++        g_prefs.wallpaper.clear();
++        save_prefs();
++    });
++    theme_own.checked = [] {
++        const std::lock_guard<std::mutex> lock(settings_mutex);
++        return g_prefs.wallpaper.empty();
++    };
++    items.push_back(std::move(theme_own));
++    const auto add_all = [&](const std::string &heading, const std::vector<fs::path> &pictures) {
++        if (pictures.empty())
++            return;
++        items.push_back(section(heading));
++        for (const fs::path &p : pictures)
++            items.push_back(picture_item(p));
++    };
++    add_all("HENkaku's pictures: " + wallpaper_dir(), pictures_in(wallpaper_dir(), false, 500));
++    for (int i = 0; i < 8; i++) {
++        const fs::path usb = fmt::format("/mnt/usb{}", i);
++        std::vector<fs::path> pictures = pictures_in(usb / "wallpapers", false, 200);
++        const std::vector<fs::path> top = pictures_in(usb, false, 200);
++        pictures.insert(pictures.end(), top.begin(), top.end());
++        add_all(fmt::format("USB drive {}", i + 1), pictures);
++    }
++    add_all("PS4 screenshots", pictures_in("/user/av_contents/photo", true, 60));
++    if (items.size() == 2)
++        items.push_back(section("Copy pictures (.png, .jpg) to " + wallpaper_dir() + " or a USB drive"));
++    return items;
++}
++
++// The home screen's look: its style, the bubbles, the theme and its colours, the wallpaper
++std::vector<Item> themes_items(EmuEnvState &emuenv) {
 +    std::vector<Item> items;
 +    items.push_back(section("Home screen"));
-+    items.push_back(pref_choice("Theme", theme_names(),
-+        [](const Prefs &p) { return p.theme; },
-+        [](Prefs &p, int value) { p.theme = value; }));
++    items.push_back(pref_choice("Style", { "Bubbles", "LiveArea cards", "List" },
++        [](const Prefs &p) { return std::clamp(p.home_style, 0, 2); },
++        [](Prefs &p, int value) { p.home_style = value; }));
++    items.push_back(pref_choice("Bubbles", { "3D", "Flat" },
++        [](const Prefs &p) { return p.bubbles_3d ? 0 : 1; },
++        [](Prefs &p, int value) { p.bubbles_3d = value == 0; }));
++    items.push_back(section("Theme"));
++    items.push_back(theme_choice(emuenv));
++    std::vector<Item> colours;
++    colours.push_back(section("Your own colours (the theme becomes Custom colours)"));
++    colours.push_back(colour_choice("Background, top", 0));
++    colours.push_back(colour_choice("Background, bottom", 1));
++    colours.push_back(colour_choice("Light", 2));
++    colours.push_back(colour_choice("Focus", 3));
++    items.push_back(page("Colours", std::move(colours)));
++    items.push_back(section("Wallpaper"));
++    items.push_back(page("Wallpaper", wallpaper_items(), "the theme's own or a picture"));
 +    items.push_back(pref_choice("Moving wallpaper", { "Off", "On" },
 +        [](const Prefs &p) { return p.moving_wallpaper ? 1 : 0; },
 +        [](Prefs &p, int value) { p.moving_wallpaper = value == 1; }));
-+    std::vector<std::string> files = wallpaper_files();
-+    std::vector<std::string> labels{ "Wave" };
-+    labels.insert(labels.end(), files.begin(), files.end());
-+    items.push_back(pref_choice("Wallpaper", labels,
-+        [files](const Prefs &p) {
-+            const auto it = std::find(files.begin(), files.end(), p.wallpaper);
-+            return it == files.end() ? 0 : static_cast<int>(it - files.begin()) + 1;
-+        },
-+        [files](Prefs &p, int value) { p.wallpaper = value == 0 ? std::string() : files[value - 1]; }));
-+    items.push_back(section("Pictures: " + wallpaper_dir()));
++    items.push_back(section("Add your own"));
++    items.push_back(info("Pictures", wallpaper_dir()));
++    items.push_back(info("PS Vita themes", "PKGj, or a theme's .pkg and .zrif"));
 +    return items;
 +}
 +
@@ -15136,7 +15923,7 @@ index 00000000..8e14fcaf
 +        if (key == "settings")
 +            version = std::atoi(value.c_str());
 +        else if (key == "home")
-+            g_prefs.bubbles = value != "list";
++            g_prefs.home_style = value == "list" ? HOME_LIST : value == "cards" ? HOME_CARDS : HOME_BUBBLES;
 +        else if (key == "fsr-sharpness")
 +            g_prefs.fsr_sharpness = std::clamp(std::atoi(value.c_str()), 0, static_cast<int>(std::size(SHARPENING_STOPS)) - 1);
 +        else if (key == "game-threads")
@@ -15173,6 +15960,18 @@ index 00000000..8e14fcaf
 +            g_prefs.moving_wallpaper = value == "on";
 +        else if (key == "wallpaper")
 +            g_prefs.wallpaper = value == "wave" ? std::string() : value;
++        else if (key == "vita-theme")
++            g_prefs.vita_theme = value;
++        else if (key == "custom-top")
++            g_prefs.custom_top = static_cast<uint32_t>(std::strtoul(value.c_str(), nullptr, 16)) & 0xFFFFFF;
++        else if (key == "custom-bottom")
++            g_prefs.custom_bottom = static_cast<uint32_t>(std::strtoul(value.c_str(), nullptr, 16)) & 0xFFFFFF;
++        else if (key == "custom-light")
++            g_prefs.custom_light = static_cast<uint32_t>(std::strtoul(value.c_str(), nullptr, 16)) & 0xFFFFFF;
++        else if (key == "custom-accent")
++            g_prefs.custom_accent = static_cast<uint32_t>(std::strtoul(value.c_str(), nullptr, 16)) & 0xFFFFFF;
++        else if (key == "bubbles")
++            g_prefs.bubbles_3d = value != "flat";
 +    }
 +    std::fclose(f);
 +    if (version < 2) {
@@ -15191,7 +15990,7 @@ index 00000000..8e14fcaf
 +    }
 +    std::fprintf(f, "# HENkaku (Vita3K for PS4): the frontend's own settings (HENkaku > System, Display, CPU)\n");
 +    std::fprintf(f, "settings = 2\n");
-+    std::fprintf(f, "home = %s\n", g_prefs.bubbles ? "bubbles" : "list");
++    std::fprintf(f, "home = %s\n", g_prefs.home_style == HOME_LIST ? "list" : g_prefs.home_style == HOME_CARDS ? "cards" : "bubbles");
 +    std::fprintf(f, "fsr-sharpness = %d\n", g_prefs.fsr_sharpness);
 +    std::fprintf(f, "game-threads = %s\n", g_prefs.cluster_threads ? "cluster" : "all");
 +    std::fprintf(f, "frame-queue = %s\n", g_prefs.frame_overlap ? "vita" : "vita3k");
@@ -15210,6 +16009,12 @@ index 00000000..8e14fcaf
 +    std::fprintf(f, "theme = %d\n", g_prefs.theme);
 +    std::fprintf(f, "moving-wallpaper = %s\n", g_prefs.moving_wallpaper ? "on" : "off");
 +    std::fprintf(f, "wallpaper = %s\n", g_prefs.wallpaper.empty() ? "wave" : g_prefs.wallpaper.c_str());
++    std::fprintf(f, "vita-theme = %s\n", g_prefs.vita_theme.c_str());
++    std::fprintf(f, "custom-top = %06x\n", g_prefs.custom_top);
++    std::fprintf(f, "custom-bottom = %06x\n", g_prefs.custom_bottom);
++    std::fprintf(f, "custom-light = %06x\n", g_prefs.custom_light);
++    std::fprintf(f, "custom-accent = %06x\n", g_prefs.custom_accent);
++    std::fprintf(f, "bubbles = %s\n", g_prefs.bubbles_3d ? "3d" : "flat");
 +    std::fclose(f);
 +}
 +
@@ -15286,8 +16091,59 @@ index 00000000..8e14fcaf
 +}
 +
 +const std::vector<std::string> &theme_names() {
-+    static const std::vector<std::string> names = { "PS Vita blue", "Midnight", "Sakura", "Forest", "Sunset", "Carbon" };
++    static const std::vector<std::string> names = { "PS Vita blue", "Midnight", "Sakura", "Forest", "Sunset", "Carbon",
++        "Ocean", "Crimson", "Lavender", "Gold", "Custom colours" };
 +    return names;
++}
++
++namespace {
++// in theme_names()' order, without "Custom colours"
++const ThemeColors THEMES[] = {
++    { 0x123ab0, 0x2662e2, 0xffffff, 0x9fe0ff }, // PS Vita blue
++    { 0x06080f, 0x161d33, 0x7896dc, 0x8fb4ff }, // Midnight
++    { 0x7a2a5c, 0xe48cb4, 0xffebf5, 0xffd2e8 }, // Sakura
++    { 0x08301f, 0x2a8250, 0xdcffe6, 0xa8ffc8 }, // Forest
++    { 0x46145a, 0xf07a3c, 0xffe6c8, 0xffc890 }, // Sunset
++    { 0x18181a, 0x3c3c42, 0xc8c8d2, 0xe0e0ea }, // Carbon
++    { 0x02303c, 0x1593a8, 0xd2fbff, 0x7ff0ff }, // Ocean
++    { 0x24040a, 0x9c1a2c, 0xffd6dc, 0xff8c9c }, // Crimson
++    { 0x2c1a52, 0xb48ce6, 0xf6eaff, 0xe2c8ff }, // Lavender
++    { 0x2e1e02, 0xc89412, 0xfff2cc, 0xffd666 }, // Gold
++};
++} // namespace
++
++int custom_theme() {
++    return static_cast<int>(std::size(THEMES));
++}
++
++ThemeColors theme_colors(const Prefs &prefs) {
++    if (prefs.theme == custom_theme())
++        return { prefs.custom_top, prefs.custom_bottom, prefs.custom_light, prefs.custom_accent };
++    return THEMES[std::clamp(prefs.theme, 0, custom_theme() - 1)];
++}
++
++std::vector<VitaTheme> vita_themes(const std::string &theme_root) {
++    std::vector<VitaTheme> themes;
++    boost::system::error_code ec;
++    for (fs::directory_iterator it(theme_root, ec), end; !ec && it != end; it.increment(ec)) {
++        const fs::path xml = it->path() / "theme.xml";
++        pugi::xml_document doc;
++        if (!doc.load_file(xml.string().c_str()))
++            continue;
++        const pugi::xml_node theme = doc.child("theme");
++        // a home screen picture at least
++        if (!theme.child("HomeProperty").child("m_bgParam").first_child())
++            continue;
++        const pugi::xml_node title = theme.child("InfomationProperty").child("m_title");
++        std::string name = title.child("m_default").text().as_string();
++        for (const pugi::xml_node child : title.children()) {
++            if (name.empty())
++                name = child.text().as_string();
++        }
++        themes.push_back({ it->path().filename().string(), name.empty() ? it->path().filename().string() : name });
++    }
++    std::sort(themes.begin(), themes.end(), [](const VitaTheme &a, const VitaTheme &b) { return a.title < b.title; });
++    return themes;
 +}
 +
 +std::string wallpaper_dir() {
@@ -15329,16 +16185,12 @@ index 00000000..8e14fcaf
 +    }
 +
 +    std::vector<Item> system;
-+    system.push_back(section("Home screen"));
-+    system.push_back(pref_choice("Style", { "Bubbles", "List" },
-+        [](const Prefs &p) { return p.bubbles ? 0 : 1; },
-+        [](Prefs &p, int value) { p.bubbles = value == 0; }));
 +    system.push_back(section("Buttons"));
 +    system.push_back(global_choice<int>(emuenv, "Enter button", { "Cross", "Circle" },
 +        { static_cast<int>(SCE_SYSTEM_PARAM_ENTER_BUTTON_CROSS), static_cast<int>(SCE_SYSTEM_PARAM_ENTER_BUTTON_CIRCLE) },
 +        &Config::sys_button, next_start));
 +    pages.push_back(section("PS4"));
-+    pages.push_back(page("Look", look_items()));
++    pages.push_back(page("Themes", themes_items(emuenv), "colours, wallpaper, the home screen"));
 +    pages.push_back(page("System", std::move(system)));
 +    pages.push_back(page("Diagnostics", diagnostics_items()));
 +    pages.push_back(page("About", about_items()));
@@ -15415,10 +16267,10 @@ index 00000000..8e14fcaf
 +} // namespace ps4settings
 diff --git a/vita3k/ps4/ps4_settings.h b/vita3k/ps4/ps4_settings.h
 new file mode 100644
-index 00000000..535b4b65
+index 00000000..968c67de
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.h
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,139 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -15457,8 +16309,9 @@ index 00000000..535b4b65
 +// The PS4 frontend's own settings, which Vita3K's config.yml has no place for
 +// (/data/HENkaku/ps4.cfg, "key = value" lines)
 +struct Prefs {
-+    // the home screen: the PS Vita's bubbles, or Vita3K's list
-+    bool bubbles = true;
++    // the home screen (HomeStyle): the PS Vita's bubbles, its LiveArea cards side by side, or
++    // Vita3K's list
++    int home_style = 0;
 +    // FSR 1's sharpening, an index into the choices (1: 0.2 stops, Vita3K's)
 +    int fsr_sharpness = 1;
 +    // the game's threads on the first four cores (one Jaguar cluster, sharing their L2 cache), or
@@ -15495,19 +16348,49 @@ index 00000000..535b4b65
 +    bool input_log = true;
 +    // each vertex and texture format a game uses, once
 +    bool format_log = false;
-+    // the home screen's look: a theme (its colours, theme_names()), its wave moving, and the
-+    // wallpaper: the theme's wave, or a picture's file name in wallpaper_dir()
++    // the home screen's look: a theme (theme_names(): the built-in ones, then "Custom colours", the
++    // colours below), or a PS Vita theme installed in ux0/theme (its folder, first when it's set),
++    // its wave moving, the wallpaper (the theme's, or a picture's file name in wallpaper_dir()),
++    // and the bubbles: lit as glass balls, or flat
 +    int theme = 0;
++    std::string vita_theme;
++    uint32_t custom_top = 0x123ab0;
++    uint32_t custom_bottom = 0x2662e2;
++    uint32_t custom_light = 0xffffff;
++    uint32_t custom_accent = 0x9fe0ff;
 +    bool moving_wallpaper = false;
 +    std::string wallpaper;
++    bool bubbles_3d = true;
++};
++
++// Prefs::home_style
++enum HomeStyle {
++    HOME_BUBBLES = 0,
++    HOME_CARDS = 1,
++    HOME_LIST = 2,
 +};
 +Prefs &prefs();
 +void load_prefs();
 +void save_prefs();
 +// RCAS stops for an fsr_sharpness index
 +float fsr_sharpening(int index);
-+// The themes, in Prefs::theme's order (the launcher has their colours)
++// The themes, in Prefs::theme's order: the built-in ones, then "Custom colours"
 +const std::vector<std::string> &theme_names();
++// A theme's colours (0xRRGGBB): its background's top and bottom, the light of its wave, and the
++// focus; for the theme in use (Prefs::theme, "Custom colours" from Prefs' own)
++struct ThemeColors {
++    uint32_t top, bottom, light, accent;
++};
++ThemeColors theme_colors(const Prefs &prefs);
++// "Custom colours"' index in theme_names()
++int custom_theme();
++// The PS Vita themes installed in a Vita's ux0/theme (by PKGj, or a theme's .pkg installed): their
++// folders and titles
++struct VitaTheme {
++    std::string folder;
++    std::string title;
++};
++std::vector<VitaTheme> vita_themes(const std::string &theme_root);
 +// Where wallpaper pictures go (/data/HENkaku/wallpapers), and the ones there (.png, .jpg)
 +std::string wallpaper_dir();
 +std::vector<std::string> wallpaper_files();
