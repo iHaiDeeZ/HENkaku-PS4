@@ -129,7 +129,17 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
 - **Audio**: `audio/src/impl/ps4_audio.cpp`, one sceAudioOut port (48 kHz stereo) fed by a mixer
   thread; each Vita port is resampled to 48 kHz into a ring.
 - **Input**: ScePad into Vita3K's virtual keyboard state (game and menus), the touchpad as touch
-  events, motion as sensor events (`ps4_pad.cpp`).
+  events, motion as sensor events (`ps4_pad.cpp`). Since 1.13 the pad's motion sensors are switched
+  on (`scePadSetMotionSensorState`) and `CtrlState::has_motion_support` is set, without which
+  SceMotion gave games a Vita lying still.
+- **Camera** (`ps4_camera.cpp`, 1.13): the "web camera" type is the PlayStation Camera (libSceCamera
+  loaded as an internal sysmodule, config type 1: 1280x800 YUV 4:2:2, the left lens), cropped to the
+  game's shape and scaled to its size as ARGB, then converted to the format it asked for. Without
+  one: `/data/HENkaku/camera.png`/`.jpg`, or grey. SDL's camera subsystem isn't used.
+  `init_default_cameras` no longer turns the default into a solid colour.
+- **Vita cores** (`kernel/src/thread.cpp`): since 1.13 a thread of a higher priority takes its Vita
+  core from the owner at once (Street Fighter X Tekken's Job Main spins for its workers and held
+  the core 10 ms), and the perf lines give each thread's wait for its core.
 - **Keyboard** (`ps4_keyboard.cpp`, 1.10): a game's IME dialog (`sceImeDialogInit`) or `sceImeOpen` opens
   the PS4's own IME dialog, as March33 does: the Vita's title, text (UTF-16 on both), length, type and
   multiline/password options; the main loop polls it and gives the text to the dialog (finished, OK)

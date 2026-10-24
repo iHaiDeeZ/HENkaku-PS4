@@ -665,6 +665,157 @@ index 00000000..4a6f7930
 +        port.cond_var.notify_all();
 +    }
 +}
+diff --git a/vita3k/camera/src/camera.cpp b/vita3k/camera/src/camera.cpp
+index 85d7e96d..565fad01 100644
+--- a/vita3k/camera/src/camera.cpp
++++ b/vita3k/camera/src/camera.cpp
+@@ -18,6 +18,7 @@
+ #include "config/state.h"
+ 
+ #include <array>
++#include <utility>
+ #include <camera/camera.h>
+ #include <camera/state.h>
+ #include <rtc/rtc.h>
+@@ -48,6 +49,14 @@ using stbi_uc_ptr = std::unique_ptr<stbi_uc, stbi_deleter>;
+ using SDL_CameraPtr = std::unique_ptr<SDL_Camera, SDL_CameraDeleter>;
+ using SDL_CameraListPtr = std::unique_ptr<SDL_CameraID[], SDL_Deleter>;
+ 
++#ifdef __PS4__
++// PS4: the PlayStation Camera for the web camera (vita3k/ps4/ps4_camera.cpp), and a picture in the
++// app's folder or grey without one (SDL has no camera there)
++extern "C" bool ps4_camera_open();
++extern "C" void ps4_camera_close();
++extern "C" bool ps4_camera_read(uint32_t *argb, int width, int height);
++#endif
++
+ class Camera::CameraImpl {
+ public:
+     SDL_CameraPtr sdl_camera;
+@@ -56,13 +65,37 @@ public:
+     SDL_PixelFormat format;
+     SDL_Colorspace colorspace;
+     std::mutex frame_mutex;
++#ifdef __PS4__
++    bool ps4_camera = false;
++#endif
+ };
+ 
+ Camera::Camera()
+     : pImpl(std::make_unique<CameraImpl>()) {}
+ Camera::~Camera() = default;
+ 
++static void set_frame_interval(Camera *self) {
++    uint16_t framerate_numerator = self->info.framerate;
++    uint16_t framerate_denominator = 1;
++    if (self->info.framerate == SCE_CAMERA_FRAMERATE_3_FPS) {
++        framerate_numerator = 375;
++        framerate_denominator = 100;
++    } else if (self->info.framerate == SCE_CAMERA_FRAMERATE_7_FPS) {
++        framerate_numerator = 75;
++        framerate_denominator = 10;
++    }
++    if (framerate_numerator)
++        self->frame_interval_us = SDL_US_PER_SECOND * framerate_denominator / framerate_numerator;
++}
++
+ static bool init_web_camera(Camera *self) {
++#ifdef __PS4__
++    if (!ps4_camera_open())
++        return false;
++    self->pImpl->ps4_camera = true;
++    set_frame_interval(self);
++    return true;
++#endif
+     // open web camera via SDL3
+     int num_cameras;
+     SDL_CameraListPtr cameras(SDL_GetCameras(&num_cameras));
+@@ -109,6 +142,20 @@ static bool init_web_camera(Camera *self) {
+ }
+ 
+ static bool init_image(Camera *self) {
++#ifdef __PS4__
++    // without one set, a picture of the user's own: /data/HENkaku/camera.png or camera.jpg
++    if (self->image.empty()) {
++        for (const char *path : { "/data/HENkaku/camera.png", "/data/HENkaku/camera.jpg" }) {
++            if (FILE *probe = fopen(path, "rb")) {
++                fclose(probe);
++                self->image = path;
++                break;
++            }
++        }
++        if (self->image.empty())
++            return false;
++    }
++#endif
+     FILE *f = FOPEN(fs_utils::utf8_to_path(self->image).c_str(), "rb");
+     if (!f) {
+         LOG_ERROR("Failed to open camera image file: {} Error: {}", self->image, strerror(errno));
+@@ -162,7 +209,13 @@ static bool init_solid_color(Camera *self) {
+         LOG_ERROR("Failed to create SDL surface for solid color: {}", SDL_GetError());
+         return false;
+     }
+-    if (!SDL_FillSurfaceRect(image_surface.get(), nullptr, self->color)) {
++#ifdef __PS4__
++    // (grey rather than black: a game shows the camera works)
++    const uint32_t color = self->color ? self->color : 0xFF808080;
++#else
++    const uint32_t color = self->color;
++#endif
++    if (!SDL_FillSurfaceRect(image_surface.get(), nullptr, color)) {
+         LOG_ERROR("Failed to fill SDL surface with solid color: {}", SDL_GetError());
+         return false;
+     }
+@@ -180,6 +233,10 @@ static void refresh_camera_image(Camera *self) {
+ 
+     self->pImpl->sdl_camera.reset();
+     self->pImpl->frame.reset();
++#ifdef __PS4__
++    if (std::exchange(self->pImpl->ps4_camera, false))
++        ps4_camera_close();
++#endif
+     if (self->type == CameraType::WebCamera) {
+         if (!init_web_camera(self))
+             self->type = CameraType::Image;
+@@ -293,6 +350,16 @@ int Camera::read(SceCameraRead *read, void *pIBase, void *pUBase, void *pVBase,
+     // next frame
+     last_frame_timestamp_us = next_frame_timestamp_us;
+     next_frame_timestamp_us = next_frame_timestamp_us + frame_interval_us;
++#ifdef __PS4__
++    if (type == CameraType::WebCamera && pImpl->ps4_camera) {
++        SDL_SurfacePtr picture(SDL_CreateSurface(info.width, info.height, SDL_PIXELFORMAT_ARGB8888));
++        if (picture && picture->pitch == info.width * 4 && ps4_camera_read(static_cast<uint32_t *>(picture->pixels), info.width, info.height)) {
++            SDL_SurfacePtr converted(SDL_ConvertSurfaceAndColorspace(picture.get(), pImpl->format, nullptr, pImpl->colorspace, 0));
++            if (converted)
++                pImpl->frame = std::move(converted);
++        }
++    } else
++#endif
+     if (type == CameraType::WebCamera) {
+         Uint64 timestampNS = 0;
+         auto surface = SDL_AcquireCameraFrame(pImpl->sdl_camera.get(), &timestampNS);
+@@ -383,6 +450,10 @@ int Camera::stop() {
+     this->is_started = false;
+     pImpl->frame.reset();
+     pImpl->sdl_camera.reset();
++#ifdef __PS4__
++    if (std::exchange(pImpl->ps4_camera, false))
++        ps4_camera_close();
++#endif
+     return 0;
+ }
+ 
+@@ -417,6 +488,10 @@ void CameraState::deinit() {
+ BOOST_DESCRIBE_ENUM(SDL_CameraPosition, SDL_CAMERA_POSITION_UNKNOWN, SDL_CAMERA_POSITION_FRONT_FACING, SDL_CAMERA_POSITION_BACK_FACING)
+ 
+ void init_default_cameras(Config &cfg) {
++#ifdef __PS4__
++    // (the web camera is the PlayStation Camera there, picked when a game opens it)
++    return;
++#endif
+     if (!((cfg.front_camera_type == WebCamera && cfg.front_camera_id.empty()) || (cfg.back_camera_type == WebCamera && cfg.back_camera_id.empty())))
+         return;
+     LOG_DEBUG("Initialize default cameras...");
 diff --git a/vita3k/codec/src/atrac9.cpp b/vita3k/codec/src/atrac9.cpp
 index cea885af..d13e7fdc 100644
 --- a/vita3k/codec/src/atrac9.cpp
@@ -2573,10 +2724,10 @@ index 78029915..baf00c6a 100644
      const auto guard = lock();
      if (!guard)
 diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
-index c01e4699..b20bd9ba 100644
+index c01e4699..bc2e6d54 100644
 --- a/vita3k/kernel/src/thread.cpp
 +++ b/vita3k/kernel/src/thread.cpp
-@@ -32,6 +32,108 @@
+@@ -32,6 +32,117 @@
  #include <sstream>
  #include <utility>
  
@@ -2590,6 +2741,7 @@ index c01e4699..b20bd9ba 100644
 +extern "C" int ps4_perf_code_end();
 +extern "C" void ps4_perf_sample(uint32_t pc);
 +extern "C" bool ps4_vita_cores(); // vita3k/ps4/ps4_settings.cpp
++extern "C" void ps4_perf_core_wait(int core, uint64_t ticks);
 +extern "C" uint64_t sceKernelGetTscFrequency();
 +
 +#include <chrono>
@@ -2602,6 +2754,9 @@ index c01e4699..b20bd9ba 100644
 +// meet on one core, while on parallel PS4 cores they deadlock. A thread takes its core to run guest
 +// code and keeps it through its calls; another one takes it over once the owner sits in a call
 +// (blocked: 0.3 ms) or ran a time slice (10 ms), so a thread blocked on the host never stalls the rest.
++// A thread of a higher priority takes it at once, as a Vita core switches to one: a game whose
++// lower-priority thread spins waiting for work (Street Fighter X Tekken's Job Main) otherwise kept
++// a thread of the same core waiting 10 ms, a missed frame.
 +namespace {
 +
 +// The owner changes under the mutex; it marks its own calls without it (most calls: the thread
@@ -2615,6 +2770,7 @@ index c01e4699..b20bd9ba 100644
 +    std::atomic<const void *> owner{ nullptr };
 +    std::atomic<bool> in_call{ false };
 +    std::atomic<uint64_t> since{ 0 }; // when the owner took the core or entered its call (TSC)
++    std::atomic<int> owner_priority{ 0 }; // the owner's (a smaller number runs first)
 +};
 +VitaCore g_vita_cores[3];
 +
@@ -2639,7 +2795,7 @@ index c01e4699..b20bd9ba 100644
 +    return ticks;
 +}
 +
-+void vita_core_take(int core, const void *self) {
++void vita_core_take(int core, const void *self, int priority) {
 +    VitaCore &c = g_vita_cores[core];
 +    t_vita_core = core;
 +    t_vita_thread = self;
@@ -2648,14 +2804,18 @@ index c01e4699..b20bd9ba 100644
 +        c.since.store(__builtin_ia32_rdtsc(), std::memory_order_release);
 +        return;
 +    }
++    const uint64_t start = __builtin_ia32_rdtsc();
 +    std::unique_lock<std::mutex> lock(c.mutex);
-+    // free, or its owner blocked on the host for 0.3 ms, or ran a 10 ms slice: woken when it's freed,
-+    // and every 100 us to look at the owner's times
-+    while (c.owner && c.owner != self && __builtin_ia32_rdtsc() - c.since < (c.in_call ? 300 : 10000) * ticks_per_us())
++    // free, or its owner of a lower priority, or blocked on the host for 0.3 ms, or ran a 10 ms
++    // slice: woken when it's freed, and every 100 us to look at the owner's times
++    while (c.owner && c.owner != self && priority >= c.owner_priority && __builtin_ia32_rdtsc() - c.since < (c.in_call ? 300 : 10000) * ticks_per_us())
 +        c.freed.wait_for(lock, std::chrono::microseconds(100));
 +    c.owner = self;
++    c.owner_priority = priority;
 +    c.in_call = false;
 +    c.since = __builtin_ia32_rdtsc();
++    lock.unlock();
++    ps4_perf_core_wait(core, c.since - start);
 +}
 +
 +void vita_core_call(int core, const void *self) {
@@ -2685,7 +2845,7 @@ index c01e4699..b20bd9ba 100644
  // Set in the wait type of a wait that runs callbacks
  constexpr SceUInt32 WAITTYPE_CB_BIT = 0x80000000U;
  // What a thread waiting for a thread signal reports as its wait UID on a Vita, which isn't a UID
-@@ -190,6 +292,10 @@ void ThreadState::request_removal() {
+@@ -190,6 +301,10 @@ void ThreadState::request_removal() {
  }
  
  void ThreadState::run_loop(bool top_level) {
@@ -2696,7 +2856,7 @@ index c01e4699..b20bd9ba 100644
      bool guest_returned = false;
  
      // Set thread-local CPU state so signal handlers can access it. The guard puts back what was
-@@ -248,6 +354,12 @@ void ThreadState::run_loop(bool top_level) {
+@@ -248,6 +363,12 @@ void ThreadState::run_loop(bool top_level) {
      while (true) {
          // This level is done once its guest function returned or the thread is ending
          if (exiting() || guest_returned) {
@@ -2709,7 +2869,7 @@ index c01e4699..b20bd9ba 100644
              // A nested level returns to the one below it
              if (!top_level)
                  break;
-@@ -272,6 +384,10 @@ void ThreadState::run_loop(bool top_level) {
+@@ -272,6 +393,10 @@ void ThreadState::run_loop(bool top_level) {
  
          // Park until we have something to do.
          if (status != ThreadStatus::running) {
@@ -2720,7 +2880,7 @@ index c01e4699..b20bd9ba 100644
              status_cond.wait(lock, [&] { return status == ThreadStatus::running || exiting(); });
              continue;
          }
-@@ -297,17 +413,59 @@ void ThreadState::run_loop(bool top_level) {
+@@ -297,17 +422,59 @@ void ThreadState::run_loop(bool top_level) {
              if (exiting())
                  break;
              const bool do_step = std::exchange(step_requested, false);
@@ -2735,7 +2895,7 @@ index c01e4699..b20bd9ba 100644
 +                vita_core = core;
 +            }
 +            if (vita_core >= 0)
-+                vita_core_take(vita_core, this);
++                vita_core_take(vita_core, this, priority);
 +#endif
  
              // Single step or run
@@ -2772,7 +2932,7 @@ index c01e4699..b20bd9ba 100644
                  kernel.call_import(*cpu, nid, id);
 +#ifdef __PS4__
 +                if (vita_core >= 0)
-+                    vita_core_take(vita_core, this);
++                    vita_core_take(vita_core, this, priority);
 +#endif
 +#ifdef __PS4__
 +                ps4_perf_import(nid, __builtin_ia32_rdtsc() - run_end);
@@ -2780,7 +2940,7 @@ index c01e4699..b20bd9ba 100644
                  clear_exclusive(*cpu);
              }
  
-@@ -501,6 +659,11 @@ bool ThreadState::is_deleted() {
+@@ -501,6 +668,11 @@ bool ThreadState::is_deleted() {
      return status == ThreadStatus::deleted;
  }
  
@@ -2792,7 +2952,7 @@ index c01e4699..b20bd9ba 100644
  ThreadStatus ThreadState::get_status() const {
      const std::lock_guard<std::mutex> lock(mutex);
      return status;
-@@ -559,6 +722,11 @@ WaitResult ThreadState::wait(WaitTarget target, Deadline deadline, bool callback
+@@ -559,6 +731,11 @@ WaitResult ThreadState::wait(WaitTarget target, Deadline deadline, bool callback
      const auto woken = [&] { return exiting() || wake_pending || (runs_callbacks && callbacks_notified()); };
      wait_target = { callbacks ? target.type | WAITTYPE_CB_BIT : target.type, target.id };
      update_status(ThreadStatus::waiting);
@@ -6939,10 +7099,10 @@ index 4eb1f4f0..bd26315a 100644
      // 8) Choose the ux0 destination (a cart image is always a full app)
 diff --git a/vita3k/ps4/ps4.cmake b/vita3k/ps4/ps4.cmake
 new file mode 100644
-index 00000000..1bfcc919
+index 00000000..175646cc
 --- /dev/null
 +++ b/vita3k/ps4/ps4.cmake
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,49 @@
 +# PS4: Vita3K's frontend for the console, included from vita3k/CMakeLists.txt once the vita3k target
 +# exists. Built with the port's toolchain (toolchain/ps4-vita3k.cmake, and ps4-love-style.cmake as
 +# the project include: PS4_RUNTIME_SOURCES, ps4_link_mesa, ps4_add_eboot).
@@ -6960,6 +7120,7 @@ index 00000000..1bfcc919
 +	ps4/ps4_launcher.h
 +	ps4/ps4_controls.cpp
 +	ps4/ps4_controls.h
++	ps4/ps4_camera.cpp
 +	ps4/ps4_keyboard.cpp
 +	ps4/ps4_keyboard.h
 +	ps4/ps4_pad.cpp
@@ -6989,7 +7150,7 @@ index 00000000..1bfcc919
 +# RADV on GNM, the system libraries, and eboot.bin
 +ps4_link_mesa(vita3k)
 +target_link_libraries(vita3k PRIVATE
-+	SceSysmodule SceSystemService SceUserService SceVideoOut SceAudioOut ScePad SceNet SceCommonDialog SceImeDialog)
++	SceSysmodule SceSystemService SceUserService SceVideoOut SceAudioOut ScePad SceNet SceCommonDialog SceImeDialog SceCamera)
 +ps4_add_eboot(vita3k)
 diff --git a/vita3k/ps4/ps4_bgdl.cpp b/vita3k/ps4/ps4_bgdl.cpp
 new file mode 100644
@@ -7412,6 +7573,255 @@ index 00000000..0574701a
 +std::string notice();
 +
 +} // namespace ps4bgdl
+diff --git a/vita3k/ps4/ps4_camera.cpp b/vita3k/ps4/ps4_camera.cpp
+new file mode 100755
+index 00000000..53d0a539
+--- /dev/null
++++ b/vita3k/ps4/ps4_camera.cpp
+@@ -0,0 +1,243 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// PS4: the PlayStation Camera for a Vita game's cameras (camera/src/camera.cpp, the "web camera"
++// type). It gives 1280x800 YUV 4:2:2 pictures (Y0 U Y1 V, its left lens); a game asks for 640x480
++// or less, so the middle of the picture at the game's shape is scaled down to it as ARGB. The
++// structures are the PS4 SDK's (as shadPS4 has them): the OpenOrbis header declares the functions
++// without their arguments.
++
++#include <util/log.h>
++
++#include <orbis/Camera.h>
++#include <orbis/Sysmodule.h>
++#include <orbis/UserService.h>
++
++#include <algorithm>
++#include <cstdint>
++#include <cstring>
++#include <mutex>
++#include <vector>
++
++namespace {
++
++constexpr int DEVICES = 2;
++constexpr int LEVELS = 4;
++constexpr int WIDTH = 1280;
++constexpr int HEIGHT = 800;
++
++struct OpenParameter {
++    uint32_t size_this;
++    uint32_t reserved[3];
++};
++
++struct Format {
++    uint32_t level[4]; // base: 0 YUV 4:2:2; scaled levels: 0 YUV 4:2:2, 0x10 not used
++};
++
++struct ConfigExtension {
++    Format format;
++    uint32_t resolution;
++    uint32_t framerate;
++    uint32_t width;
++    uint32_t height;
++    uint32_t reserved;
++    void *base_option;
++};
++
++struct Config {
++    uint32_t size_this;
++    uint32_t type; // 1: YUV 4:2:2 at 1280x800, 60 fps
++    ConfigExtension extension[DEVICES];
++};
++
++struct StartParameter {
++    uint32_t size_this;
++    uint32_t format_level[DEVICES]; // bit n: level n
++    void *start_option;
++};
++
++struct FramePosition {
++    uint32_t x, y, width, height;
++};
++
++struct ExposureGain {
++    uint32_t control, exposure, gain, mode;
++};
++
++struct WhiteBalance {
++    uint32_t control, red, blue, green;
++};
++
++struct Gamma {
++    uint32_t control, value;
++    uint8_t reserved[16];
++};
++
++struct Meta {
++    uint32_t mode;
++    uint32_t format[DEVICES][LEVELS];
++    uint64_t frame[DEVICES];
++    uint64_t timestamp[DEVICES];
++    uint32_t device_timestamp[DEVICES];
++    ExposureGain exposure_gain[DEVICES];
++    WhiteBalance white_balance[DEVICES];
++    Gamma gamma[DEVICES];
++    uint32_t luminance[DEVICES];
++    float acceleration[3];
++    uint64_t vcounter;
++    uint32_t reserved[14];
++};
++
++struct FrameData {
++    uint32_t size_this;
++    uint32_t read_mode;
++    FramePosition position[DEVICES][LEVELS];
++    void *frame[DEVICES][LEVELS];
++    uint32_t frame_size[DEVICES][LEVELS];
++    uint32_t status[DEVICES];
++    Meta meta;
++    void *frame_garlic[DEVICES][LEVELS];
++};
++static_assert(sizeof(FrameData) == 584);
++
++using IsAttachedFn = int32_t (*)(int32_t index);
++using OpenFn = int32_t (*)(int32_t user, int32_t type, int32_t index, OpenParameter *param);
++using CloseFn = int32_t (*)(int32_t handle);
++using SetConfigFn = int32_t (*)(int32_t handle, Config *config);
++using StartFn = int32_t (*)(int32_t handle, StartParameter *param);
++using StopFn = int32_t (*)(int32_t handle);
++using GetFrameDataFn = int32_t (*)(int32_t handle, FrameData *data);
++
++std::mutex g_lock;
++int g_users = 0; // the Vita cameras that have it open
++int32_t g_handle = -1;
++bool g_loaded = false;
++std::vector<uint8_t> g_frame; // the last picture, YUV 4:2:2
++uint64_t g_frame_number = 0;
++
++uint8_t clamp8(int v) {
++    return static_cast<uint8_t>(std::clamp(v, 0, 255));
++}
++
++void close_camera() {
++    if (g_handle < 0)
++        return;
++    reinterpret_cast<StopFn>(&sceCameraStop)(g_handle);
++    reinterpret_cast<CloseFn>(&sceCameraClose)(g_handle);
++    g_handle = -1;
++    g_frame.clear();
++}
++
++} // namespace
++
++// Opens the PlayStation Camera for a Vita camera: false if there is none (the caller shows a
++// picture instead)
++extern "C" bool ps4_camera_open() {
++    const std::lock_guard<std::mutex> guard(g_lock);
++    if (g_handle >= 0) {
++        g_users++;
++        return true;
++    }
++    if (!g_loaded) {
++        const int32_t r = sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_CAMERA);
++        if (r != 0)
++            LOG_WARN("PS4 camera: its module didn't load ({:08X})", static_cast<uint32_t>(r));
++        g_loaded = true;
++    }
++    const int32_t attached = reinterpret_cast<IsAttachedFn>(&sceCameraIsAttached)(0);
++    if (attached != 1) {
++        LOG_INFO("PS4 camera: no PlayStation Camera ({:08X})", static_cast<uint32_t>(attached));
++        return false;
++    }
++    int32_t user = -1;
++    sceUserServiceGetInitialUser(&user);
++    OpenParameter open{ sizeof(OpenParameter), {} };
++    const int32_t handle = reinterpret_cast<OpenFn>(&sceCameraOpen)(user, 0, 0, &open);
++    if (handle < 0) {
++        LOG_WARN("PS4 camera: sceCameraOpen failed: {:08X}", static_cast<uint32_t>(handle));
++        return false;
++    }
++    Config config{};
++    config.size_this = sizeof(Config);
++    config.type = 1;
++    int32_t r = reinterpret_cast<SetConfigFn>(&sceCameraSetConfig)(handle, &config);
++    if (r != 0)
++        LOG_WARN("PS4 camera: sceCameraSetConfig failed: {:08X}", static_cast<uint32_t>(r));
++    StartParameter start{ sizeof(StartParameter), { 1, 1 }, nullptr };
++    r = reinterpret_cast<StartFn>(&sceCameraStart)(handle, &start);
++    if (r != 0) {
++        LOG_WARN("PS4 camera: sceCameraStart failed: {:08X}", static_cast<uint32_t>(r));
++        reinterpret_cast<CloseFn>(&sceCameraClose)(handle);
++        return false;
++    }
++    g_handle = handle;
++    g_users = 1;
++    LOG_INFO("PS4 camera: the PlayStation Camera is open (handle {})", handle);
++    return true;
++}
++
++extern "C" void ps4_camera_close() {
++    const std::lock_guard<std::mutex> guard(g_lock);
++    if (g_users > 0 && --g_users == 0)
++        close_camera();
++}
++
++// The camera's newest picture at width x height, as ARGB8888 (pitch width * 4): false while it
++// has given none
++extern "C" bool ps4_camera_read(uint32_t *argb, int width, int height) {
++    const std::lock_guard<std::mutex> guard(g_lock);
++    if (g_handle < 0 || width <= 0 || height <= 0)
++        return false;
++    FrameData data{};
++    data.size_this = sizeof(FrameData);
++    const int32_t r = reinterpret_cast<GetFrameDataFn>(&sceCameraGetFrameData)(g_handle, &data);
++    if (r == 0 && data.frame[0][0] && data.meta.frame[0] != g_frame_number) {
++        g_frame_number = data.meta.frame[0];
++        g_frame.resize(WIDTH * HEIGHT * 2);
++        std::memcpy(g_frame.data(), data.frame[0][0], g_frame.size());
++    }
++    if (g_frame.empty())
++        return false;
++
++    // the middle of the picture at the game's shape
++    int crop_w = WIDTH, crop_h = HEIGHT;
++    if (WIDTH * height > HEIGHT * width)
++        crop_w = HEIGHT * width / height;
++    else
++        crop_h = WIDTH * height / width;
++    const int x0 = (WIDTH - crop_w) / 2;
++    const int y0 = (HEIGHT - crop_h) / 2;
++    for (int y = 0; y < height; y++) {
++        const uint8_t *row = g_frame.data() + static_cast<size_t>(y0 + y * crop_h / height) * WIDTH * 2;
++        uint32_t *out = argb + static_cast<size_t>(y) * width;
++        for (int x = 0; x < width; x++) {
++            const int sx = x0 + x * crop_w / width;
++            const uint8_t *pair = row + (sx & ~1) * 2; // Y0 U Y1 V
++            const int luma = pair[(sx & 1) * 2] - 16;
++            const int u = pair[1] - 128;
++            const int v = pair[3] - 128;
++            // BT.601, limited range
++            const int c = 298 * luma;
++            const uint8_t red = clamp8((c + 409 * v + 128) >> 8);
++            const uint8_t green = clamp8((c - 100 * u - 208 * v + 128) >> 8);
++            const uint8_t blue = clamp8((c + 516 * u + 128) >> 8);
++            out[x] = 0xFF000000u | (red << 16) | (green << 8) | blue;
++        }
++    }
++    return true;
++}
 diff --git a/vita3k/ps4/ps4_canvas.cpp b/vita3k/ps4/ps4_canvas.cpp
 new file mode 100644
 index 00000000..8bee2f7f
@@ -14716,10 +15126,10 @@ index 00000000..28d0434d
 +}
 diff --git a/vita3k/ps4/ps4_pad.cpp b/vita3k/ps4/ps4_pad.cpp
 new file mode 100644
-index 00000000..3ae0c61b
+index 00000000..bb2db322
 --- /dev/null
 +++ b/vita3k/ps4/ps4_pad.cpp
-@@ -0,0 +1,382 @@
+@@ -0,0 +1,389 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -14756,6 +15166,7 @@ index 00000000..3ae0c61b
 +#include <ctrl/state.h>
 +#include <emuenv/state.h>
 +#include <motion/event_handler.h>
++#include <motion/state.h>
 +#include <touch/functions.h>
 +#include <touch/state.h>
 +#include <touch/touch.h>
@@ -14833,7 +15244,10 @@ index 00000000..3ae0c61b
 +    }
 +    user = initial;
 +    handle = h;
-+    LOG_INFO("PS4 pad: user {:08X} on handle {}", static_cast<uint32_t>(user), handle);
++    // the motion sensors: off until asked for (their readings stay 0)
++    // (declared without its arguments by the SDK)
++    const int motion = reinterpret_cast<int32_t (*)(int32_t, bool)>(&scePadSetMotionSensorState)(handle, true);
++    LOG_INFO("PS4 pad: user {:08X} on handle {}, motion sensors {:08X}", static_cast<uint32_t>(user), handle, static_cast<uint32_t>(motion));
 +}
 +
 +// The touch pad as a pointer on the front screen (Controls > Touch pad > Pointer, the default): the
@@ -14985,6 +15399,9 @@ index 00000000..3ae0c61b
 +}
 +
 +void update_motion(EmuEnvState &emuenv, const Snapshot &pad) {
++    // the pad's sensors stand for the Vita's (a game's SceMotion reads them)
++    emuenv.ctrl.has_motion_support = true;
++    const std::lock_guard<std::mutex> guard(emuenv.motion.mutex);
 +    SDL_GamepadSensorEvent ev{};
 +    ev.type = SDL_EVENT_GAMEPAD_SENSOR_UPDATE;
 +    ev.sensor_timestamp = pad.timestamp * 1000; // us -> ns
@@ -15171,10 +15588,10 @@ index 00000000..eac30bd6
 +} // namespace ps4pad
 diff --git a/vita3k/ps4/ps4_perf.cpp b/vita3k/ps4/ps4_perf.cpp
 new file mode 100644
-index 00000000..2843dcb8
+index 00000000..52f84630
 --- /dev/null
 +++ b/vita3k/ps4/ps4_perf.cpp
-@@ -0,0 +1,446 @@
+@@ -0,0 +1,467 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -15236,6 +15653,9 @@ index 00000000..2843dcb8
 +    std::atomic<bool> ready{ false };
 +    std::atomic<uint64_t> code_ticks{ 0 };
 +    std::atomic<uint64_t> code_runs{ 0 };
++    // the time it waited for its Vita core (kernel/src/thread.cpp), and which one
++    std::atomic<uint64_t> core_wait_ticks{ 0 };
++    std::atomic<int> core{ -1 };
 +    // the imports the JIT ran itself in the current run of guest code (the owner's only)
 +    uint64_t fast_ticks = 0;
 +    ImportSlot slots[kSlots];
@@ -15296,6 +15716,14 @@ index 00000000..2843dcb8
 +    thread->fast_ticks = 0;
 +    add(thread->code_ticks, ticks);
 +    add(thread->code_runs, 1);
++}
++
++extern "C" void ps4_perf_core_wait(int core, uint64_t ticks) {
++    GuestThread *const thread = t_thread;
++    if (!thread)
++        return;
++    thread->core.store(core, std::memory_order_relaxed);
++    add(thread->core_wait_ticks, ticks);
 +}
 +
 +extern "C" void ps4_perf_code_begin(void *cpu, void (*halt)(void *)) {
@@ -15420,6 +15848,7 @@ index 00000000..2843dcb8
 +struct Snapshot {
 +    uint64_t code_ticks = 0;
 +    uint64_t code_runs = 0;
++    uint64_t core_wait_ticks = 0;
 +    uint64_t ticks[kSlots] = {};
 +    uint64_t calls[kSlots] = {};
 +};
@@ -15467,6 +15896,9 @@ index 00000000..2843dcb8
 +        const uint64_t code_runs = thread.code_runs.load(std::memory_order_relaxed);
 +        const double code_ms = (code_ticks - previous.code_ticks) / ticks_per_ms / seconds;
 +        previous.code_ticks = code_ticks;
++        const uint64_t core_wait_ticks = thread.core_wait_ticks.load(std::memory_order_relaxed);
++        const double core_wait_ms = (core_wait_ticks - previous.core_wait_ticks) / ticks_per_ms / seconds;
++        previous.core_wait_ticks = core_wait_ticks;
 +        previous.code_runs = code_runs;
 +
 +        // a thread in guest code for 2 s or more without a call: a spin. Stopped once, it logs where
@@ -15506,6 +15938,12 @@ index 00000000..2843dcb8
 +        for (size_t e = 0; e < std::min<size_t>(entries.size(), 8); e++) {
 +            char part[128];
 +            snprintf(part, sizeof(part), "%s%s %.0f (%.0f/s)", e ? ", " : "", import_name(entries[e].nid), entries[e].ms, entries[e].calls);
++            line += part;
++        }
++        // (Vita core threads one at a time: the time it waited for its core while another ran)
++        if (core_wait_ms >= 1.0) {
++            char part[96];
++            snprintf(part, sizeof(part), "; waits for Vita core %d %.0f ms/s", thread.core.load(std::memory_order_relaxed), core_wait_ms);
 +            line += part;
 +        }
 +        LOG_INFO("perf: {}: guest code {:.0f} ms/s, imports {:.0f} ms/s ({:.0f} calls/s): {}", thread.name, code_ms, imports_ms, import_calls, line);
@@ -15695,10 +16133,10 @@ index 00000000..69e26898
 +} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_settings.cpp b/vita3k/ps4/ps4_settings.cpp
 new file mode 100644
-index 00000000..4ee093c8
+index 00000000..062f7626
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.cpp
-@@ -0,0 +1,1056 @@
+@@ -0,0 +1,1064 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -16059,27 +16497,35 @@ index 00000000..4ee093c8
 +    return items;
 +}
 +
-+// The Vita's cameras: the PS4 has none for them, so they see a solid colour. Dark, or bright for
-+// the puzzles that want light on a camera (Uncharted: Golden Abyss, chapter 13). Changes at once.
++// The Vita's cameras: the PlayStation Camera (ps4_camera.cpp; without one, the picture or grey), a
++// picture of the user's own (/data/HENkaku/camera.png or camera.jpg; grey without one), or a solid
++// colour: dark, or bright for the puzzles that want light on a camera (Uncharted: Golden Abyss,
++// chapter 13). Changes at once.
 +Item camera_choice(EmuEnvState &emuenv) {
 +    constexpr uint32_t DARK = 0xFF000000, BRIGHT = 0xFFFFFFFF;
 +    Item item;
 +    item.type = Item::kind::choice;
 +    item.name = "Camera";
-+    item.values = { "Dark", "Bright" };
++    item.values = { "PS4 camera", "Picture", "Dark", "Bright" };
 +    item.get = [&emuenv] {
 +        const std::lock_guard<std::mutex> lock(settings_mutex);
-+        return emuenv.cfg.back_camera_type == CameraType::SolidColor && emuenv.cfg.back_camera_color == BRIGHT ? 1 : 0;
++        switch (emuenv.cfg.back_camera_type) {
++        case CameraType::WebCamera: return 0;
++        case CameraType::Image: return 1;
++        default: return emuenv.cfg.back_camera_color == BRIGHT ? 3 : 2;
++        }
 +    };
 +    item.set = [&emuenv](int index) {
 +        const std::lock_guard<std::mutex> lock(settings_mutex);
-+        const uint32_t color = index == 1 ? BRIGHT : DARK;
-+        emuenv.cfg.front_camera_type = emuenv.cfg.back_camera_type = CameraType::SolidColor;
-+        emuenv.cfg.front_camera_color = emuenv.cfg.back_camera_color = color;
++        const int type = index == 0 ? CameraType::WebCamera : index == 1 ? CameraType::Image : CameraType::SolidColor;
++        const uint32_t color = index == 3 ? BRIGHT : DARK;
++        emuenv.cfg.front_camera_type = emuenv.cfg.back_camera_type = type;
++        emuenv.cfg.front_camera_color = emuenv.cfg.back_camera_color = index >= 2 ? color : 0;
++        emuenv.cfg.front_camera_image = emuenv.cfg.back_camera_image = {};
 +        config::serialize_config(emuenv.cfg, emuenv.cfg.config_path);
 +        // a camera the game has open shows it from its next frame
-+        emuenv.camera.front()->update_config(CameraType::SolidColor, {}, {}, color);
-+        emuenv.camera.back()->update_config(CameraType::SolidColor, {}, {}, color);
++        emuenv.camera.front()->update_config(type, {}, {}, emuenv.cfg.front_camera_color);
++        emuenv.camera.back()->update_config(type, {}, {}, emuenv.cfg.back_camera_color);
 +    };
 +    return item;
 +}

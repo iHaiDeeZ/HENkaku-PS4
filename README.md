@@ -188,6 +188,17 @@ the game's title and text. Type with the DualShock 4 (Cross picks a key) or a US
 choose Done: the text goes to the game. Closing the keyboard cancels, or keeps the text the game started with if
 the game gives no way to cancel.
 
+The DualShock 4's **motion sensors** are the Vita's: tilting and turning the controller tilts and turns the Vita
+for games that use motion (aiming, balancing, steering).
+
+The Vita's **cameras** (Controls > Camera, for all games or one, also in the HENkaku menu):
+
+- **PS4 camera** (the default): a PlayStation Camera on the PS4 shows what it sees. Without one, the game sees
+  your picture (below), or grey.
+- **Picture**: a picture of your own: put it in `/data/HENkaku/camera.png` or `/data/HENkaku/camera.jpg`.
+- **Dark** or **Bright**: a solid colour. Bright passes puzzles that want light on the camera (Uncharted: Golden
+  Abyss, chapter 13).
+
 ## The HENkaku menu
 
 Press **L3 + R3** while playing. The game pauses under the menu; **Resume** goes back to it and **Exit** to the
@@ -229,6 +240,9 @@ good guide: a game that doesn't work in Vita3K won't work here either.
   instruction each, without a lock shared by all of its threads. They differ from the Vita only in a case games
   rarely depend on. It's on by default and applies when a game starts; turn it off if a game hangs or crashes
   where it didn't before.
+- **Vita core threads** (HENkaku > CPU): **One at a time** (the default) runs the threads a game puts on one Vita
+  core one at a time, as the Vita does, and a thread of a higher priority takes the core at once; some games
+  deadlock otherwise. **Side by side** lets them all run at the same time; try it if a game hitches.
 - **Ordered blending** (HENkaku > Graphics): draws that blend with what's already on screen are drawn one triangle
   at a time. That's exact where triangles overlap, but much slower on the PS4's GPU. It's off by default; turn it on
   if you see flickering specks in smoke or water effects.
