@@ -738,7 +738,7 @@ index 0b51c46b..da28d9e1 100644
      delete state;
  }
 diff --git a/vita3k/cpu/src/dynarmic_cpu.cpp b/vita3k/cpu/src/dynarmic_cpu.cpp
-index 54e89f88..6ffb8a53 100644
+index 54e89f88..146b9c4d 100644
 --- a/vita3k/cpu/src/dynarmic_cpu.cpp
 +++ b/vita3k/cpu/src/dynarmic_cpu.cpp
 @@ -338,6 +338,15 @@ public:
@@ -757,7 +757,27 @@ index 54e89f88..6ffb8a53 100644
          parent->svc_called = true;
          parent->svc = svc;
          cpu->jit->HaltExecution(Dynarmic::HaltReason::UserDefined8);
-@@ -367,6 +376,26 @@ std::unique_ptr<Dynarmic::A32::Jit> DynarmicCPU::make_jit() {
+@@ -352,6 +361,19 @@ public:
+ 
+ Dynarmic::ExclusiveMonitor DynarmicCPU::shared_monitor(MAX_CORE_COUNT);
+ 
++#ifdef __PS4__
++extern "C" bool ps4_fast_atomics(); // vita3k/ps4/ps4_settings.cpp
++
++// dynarmic's fault handler for translated code (a protected page written), for the perf line
++static std::atomic<uint64_t> g_fastmem_faults{ 0 };
++extern "C" void ps4_fastmem_fault() {
++    g_fastmem_faults.fetch_add(1, std::memory_order_relaxed);
++}
++extern "C" uint64_t ps4_fastmem_faults() {
++    return g_fastmem_faults.load(std::memory_order_relaxed);
++}
++#endif
++
+ std::unique_ptr<Dynarmic::A32::Jit> DynarmicCPU::make_jit() {
+     Dynarmic::A32::UserConfig config{};
+     config.arch_version = Dynarmic::A32::ArchVersion::v7;
+@@ -367,6 +389,40 @@ std::unique_ptr<Dynarmic::A32::Jit> DynarmicCPU::make_jit() {
      config.coprocessors[15] = cp15;
      config.processor_id = core_id;
      config.optimizations = cpu_opt ? Dynarmic::all_safe_optimizations : Dynarmic::no_optimizations;
@@ -778,8 +798,22 @@ index 54e89f88..6ffb8a53 100644
 +    // guest memory, instead of a call into the monitor under its spin lock each: yuzu's default
 +    if (config.fastmem_pointer) {
 +        config.fastmem_exclusive_access = true;
-+        config.recompile_on_exclusive_fastmem_failure = true;
++        // A page the renderer protects (a texture, a render target) written by translated code was
++        // taken for memory fastmem can't reach: the instruction then went through a call for every
++        // access, for the rest of the session (the game's memcpy, its allocator...). The access
++        // that faulted goes through the call once, and the code stays as it was.
++        config.recompile_on_fastmem_failure = false;
++        config.recompile_on_exclusive_fastmem_failure = false;
 +    }
++    // Without the global monitor (yuzu's default too): an STREX is a lock cmpxchg against the value
++    // its LDREX read, and neither takes the monitor's lock. With it, every STREX also cleared the
++    // reservations of the other 149 threads (a monitor slot for each) under that lock, some 450
++    // instructions, and every LDREX took the lock: a game's locks, counters and queues (Uncharted's
++    // thread library) waited for each other across all threads. It differs only where another
++    // thread writes a value and writes it back between an LDREX and its STREX: HENkaku > CPU > Fast
++    // atomics, Off for the exact monitor.
++    if (cpu_opt && ps4_fast_atomics())
++        config.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
 +#endif
      config.enable_cycle_counting = false;
  
@@ -2163,6 +2197,22 @@ index f70b3397..1328a821 100644
  };
  
  // Base of a kernel object type with a single class, which uid_class names.
+diff --git a/vita3k/kernel/include/kernel/state.h b/vita3k/kernel/include/kernel/state.h
+index 922e545d..fc4efc24 100644
+--- a/vita3k/kernel/include/kernel/state.h
++++ b/vita3k/kernel/include/kernel/state.h
+@@ -146,6 +146,11 @@ struct KernelState {
+     // Shared NOP+WFI sentinel used by the Dynarmic as the halt return address
+     Block halt_instruction;
+     Address halt_instruction_pc;
++#ifdef __PS4__
++    // sceKernelGetTLSAddr in ARM, the stubs of games' imports branch to it (kernel/src/load_self.cpp)
++    Block native_tls_routine;
++    Address native_tls_addr = 0;
++#endif
+ 
+     ObjectStore obj_store;
+ 
 diff --git a/vita3k/kernel/include/kernel/sync_primitives.h b/vita3k/kernel/include/kernel/sync_primitives.h
 index 80c44ba4..538c122b 100644
 --- a/vita3k/kernel/include/kernel/sync_primitives.h
@@ -2233,7 +2283,7 @@ index 051d616a..b205a814 100644
      SceSize size;
      SceUInt32 flags;
 diff --git a/vita3k/kernel/src/kernel.cpp b/vita3k/kernel/src/kernel.cpp
-index 97794b3d..492222e3 100644
+index 97794b3d..8d9cafc4 100644
 --- a/vita3k/kernel/src/kernel.cpp
 +++ b/vita3k/kernel/src/kernel.cpp
 @@ -23,6 +23,7 @@
@@ -2295,7 +2345,31 @@ index 97794b3d..492222e3 100644
      const uint32_t r0 = read_reg(*thread->cpu, 0);
      const SceUID id = thread->id;
      const int processor_id = get_processor_id(*thread->cpu);
-@@ -149,6 +173,8 @@ uint64_t KernelState::process_time_at(uint64_t clock_time) const {
+@@ -107,6 +131,23 @@ bool KernelState::init(MemState &mem, const CallImportFunc &call_import, bool cp
+     halt_ptr[1] = 0xBF30; // WFI
+     halt_instruction_pc = halt_instruction.get() | 1; // thumb mode pc
+ 
++#ifdef __PS4__
++    // sceKernelGetTLSAddr(key) as get_thread_tls_addr: the kernel part of the TLS starts 0x800 bytes
++    // below TPIDRURO, and a key past 0x100 (or below 0) gives 0
++    native_tls_routine = alloc_block(mem, 7 * sizeof(uint32_t), "native_tls_addr");
++    if (native_tls_routine.get()) {
++        uint32_t *const code = native_tls_routine.get_ptr<uint32_t>().get(mem);
++        code[0] = 0xE3500C01; // cmp r0, #0x100
++        code[1] = 0x83A00000; // movhi r0, #0
++        code[2] = 0x812FFF1E; // bxhi lr
++        code[3] = 0xEE1D1F70; // mrc p15, 0, r1, c13, c0, 3 (TPIDRURO)
++        code[4] = 0xE2411B02; // sub r1, r1, #0x800
++        code[5] = 0xE0810100; // add r0, r1, r0, lsl #2
++        code[6] = 0xE12FFF1E; // bx lr
++        native_tls_addr = native_tls_routine.get();
++    }
++#endif
++
+     return true;
+ }
+ 
+@@ -149,6 +190,8 @@ uint64_t KernelState::process_time_at(uint64_t clock_time) const {
  }
  
  ThreadStatePtr KernelState::get_thread(SceUID thread_id) {
@@ -2304,7 +2378,7 @@ index 97794b3d..492222e3 100644
      const ThreadStatePtr thread = lock_and_find(thread_id, threads, mutex);
      // A deleted thread stays in threads until its host thread ends, but guest calls can't find it
      if (thread && thread->is_deleted())
-@@ -229,7 +255,16 @@ void KernelState::process_exit() {
+@@ -229,7 +272,16 @@ void KernelState::process_exit() {
      }
  
      std::unique_lock<std::mutex> lock(mutex);
@@ -2321,7 +2395,18 @@ index 97794b3d..492222e3 100644
  }
  
  void KernelState::pause_threads() {
-@@ -326,3 +361,58 @@ SceKernelModuleInfo *KernelState::find_module_by_addr(Address address) {
+@@ -300,6 +352,10 @@ void KernelState::deinit(MemState &mem) {
+ 
+     halt_instruction = nullptr;
+     halt_instruction_pc = 0;
++#ifdef __PS4__
++    native_tls_routine = nullptr;
++    native_tls_addr = 0;
++#endif
+ 
+     process_param = nullptr;
+     client_vtable = Ptr<void>(0);
+@@ -326,3 +382,58 @@ SceKernelModuleInfo *KernelState::find_module_by_addr(Address address) {
      }
      return nullptr;
  }
@@ -2380,6 +2465,60 @@ index 97794b3d..492222e3 100644
 +    }
 +}
 +#endif
+diff --git a/vita3k/kernel/src/load_self.cpp b/vita3k/kernel/src/load_self.cpp
+index fd1bbd6b..f977b73b 100644
+--- a/vita3k/kernel/src/load_self.cpp
++++ b/vita3k/kernel/src/load_self.cpp
+@@ -124,6 +124,39 @@ static bool unload_var_imports(const uint32_t *nids, const Ptr<uint32_t> *entrie
+     return true;
+ }
+ 
++#ifdef __PS4__
++extern "C" bool ps4_fast_calls(); // vita3k/ps4/ps4_settings.cpp
++
++// Three imports a game's thread library makes some 200,000 times a second (SceUlt: Uncharted), which
++// never leave user mode on a Vita, answered by ARM code in their stubs instead of a call into the
++// kernel (about 0.4 us each even on the JIT's fast way): the thread's ID and VFP exception state in
++// the kernel part of its TLS, 0x800 bytes below TPIDRURO (ThreadState's setup in thread.cpp), and a
++// TLS slot's address. HENkaku > CPU > Fast system calls, at a game's start.
++static void write_native_import(const KernelState &kernel, uint32_t *stub, uint32_t nid) {
++    if (!ps4_fast_calls() || kernel.debugger.watch_import_calls)
++        return;
++    switch (nid) {
++    case 0x0FB972F9: // sceKernelGetThreadId
++        stub[0] = 0xEE1D0F70; // mrc p15, 0, r0, c13, c0, 3 (TPIDRURO)
++        stub[1] = 0xE51007FC; // ldr r0, [r0, #-0x7FC] (TLS_THREAD_ID)
++        stub[2] = 0xE12FFF1E; // bx lr
++        break;
++    case 0xA37A6057: // sceKernelGetCurrentThreadVfpException
++        stub[0] = 0xEE1D0F70; // mrc p15, 0, r0, c13, c0, 3
++        stub[1] = 0xE51007F0; // ldr r0, [r0, #-0x7F0] (TLS_VFP_EXCEPTION)
++        stub[2] = 0xE12FFF1E; // bx lr
++        break;
++    case 0xB295EB61: // sceKernelGetTLSAddr: to its routine (KernelState::init)
++        if (!kernel.native_tls_addr)
++            return;
++        stub[0] = encode_arm_inst(INSTRUCTION_MOVW, static_cast<uint16_t>(kernel.native_tls_addr), 12);
++        stub[1] = encode_arm_inst(INSTRUCTION_MOVT, static_cast<uint16_t>(kernel.native_tls_addr >> 16), 12);
++        stub[2] = encode_arm_inst(INSTRUCTION_BRANCH, 0, 12);
++        break;
++    }
++}
++#endif
++
+ static bool load_func_imports(const uint32_t *nids, const Ptr<uint32_t> *entries, size_t count, uint32_t library_nid, const SegmentInfosForReloc &segments, KernelState &kernel, const MemState &mem) {
+     const std::lock_guard<std::mutex> guard(kernel.export_nids_mutex);
+     for (size_t i = 0; i < count; ++i) {
+@@ -149,6 +182,9 @@ static bool load_func_imports(const uint32_t *nids, const Ptr<uint32_t> *entries
+             stub[0] = 0xef000000; // svc #0 - Call our interrupt hook.
+             stub[1] = 0xe1a0f00e; // mov pc, lr - Return to the caller.
+             stub[2] = nid; // Our interrupt hook will read this.
++#ifdef __PS4__
++            write_native_import(kernel, stub, nid);
++#endif
+         } else {
+             stub[0] = encode_arm_inst(INSTRUCTION_MOVW, (uint16_t)func_address, 12);
+             stub[1] = encode_arm_inst(INSTRUCTION_MOVT, (uint16_t)(func_address >> 16), 12);
 diff --git a/vita3k/kernel/src/sync_primitives.cpp b/vita3k/kernel/src/sync_primitives.cpp
 index 78029915..baf00c6a 100644
 --- a/vita3k/kernel/src/sync_primitives.cpp
@@ -2665,6 +2804,56 @@ index 2e2bd287..659ab47a 100644
  	add_executable(
  		mem-tests
  		tests/allocator_tests.cpp
+diff --git a/vita3k/mem/include/mem/functions.h b/vita3k/mem/include/mem/functions.h
+index fdc3cd3b..7d2ca507 100644
+--- a/vita3k/mem/include/mem/functions.h
++++ b/vita3k/mem/include/mem/functions.h
+@@ -53,7 +53,7 @@ Address alloc(MemState &state, uint32_t size, const char *name, Address start_ad
+ Address alloc_aligned(MemState &state, uint32_t size, const char *name, unsigned int alignment, Address start_addr = user_main_memory_start);
+ void protect_inner(MemState &state, Address addr, uint32_t size, const MemPerm perm);
+ void unprotect_inner(MemState &state, Address addr, uint32_t size);
+-bool add_protect(MemState &state, Address addr, const uint32_t size, const MemPerm perm, const ProtectCallback &callback);
++bool add_protect(MemState &state, Address addr, const uint32_t size, const MemPerm perm, const ProtectCallback &callback, const void *owner = nullptr);
+ void open_access_parent_protect_segment(MemState &state, Address addr);
+ void close_access_parent_protect_segment(MemState &state, Address addr);
+ void add_external_mapping(MemState &mem, Address addr, uint32_t size, uint8_t *addr_ptr);
+diff --git a/vita3k/mem/include/mem/state.h b/vita3k/mem/include/mem/state.h
+index 85ce17be..67e26da1 100644
+--- a/vita3k/mem/include/mem/state.h
++++ b/vita3k/mem/include/mem/state.h
+@@ -22,6 +22,7 @@
+ #include <mem/util.h>
+ 
+ #include <map>
++#include <unordered_map>
+ #include <memory>
+ #include <mutex>
+ 
+@@ -41,6 +42,8 @@ typedef std::map<int, std::string> PageNameMap;
+ struct ProtectBlockInfo {
+     uint32_t size = 0;
+     ProtectCallback callback;
++    // what the block is for (a texture, a render target): an owner keeps one block, its last
++    const void *owner = nullptr;
+ };
+ 
+ struct ProtectSegmentInfo {
+@@ -71,6 +74,15 @@ struct MemState {
+     AllocPageTable alloc_table;
+     BitmapAllocator allocator;
+     ProtectSegmentTrees protect_tree;
++    // where the block of each owner that has one is (its address in its range)
++    std::unordered_map<const void *, Address> protect_owners;
++    // for the perf line (HENkaku > Diagnostics > Renderer profiler): protections asked and those
++    // that joined a range already protected, faults handled and their time (TSC), blocks kept
++    uint64_t protect_adds = 0;
++    uint64_t protect_joins = 0;
++    uint64_t protect_faults = 0;
++    uint64_t protect_fault_ticks = 0;
++    uint64_t protect_blocks = 0;
+ 
+     PageNameMap page_name_map;
+ 
 diff --git a/vita3k/mem/src/allocator.cpp b/vita3k/mem/src/allocator.cpp
 index b6b9d5b9..04562b1f 100644
 --- a/vita3k/mem/src/allocator.cpp
@@ -2692,7 +2881,7 @@ index b6b9d5b9..04562b1f 100644
              while (cursor >= 0) {
                  if (((wv >> cursor) & 1) == 1) {
 diff --git a/vita3k/mem/src/mem.cpp b/vita3k/mem/src/mem.cpp
-index 28bc81bf..e125fbc6 100644
+index 28bc81bf..27ab98cf 100644
 --- a/vita3k/mem/src/mem.cpp
 +++ b/vita3k/mem/src/mem.cpp
 @@ -26,6 +26,7 @@
@@ -2957,7 +3146,161 @@ index 28bc81bf..e125fbc6 100644
  #else
      const int ret = mprotect(commit_ptr, commit_size, PROT_READ | PROT_WRITE);
      LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
-@@ -520,6 +744,8 @@ void free(MemState &state, Address address) {
+@@ -268,10 +492,49 @@ void protect_inner(MemState &state, Address addr, uint32_t size, const MemPerm p
+ #endif
+ }
+ 
++// The blocks of a range that goes leave the owners' index and the count with it
++static void forget_blocks(MemState &state, const ProtectSegmentInfo &info) {
++    for (const auto &[block_addr, block] : info.blocks) {
++        if (!block.owner)
++            continue;
++        const auto owner = state.protect_owners.find(block.owner);
++        if (owner != state.protect_owners.end() && owner->second == block_addr)
++            state.protect_owners.erase(owner);
++    }
++    state.protect_blocks -= std::min<uint64_t>(state.protect_blocks, info.blocks.size());
++}
++
++// Takes away the block an owner has: an owner (a texture, a render target) keeps one, for what it
++// is now. Its range stays protected: the owner's new block usually joins it right away, else the
++// first write there unprotects it.
++static void drop_owner_block(MemState &state, const void *owner) {
++    const auto entry = state.protect_owners.find(owner);
++    if (entry == state.protect_owners.end())
++        return;
++    const Address block_addr = entry->second;
++    state.protect_owners.erase(entry);
++    // the range holding it: the last one starting at or before it
++    const auto segment = state.protect_tree.lower_bound(block_addr);
++    if (segment == state.protect_tree.end() || block_addr >= segment->first + segment->second.size)
++        return;
++    auto [block, end] = segment->second.blocks.equal_range(block_addr);
++    for (; block != end; ++block) {
++        if (block->second.owner == owner) {
++            segment->second.blocks.erase(block);
++            if (state.protect_blocks)
++                state.protect_blocks--;
++            return;
++        }
++    }
++}
++
+ bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcept {
+     const uintptr_t memory_addr = reinterpret_cast<uintptr_t>(state.memory.get());
+     const uintptr_t fault_addr = reinterpret_cast<uintptr_t>(addr);
+ 
++#ifdef __PS4__
++    const uint64_t fault_start = __builtin_ia32_rdtsc();
++#endif
+     Address vaddr = 0;
+     const std::unique_lock<std::mutex> lock(state.protect_mutex);
+     if (fault_addr < memory_addr || fault_addr >= memory_addr + TOTAL_MEM_SIZE) {
+@@ -315,28 +578,57 @@ bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcep
+     }
+ 
+     Address previous_beg = it->first;
++    forget_blocks(state, info);
+     for (auto &[block_addr, block] : info.blocks) {
+         block.callback(vaddr, write);
+     }
+ 
+     unprotect_inner(state, it->first, info.size);
+     state.protect_tree.erase(it);
++#ifdef __PS4__
++    state.protect_faults++;
++    state.protect_fault_ticks += __builtin_ia32_rdtsc() - fault_start;
++#endif
+ 
+     return true;
+ }
+ 
+-bool add_protect(MemState &state, Address addr, const uint32_t size, const MemPerm perm, const ProtectCallback &callback) {
++bool add_protect(MemState &state, Address addr, const uint32_t size, const MemPerm perm, const ProtectCallback &callback, const void *owner) {
+     const std::lock_guard<std::mutex> lock(state.protect_mutex);
+     ProtectSegmentInfo protect(size, perm);
+     align_to_page(state, addr, protect.size);
++    state.protect_adds++;
++
++    // An owner keeps one block: the one it had goes. Each render target Uncharted makes again every
++    // frame added a block that stayed (nothing writes there), and the next protection merged them
++    // all again: a scene's start took 1.3 ms after a few minutes, growing.
++    if (owner)
++        drop_owner_block(state, owner);
+ 
+     ProtectBlockInfo block;
+     block.size = size;
+     block.callback = callback;
++    block.owner = owner;
++
++    // Inside a range already protected as strictly: the block joins it, with no merging, and only
++    // its own pages are protected again (a fault in a range sharing a 16 KiB host page with this
++    // one unprotected the page), not the whole range
++    auto it = state.protect_tree.lower_bound(addr);
++    if (it != state.protect_tree.end() && addr + protect.size <= it->first + it->second.size
++        && most_restrictive_perm(it->second.perm, perm) == it->second.perm) {
++        protect_inner(state, addr, protect.size, it->second.perm);
++        it->second.blocks.emplace(addr, std::move(block));
++        if (owner)
++            state.protect_owners[owner] = addr;
++        state.protect_blocks++;
++        state.protect_joins++;
++        return true;
++    }
+ 
+     protect.blocks.emplace(addr, std::move(block));
++    const Address new_addr = addr;
++    const uint32_t new_size = protect.size;
+ 
+-    auto it = state.protect_tree.lower_bound(addr);
+     if (it == state.protect_tree.end() || it->first + it->second.size <= addr) {
+         if (it == state.protect_tree.begin())
+             it = state.protect_tree.end();
+@@ -344,11 +636,15 @@ bool add_protect(MemState &state, Address addr, const uint32_t size, const MemPe
+             --it;
+     }
+ 
+-    while (it != state.protect_tree.end() && it->first < addr + size) {
++    // every range overlapping the merged one as it grows (it stopped at the new range's end
++    // measured from the merged start, leaving ranges that overlap the merged one)
++    unsigned merged_perms = 0;
++    while (it != state.protect_tree.end() && it->first < addr + protect.size) {
+         const Address start = std::min(it->first, addr);
+         protect.size = std::max(it->first + it->second.size, addr + protect.size) - start;
+         addr = start;
+         protect.blocks.merge(it->second.blocks); // transfer blocks to the new protect
++        merged_perms |= 1u << static_cast<unsigned>(it->second.perm);
+         protect.perm = most_restrictive_perm(protect.perm, it->second.perm);
+ 
+         if (it == state.protect_tree.begin()) {
+@@ -360,9 +656,17 @@ bool add_protect(MemState &state, Address addr, const uint32_t size, const MemPe
+         state.protect_tree.erase(it--);
+     }
+ 
+-    protect_inner(state, addr, protect.size, protect.perm);
++    // the ranges merged keep their protection: only the new pages need it, unless the merged range
++    // is stricter than one of them
++    if (merged_perms & ~(1u << static_cast<unsigned>(protect.perm)))
++        protect_inner(state, addr, protect.size, protect.perm);
++    else
++        protect_inner(state, new_addr, new_size, protect.perm);
+ 
+     state.protect_tree.emplace(addr, std::move(protect));
++    if (owner)
++        state.protect_owners[owner] = new_addr;
++    state.protect_blocks++;
+     return true;
+ }
+ 
+@@ -431,6 +735,7 @@ void remove_external_mapping(MemState &mem, uint8_t *addr_ptr, uint32_t size) {
+         }
+ 
+         while (prot_it != mem.protect_tree.end() && prot_it->first < mapping.address + mapping.size) {
++            forget_blocks(mem, prot_it->second);
+             if (prot_it == mem.protect_tree.begin()) {
+                 mem.protect_tree.erase(prot_it);
+                 break;
+@@ -520,6 +825,8 @@ void free(MemState &state, Address address) {
  #ifdef _WIN32
              const BOOL ret = VirtualFree(memory, batch_size, MEM_DECOMMIT);
              LOG_CRITICAL_IF(!ret, "VirtualFree failed: {}", get_error_msg());
@@ -2966,7 +3309,7 @@ index 28bc81bf..e125fbc6 100644
  #else
              int ret = mprotect(memory, batch_size, PROT_NONE);
              LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
-@@ -536,6 +762,8 @@ void free(MemState &state, Address address) {
+@@ -536,6 +843,8 @@ void free(MemState &state, Address address) {
  #ifdef _WIN32
          const BOOL ret = VirtualFree(memory, batch_size, MEM_DECOMMIT);
          LOG_CRITICAL_IF(!ret, "VirtualFree failed: {}", get_error_msg());
@@ -2975,7 +3318,16 @@ index 28bc81bf..e125fbc6 100644
  #else
          int ret = mprotect(memory, batch_size, PROT_NONE);
          LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
-@@ -602,6 +830,12 @@ static void register_access_violation_handler(const AccessViolationHandler &hand
+@@ -562,6 +871,8 @@ void deinit_mem(MemState &state) {
+     {
+         const std::lock_guard<std::mutex> prot_lock(state.protect_mutex);
+         state.protect_tree.clear();
++        state.protect_owners.clear();
++        state.protect_blocks = 0;
+     }
+ 
+     state.memory.reset();
+@@ -602,6 +913,12 @@ static void register_access_violation_handler(const AccessViolationHandler &hand
  
  #else
  
@@ -2988,7 +3340,7 @@ index 28bc81bf..e125fbc6 100644
  static void signal_handler(int sig, siginfo_t *info, void *uct) noexcept {
      auto context = static_cast<ucontext_t *>(uct);
  
-@@ -630,6 +864,9 @@ static void signal_handler(int sig, siginfo_t *info, void *uct) noexcept {
+@@ -630,6 +947,9 @@ static void signal_handler(int sig, siginfo_t *info, void *uct) noexcept {
  #else
  #ifdef __APPLE__
      const uint64_t err = context->uc_mcontext->__es.__err;
@@ -2998,7 +3350,7 @@ index 28bc81bf..e125fbc6 100644
  #else
      const uint64_t err = context->uc_mcontext.gregs[REG_ERR];
  #endif
-@@ -643,6 +880,14 @@ static void signal_handler(int sig, siginfo_t *info, void *uct) noexcept {
+@@ -643,6 +963,14 @@ static void signal_handler(int sig, siginfo_t *info, void *uct) noexcept {
          }
      }
  
@@ -3013,7 +3365,7 @@ index 28bc81bf..e125fbc6 100644
      LOG_CRITICAL("Unhandled access to 0x{:X}", reinterpret_cast<uintptr_t>(info->si_addr));
      raise(SIGTRAP);
      return;
-@@ -652,15 +897,30 @@ static void register_access_violation_handler(const AccessViolationHandler &hand
+@@ -652,15 +980,30 @@ static void register_access_violation_handler(const AccessViolationHandler &hand
      access_violation_handler = handler;
      struct sigaction sa;
      sa.sa_flags = SA_SIGINFO;
@@ -3470,7 +3822,7 @@ index 5ce4c807..59ac584a 100644
      if (emuenv.display.abort.load())
          return SCE_DISPLAY_ERROR_NO_PIXEL_DATA;
 diff --git a/vita3k/modules/SceGxm/SceGxm.cpp b/vita3k/modules/SceGxm/SceGxm.cpp
-index 4c864368..595d3069 100644
+index 4c864368..2018c81c 100644
 --- a/vita3k/modules/SceGxm/SceGxm.cpp
 +++ b/vita3k/modules/SceGxm/SceGxm.cpp
 @@ -48,6 +48,11 @@
@@ -3560,7 +3912,25 @@ index 4c864368..595d3069 100644
      if (!gxm::convert_color_format_to_texture_format(format, tex_format)) {
          LOG_WARN("Unable to convert color surface type 0x{:X} to texture format enum for background texture of color surface!", static_cast<std::uint32_t>(format));
      }
-@@ -2282,7 +2307,13 @@ EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<Sce
+@@ -1972,6 +1997,17 @@ EXPORT(void, sceGxmColorSurfaceSetScaleMode, SceGxmColorSurface *surface, SceGxm
+     UNIMPLEMENTED();
+ }
+ 
++#ifdef __PS4__
++// For the JIT's fast imports (modules/module_parent.cpp): an immediate context takes its commands
++// from its VDM ring or the host heap, a deferred one may call the game back for more memory
++bool gxm_context_is_immediate(EmuEnvState &emuenv, Address context) {
++    if (!context)
++        return false;
++    const SceGxmContext *const ctx = Ptr<SceGxmContext>(context).get(emuenv.mem);
++    return ctx && ctx->state.type == SCE_GXM_CONTEXT_TYPE_IMMEDIATE;
++}
++#endif
++
+ EXPORT(int, sceGxmCreateContext, const SceGxmContextParams *params, Ptr<SceGxmContext> *context) {
+     TRACY_FUNC(sceGxmCreateContext, params, context);
+     if (!params || !context)
+@@ -2282,7 +2318,13 @@ EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<Sce
  
      renderer::send_single_command(*emuenv.renderer, nullptr, renderer::CommandOpcode::NewFrame, false, frame, &emuenv.display, active_renderer_context);
  
@@ -3575,7 +3945,7 @@ index 4c864368..595d3069 100644
          // double buffering, not handled by the queue configuration
          emuenv.gxm.display_queue.wait_empty();
  
-@@ -2296,6 +2327,16 @@ EXPORT(int, sceGxmDisplayQueueFinish) {
+@@ -2296,6 +2338,16 @@ EXPORT(int, sceGxmDisplayQueueFinish) {
      return 0;
  }
  
@@ -3592,7 +3962,7 @@ index 4c864368..595d3069 100644
  static void gxmSetUniformBuffers(renderer::State &state, GxmState &gxm, SceGxmContext *context, const SceGxmProgram &program, std::span<UniformBuffer> buffers, const UniformBufferSizes &sizes, const MemState &mem) {
      for (size_t i = 0; i < buffers.size(); i++) {
          if (!buffers[i] || sizes.at(i) == 0) {
-@@ -2391,10 +2432,10 @@ static int gxmDrawElementGeneral(EmuEnvState &emuenv, const char *export_name, c
+@@ -2391,10 +2443,10 @@ static int gxmDrawElementGeneral(EmuEnvState &emuenv, const char *export_name, c
          // we don't need to get the vertex buffer size with memory mapping
          if (indexType == SCE_GXM_INDEX_FORMAT_U16) {
              const uint16_t *const data = static_cast<const uint16_t *>(indices_ptr);
@@ -3605,7 +3975,7 @@ index 4c864368..595d3069 100644
          }
      }
  
-@@ -2513,10 +2554,10 @@ EXPORT(int, sceGxmDrawPrecomputed, SceGxmContext *context, SceGxmPrecomputedDraw
+@@ -2513,10 +2565,10 @@ EXPORT(int, sceGxmDrawPrecomputed, SceGxmContext *context, SceGxmPrecomputedDraw
          // we don't need to get the vertex buffer size with memory mapping
          if (draw->index_format == SCE_GXM_INDEX_FORMAT_U16) {
              const uint16_t *const data = draw->index_data.cast<const uint16_t>().get(emuenv.mem);
@@ -3618,7 +3988,7 @@ index 4c864368..595d3069 100644
          }
      }
  
-@@ -2676,17 +2717,8 @@ EXPORT(int, sceGxmExecuteCommandList, SceGxmContext *context, SceGxmCommandList
+@@ -2676,17 +2728,8 @@ EXPORT(int, sceGxmExecuteCommandList, SceGxmContext *context, SceGxmCommandList
      if (!commandList || !commandList->list)
          return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
  
@@ -3638,7 +4008,7 @@ index 4c864368..595d3069 100644
  
      // Restore back our GXM state
      gxmContextStateRestore(*emuenv.renderer, context, true);
-@@ -2884,6 +2916,8 @@ EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params) {
+@@ -2884,6 +2927,8 @@ EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params) {
      // the case where displayQueueMaxPendingCount is 1 handled in sceGxmDisplayQueueAddEntry
      const uint32_t max_queue_size = std::max(std::min(params->displayQueueMaxPendingCount, 3U) - 1, 1U);
      emuenv.gxm.display_queue.maxPendingCount_ = max_queue_size;
@@ -4056,7 +4426,7 @@ index f6877fd1..74d18f31 100644
  // Returns true if the NID has an HLE (C++) implementation in nids.inc.
  // Used to determine if an LLE export should be overridden with HLE dispatch.
 diff --git a/vita3k/modules/module_parent.cpp b/vita3k/modules/module_parent.cpp
-index 0d6f62ec..334be567 100644
+index 0d6f62ec..8e1299bc 100644
 --- a/vita3k/modules/module_parent.cpp
 +++ b/vita3k/modules/module_parent.cpp
 @@ -22,6 +22,7 @@
@@ -4067,7 +4437,7 @@ index 0d6f62ec..334be567 100644
  #include <emuenv/state.h>
  #include <io/device.h>
  #include <io/state.h>
-@@ -176,6 +177,51 @@ void call_import(EmuEnvState &emuenv, CPUState &cpu, uint32_t nid, SceUID thread
+@@ -176,6 +177,137 @@ void call_import(EmuEnvState &emuenv, CPUState &cpu, uint32_t nid, SceUID thread
      }
  }
  
@@ -4075,10 +4445,22 @@ index 0d6f62ec..334be567 100644
 +extern "C" void ps4_perf_fast_import(uint32_t nid, uint64_t ticks); // vita3k/ps4/ps4_perf.cpp
 +extern "C" bool ps4_fast_calls(); // vita3k/ps4/ps4_settings.cpp
 +
++bool gxm_context_is_immediate(EmuEnvState &emuenv, Address context); // modules/SceGxm/SceGxm.cpp
++
++// How an import may run inside the JIT's callback
++enum class FastImport {
++    No,
++    Yes,
++    // a GXM call on an immediate context (its first argument): a deferred context's commands may
++    // call the game back for memory (its VDM and ring buffer callbacks)
++    ImmediateContext,
++};
++
 +// The imports the JIT runs inside its callback (cpu/src/dynarmic_cpu.cpp): they never wait, call
 +// back into the game or change the thread, so the JIT needn't stop for them. A thread library some
-+// games use (SceUlt: Uncharted) asks for its thread's ID and TLS on every operation.
-+static bool is_fast_import(uint32_t nid) {
++// games use (SceUlt: Uncharted) asks for its thread's ID and TLS on every operation (their stubs
++// answer them since 1.09: kernel/src/load_self.cpp).
++static FastImport fast_import_kind(uint32_t nid) {
 +    switch (nid) {
 +    case 0xB295EB61: // sceKernelGetTLSAddr
 +    case 0x0FB972F9: // sceKernelGetThreadId
@@ -4095,16 +4477,90 @@ index 0d6f62ec..334be567 100644
 +    case 0xBE5A68EF: // sceGxmPrecomputedVertexStateGetDefaultUniformBuffer
 +    case 0xB452F1FB: // sceGxmPrecomputedFragmentStateSetUniformBuffer
 +    case 0xCECB584A: // sceGxmPrecomputedFragmentStateGetDefaultUniformBuffer
-+        return true;
++    // the rest of the precomputed states and draws: writes to the game's own structures
++    case 0xA197F096: // sceGxmPrecomputedDrawInit
++    case 0xB6C6F571: // sceGxmPrecomputedDrawSetAllVertexStreams
++    case 0x884D0D08: // sceGxmPrecomputedDrawSetParams
++    case 0x3A7B1633: // sceGxmPrecomputedDrawSetParamsInstanced
++    case 0x6C936214: // sceGxmPrecomputedDrawSetVertexStream
++    case 0xE297D7AF: // sceGxmPrecomputedFragmentStateInit
++    case 0x9D93B63A: // sceGxmPrecomputedFragmentStateSetAllAuxiliarySurfaces
++    case 0xC383DE39: // sceGxmPrecomputedFragmentStateSetAllTextures
++    case 0x5A783DC3: // sceGxmPrecomputedFragmentStateSetAllUniformBuffers
++    case 0x91236858: // sceGxmPrecomputedFragmentStateSetDefaultUniformBuffer
++    case 0x29118BF1: // sceGxmPrecomputedFragmentStateSetTexture
++    case 0xBE937F8D: // sceGxmPrecomputedVertexStateInit
++    case 0xC40C9127: // sceGxmPrecomputedVertexStateSetAllTextures
++    case 0x0389861D: // sceGxmPrecomputedVertexStateSetAllUniformBuffers
++    case 0x34BF64E3: // sceGxmPrecomputedVertexStateSetDefaultUniformBuffer
++    case 0x6A29EB06: // sceGxmPrecomputedVertexStateSetTexture
++        return FastImport::Yes;
++    // GXM's state setters and draws: they record commands for the render thread and return. A game
++    // makes a dozen for each draw (Uncharted: some 170,000 a second, each 0.4 us of stopping the
++    // JIT, the thread's loop and starting it again)
++    case 0xBC059AFC: // sceGxmDraw
++    case 0x14C4E7D3: // sceGxmDrawInstanced
++    case 0xED3F78B8: // sceGxmDrawPrecomputed
++    case 0x7B1FABB6: // sceGxmReserveFragmentDefaultUniformBuffer
++    case 0x97118913: // sceGxmReserveVertexDefaultUniformBuffer
++    case 0x17B3BF86: // sceGxmSetBackDepthBias
++    case 0xB042A4D2: // sceGxmSetBackDepthFunc
++    case 0xC18B706B: // sceGxmSetBackDepthWriteEnable
++    case 0xE26B4834: // sceGxmSetBackFragmentProgramEnable
++    case 0xC88EB702: // sceGxmSetBackLineFillLastPixelEnable
++    case 0x8DCB0EDB: // sceGxmSetBackPointLineWidth
++    case 0xF66EC6FE: // sceGxmSetBackPolygonMode
++    case 0x1A68C8D2: // sceGxmSetBackStencilFunc
++    case 0x866A0517: // sceGxmSetBackStencilRef
++    case 0x17CF46B9: // sceGxmSetBackVisibilityTestEnable
++    case 0xAE7886FE: // sceGxmSetBackVisibilityTestIndex
++    case 0xC83F0AB3: // sceGxmSetBackVisibilityTestOp
++    case 0xE1CA72AE: // sceGxmSetCullMode
++    case 0x60CF708E: // sceGxmSetDefaultRegionClipAndViewport
++    case 0xA824EB24: // sceGxmSetFragmentDefaultUniformBuffer
++    case 0xAD2F48D9: // sceGxmSetFragmentProgram
++    case 0x29C34DF5: // sceGxmSetFragmentTexture
++    case 0xEA0FC310: // sceGxmSetFragmentUniformBuffer
++    case 0xAAA97F81: // sceGxmSetFrontDepthBias
++    case 0x14BD831F: // sceGxmSetFrontDepthFunc
++    case 0xF32CBF34: // sceGxmSetFrontDepthWriteEnable
++    case 0x575958A8: // sceGxmSetFrontFragmentProgramEnable
++    case 0x5765DE9F: // sceGxmSetFrontLineFillLastPixelEnable
++    case 0x06752183: // sceGxmSetFrontPointLineWidth
++    case 0xFD93209D: // sceGxmSetFrontPolygonMode
++    case 0xB8645A9A: // sceGxmSetFrontStencilFunc
++    case 0x8FA6FE44: // sceGxmSetFrontStencilRef
++    case 0x30459117: // sceGxmSetFrontVisibilityTestEnable
++    case 0x12625C34: // sceGxmSetFrontVisibilityTestIndex
++    case 0xD0E3CD9A: // sceGxmSetFrontVisibilityTestOp
++    case 0xF8952750: // sceGxmSetPrecomputedFragmentState
++    case 0xB7626A93: // sceGxmSetPrecomputedVertexState
++    case 0x70C86868: // sceGxmSetRegionClip
++    case 0x0DE9AEB7: // sceGxmSetTwoSidedEnable
++    case 0xC697CAE5: // sceGxmSetVertexDefaultUniformBuffer
++    case 0x31FF8ABD: // sceGxmSetVertexProgram
++    case 0x895DF2E9: // sceGxmSetVertexStream
++    case 0x9EB4380F: // sceGxmSetVertexTexture
++    case 0xC68015E4: // sceGxmSetVertexUniformBuffer
++    case 0x3EB3380B: // sceGxmSetViewport
++    case 0x814F61EB: // sceGxmSetViewportEnable
++    case 0x7767EC49: // sceGxmSetVisibilityBuffer
++    case 0xEED86975: // sceGxmSetWBufferEnable
++    case 0x1BF8B853: // sceGxmSetWClampEnable
++    case 0xD096336E: // sceGxmSetWClampValue
++        return FastImport::ImmediateContext;
 +    default:
-+        return false;
++        return FastImport::No;
 +    }
 +}
 +
 +bool call_fast_import(EmuEnvState &emuenv, CPUState &cpu) {
 +    // the stub is "svc #0; mov pc, lr; .word nid", and the pc is past the svc
 +    const uint32_t nid = *Ptr<uint32_t>(read_pc(cpu) + 4).get(emuenv.mem);
-+    if (!is_fast_import(nid) || emuenv.kernel.debugger.watch_import_calls || !ps4_fast_calls())
++    const FastImport kind = fast_import_kind(nid);
++    if (kind == FastImport::No || emuenv.kernel.debugger.watch_import_calls || !ps4_fast_calls())
++        return false;
++    if (kind == FastImport::ImmediateContext && !gxm_context_is_immediate(emuenv, read_reg(cpu, 0)))
 +        return false;
 +    const ImportFn *fn = resolve_import(nid);
 +    if (!fn)
@@ -4119,7 +4575,7 @@ index 0d6f62ec..334be567 100644
  struct SceKernelBootimageModules {
      Ptr<const char> path;
      Ptr<const void> data;
-@@ -467,4 +513,10 @@ void init_libraries(EmuEnvState &emuenv) {
+@@ -467,4 +599,10 @@ void init_libraries(EmuEnvState &emuenv) {
  #define LIBRARY(name) import_library_init_##name(emuenv);
  #include <modules/library_init_list.inc>
  #undef LIBRARY
@@ -12076,10 +12532,10 @@ index 00000000..800318b2
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..0ebf7b8e
+index 00000000..936757dd
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
-@@ -0,0 +1,677 @@
+@@ -0,0 +1,696 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -12169,13 +12625,15 @@ index 00000000..0ebf7b8e
 +extern "C" long long ps4_wait_total(int slot);
 +// the Mesa winsys (port/mesa/ac_ps4_drm.c): the GPU's busy time and the time it spans (GPU clock)
 +extern "C" void ac_ps4_get_gpu_busy(uint64_t *busy_ticks, uint64_t *span_ticks);
++// faults in translated code: a page the renderer protects written (cpu/src/dynarmic_cpu.cpp)
++extern "C" uint64_t ps4_fastmem_faults();
 +
 +// kernel/src/kernel.cpp: every guest thread's wait, and who holds what it waits for
 +void ps4_log_waits(KernelState &kernel);
 +
 +// The renderer profiler's line: HENkaku's render thread's draws and what each part of them took,
 +// its biggest kinds of state set and command (renderer/ps4_render_stats.h)
-+void log_render_stats(double seconds, double ticks_per_ms) {
++void log_render_stats(const EmuEnvState &emuenv, double seconds, double ticks_per_ms) {
 +    namespace st = renderer::ps4stats;
 +    static const char *const commands[] = { "CreateContext", "CreateRenderTarget", "MemoryMap", "MemoryUnmap", "Draw", "TransferCopy", "TransferDownscale", "TransferFill", "Nop",
 +        "SetState", "SetContext", "SyncSurfaceData", "MidSceneFlush", "SignalSyncObject", "WaitSyncObject", "SignalNotification", "SetScreenFilter", "NewFrame",
@@ -12232,7 +12690,7 @@ index 00000000..0ebf7b8e
 +
 +    // a scene's start and end, part by part, and the draws reading the framebuffer
 +    static const char *const scene_names[] = { "begin", "mask", "surfaces", "end", "submit" };
-+    static uint64_t last_scene_ticks[st::ScenePartCount], last_scenes, last_fetch, last_ordered, last_ordered_primitives;
++    static uint64_t last_scene_ticks[st::ScenePartCount], last_scenes, last_fetch, last_ordered, last_ordered_primitives, last_color_made, last_ds_made;
 +    const double scenes = take(st::scenes, last_scenes) / seconds;
 +    std::string scene_parts;
 +    for (int i = 0; i < st::ScenePartCount; i++) {
@@ -12241,8 +12699,25 @@ index 00000000..0ebf7b8e
 +    }
 +    const double fetch = take(st::fetch_draws, last_fetch) / seconds, ordered = take(st::ordered_draws, last_ordered) / seconds;
 +    const double ordered_primitives = take(st::ordered_primitives, last_ordered_primitives) / seconds;
-+    LOG_INFO("renderer: {:.0f} scenes/s ({}; us each); draws reading the framebuffer {:.0f}/s, {:.0f}/s of them a primitive at a time ({:.0f} primitives/s)",
-+        scenes, scene_parts, fetch, ordered, ordered_primitives);
++    const double color_made = take(st::color_surfaces_made, last_color_made) / seconds, ds_made = take(st::ds_surfaces_made, last_ds_made) / seconds;
++    LOG_INFO("renderer: {:.0f} scenes/s ({}; us each); render targets made {:.0f}/s, depth-stencil {:.0f}/s; draws reading the framebuffer {:.0f}/s, {:.0f}/s of them a primitive at a time ({:.0f} primitives/s)",
++        scenes, scene_parts, color_made, ds_made, fetch, ordered, ordered_primitives);
++
++    // the memory the renderer watches for the game's writes (textures, render targets: mem.cpp):
++    // the protections, those that joined a range already protected, the writes caught (faults) and
++    // their time, those of them in translated code, and what is watched now
++    const MemState &mem = emuenv.mem;
++    static uint64_t last_adds, last_joins, last_faults, last_fault_ticks, last_fastmem;
++    const auto take_plain = [](uint64_t now, uint64_t &last) {
++        const uint64_t delta = now - last;
++        last = now;
++        return delta;
++    };
++    const double adds = take_plain(mem.protect_adds, last_adds) / seconds, joins = take_plain(mem.protect_joins, last_joins) / seconds;
++    const double faults = take_plain(mem.protect_faults, last_faults) / seconds, fault_ms = ms(take_plain(mem.protect_fault_ticks, last_fault_ticks));
++    const double fastmem = take_plain(ps4_fastmem_faults(), last_fastmem) / seconds;
++    LOG_INFO("memory watch: {:.0f} protections/s ({:.0f}/s in a range already protected), {:.0f} writes caught/s ({:.1f} ms/s; {:.0f}/s in translated code), {} ranges with {} blocks",
++        adds, joins, faults, fault_ms, fastmem, mem.protect_tree.size(), mem.protect_blocks);
 +}
 +
 +// The profiler's hottest places in each busy guest thread's code: the share of its samples, the
@@ -12324,7 +12799,7 @@ index 00000000..0ebf7b8e
 +            }
 +            log_profile(emuenv);
 +            if (ps4settings::prefs().host_profiler)
-+                log_render_stats(seconds, (tsc - last_tsc) / (seconds * 1000.0));
++                log_render_stats(emuenv, seconds, (tsc - last_tsc) / (seconds * 1000.0));
 +        } else {
 +            ps4perf::report(0, 0);
 +        }
@@ -13738,10 +14213,10 @@ index 00000000..69e26898
 +} // namespace ps4perf
 diff --git a/vita3k/ps4/ps4_settings.cpp b/vita3k/ps4/ps4_settings.cpp
 new file mode 100644
-index 00000000..1ce95cdb
+index 00000000..8e14fcaf
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.cpp
-@@ -0,0 +1,780 @@
+@@ -0,0 +1,790 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -14224,7 +14699,10 @@ index 00000000..1ce95cdb
 +            [](Prefs &p, int value) { p.vita_cores = value == 1; }, {}));
 +        items.push_back(pref_choice("Fast system calls", { "Off", "On" },
 +            [](const Prefs &p) { return p.fast_calls ? 1 : 0; },
-+            [](Prefs &p, int value) { p.fast_calls = value == 1; }, {}));
++            [](Prefs &p, int value) { p.fast_calls = value == 1; }, next_start));
++        items.push_back(pref_choice("Fast atomics", { "Off", "On" },
++            [](const Prefs &p) { return p.fast_atomics ? 1 : 0; },
++            [](Prefs &p, int value) { p.fast_atomics = value == 1; }, next_start));
 +    }
 +    return items;
 +}
@@ -14269,6 +14747,8 @@ index 00000000..1ce95cdb
 +            g_prefs.ordered_blending = value == "on";
 +        else if (key == "fast-calls")
 +            g_prefs.fast_calls = value == "on";
++        else if (key == "fast-atomics")
++            g_prefs.fast_atomics = value == "on";
 +        else if (key == "vita-cores")
 +            g_prefs.vita_cores = value != "parallel";
 +        else if (key == "profiler")
@@ -14315,6 +14795,7 @@ index 00000000..1ce95cdb
 +    std::fprintf(f, "gpu-compression = %s\n", g_prefs.gpu_compression ? "on" : "off");
 +    std::fprintf(f, "ordered-blending = %s\n", g_prefs.ordered_blending ? "on" : "off");
 +    std::fprintf(f, "fast-calls = %s\n", g_prefs.fast_calls ? "on" : "off");
++    std::fprintf(f, "fast-atomics = %s\n", g_prefs.fast_atomics ? "on" : "off");
 +    std::fprintf(f, "profiler = %s\n", g_prefs.profiler ? "on" : "off");
 +    std::fprintf(f, "renderer-profiler = %s\n", g_prefs.host_profiler ? "on" : "off");
 +    std::fprintf(f, "freeze-log = %s\n", g_prefs.freeze_log ? "on" : "off");
@@ -14347,6 +14828,10 @@ index 00000000..1ce95cdb
 +
 +extern "C" bool ps4_fast_calls() {
 +    return ps4settings::prefs().fast_calls;
++}
++
++extern "C" bool ps4_fast_atomics() {
++    return ps4settings::prefs().fast_atomics;
 +}
 +
 +// frame generation is making in-between frames now (renderer.cpp): the FPS overlay's "on screen"
@@ -14524,10 +15009,10 @@ index 00000000..1ce95cdb
 +} // namespace ps4settings
 diff --git a/vita3k/ps4/ps4_settings.h b/vita3k/ps4/ps4_settings.h
 new file mode 100644
-index 00000000..7340f555
+index 00000000..535b4b65
 --- /dev/null
 +++ b/vita3k/ps4/ps4_settings.h
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,108 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -14588,6 +15073,8 @@ index 00000000..7340f555
 +    bool ordered_blending = false;
 +    // the imports that never wait run inside the JIT instead of stopping it (module_parent.cpp)
 +    bool fast_calls = true;
++    // LDREX/STREX without dynarmic's global monitor (cpu/src/dynarmic_cpu.cpp), at a game's start
++    bool fast_atomics = true;
 +    // the threads a game pins to one Vita core run one at a time, switching when one blocks, as on
 +    // the Vita (some games deadlock when they run side by side), or all side by side
 +    bool vita_cores = true;
@@ -15745,10 +16232,10 @@ index c45a74c4..4fbfd672 100644
  // Assume fmt is a bcn format
 diff --git a/vita3k/renderer/include/renderer/ps4_render_stats.h b/vita3k/renderer/include/renderer/ps4_render_stats.h
 new file mode 100644
-index 00000000..26701315
+index 00000000..46321d45
 --- /dev/null
 +++ b/vita3k/renderer/include/renderer/ps4_render_stats.h
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,115 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -15822,6 +16309,10 @@ index 00000000..26701315
 +inline std::atomic<uint64_t> fetch_draws{ 0 };
 +inline std::atomic<uint64_t> ordered_draws{ 0 };
 +inline std::atomic<uint64_t> ordered_primitives{ 0 };
++// the render targets (colour, depth-stencil) made, each a new image (vulkan/surface_cache.cpp): a
++// game drawing to a memory with another format or size than the last time gets one made again
++inline std::atomic<uint64_t> color_surfaces_made{ 0 };
++inline std::atomic<uint64_t> ds_surfaces_made{ 0 };
 +
 +inline void add(std::atomic<uint64_t> &counter, uint64_t value) {
 +    counter.store(counter.load(std::memory_order_relaxed) + value, std::memory_order_relaxed);
@@ -16841,7 +17332,7 @@ index 684c12ca..99d778e0 100644
  
  COMMAND(handle_notification) {
 diff --git a/vita3k/renderer/src/texture/cache.cpp b/vita3k/renderer/src/texture/cache.cpp
-index 955648eb..d681387d 100644
+index 955648eb..e42a46d5 100644
 --- a/vita3k/renderer/src/texture/cache.cpp
 +++ b/vita3k/renderer/src/texture/cache.cpp
 @@ -325,8 +325,8 @@ void TextureCache::upload_texture(const SceGxmTexture &gxm_texture, MemState &me
@@ -16895,7 +17386,17 @@ index 955648eb..d681387d 100644
  
              upload = previous_hash != info->hash;
          } else {
-@@ -802,7 +815,7 @@ void TextureCache::cache_and_bind_texture(const SceGxmTexture &gxm_texture, MemS
+@@ -783,7 +796,8 @@ void TextureCache::cache_and_bind_texture(const SceGxmTexture &gxm_texture, MemS
+                 }
+ 
+                 return true;
+-            });
++            },
++                info);
+         }
+ 
+         upload_done();
+@@ -802,7 +816,7 @@ void TextureCache::cache_and_bind_texture(const SceGxmTexture &gxm_texture, MemS
          cache_and_bind_sampler(gxm_texture);
  }
  
@@ -16904,7 +17405,7 @@ index 955648eb..d681387d 100644
      uint32_t compact_repr = 0;
      if (gxm_texture.texture_type() != SCE_GXM_TEXTURE_LINEAR_STRIDED) {
          compact_repr = 0b01
-@@ -822,9 +835,7 @@ int TextureCache::cache_and_bind_sampler(const SceGxmTexture &gxm_texture, bool
+@@ -822,9 +836,7 @@ int TextureCache::cache_and_bind_sampler(const SceGxmTexture &gxm_texture, bool
              | (gxm_texture.mag_filter << 8);
      }
  
@@ -16915,7 +17416,7 @@ index 955648eb..d681387d 100644
  
      auto it = sampler_lookup.find(compact_repr);
      if (it != sampler_lookup.end()) {
-@@ -844,7 +855,7 @@ int TextureCache::cache_and_bind_sampler(const SceGxmTexture &gxm_texture, bool
+@@ -844,7 +856,7 @@ int TextureCache::cache_and_bind_sampler(const SceGxmTexture &gxm_texture, bool
      sampler_lookup[compact_repr] = info;
  
      info->value = compact_repr;
@@ -17890,7 +18391,7 @@ index ff6d0c5b..fd5d034c 100644
  
          if (request == nullptr)
 diff --git a/vita3k/renderer/src/vulkan/renderer.cpp b/vita3k/renderer/src/vulkan/renderer.cpp
-index ed8c71ad..7ebc233b 100644
+index ed8c71ad..357dc215 100644
 --- a/vita3k/renderer/src/vulkan/renderer.cpp
 +++ b/vita3k/renderer/src/vulkan/renderer.cpp
 @@ -22,6 +22,7 @@
@@ -18145,6 +18646,16 @@ index ed8c71ad..7ebc233b 100644
  #else
          dispatch.init();
  #endif
+@@ -1918,7 +2025,8 @@ TrappedBuffer *BufferTrapping::access_buffer(Address addr, uint32_t size, MemSta
+     add_protect(mem, aligned_addr, aligned_size, MemPerm::ReadOnly, [it](Address addr, bool write) {
+         it->second.dirty = true;
+         return true;
+-    });
++    },
++        &it->second);
+ 
+     // copy back the data as it was non-existent or dirty
+     memcpy(it->second.mapped_location, Ptr<void>(addr).get(mem), size);
 diff --git a/vita3k/renderer/src/vulkan/scene.cpp b/vita3k/renderer/src/vulkan/scene.cpp
 index acd85ab5..ce1118c9 100644
 --- a/vita3k/renderer/src/vulkan/scene.cpp
@@ -18426,7 +18937,7 @@ index bbc6ba97..8718d19c 100644
      filter->render(true, image_view, layout, viewport);
  
 diff --git a/vita3k/renderer/src/vulkan/surface_cache.cpp b/vita3k/renderer/src/vulkan/surface_cache.cpp
-index 84f14b6a..1bc49833 100644
+index 84f14b6a..14beb301 100644
 --- a/vita3k/renderer/src/vulkan/surface_cache.cpp
 +++ b/vita3k/renderer/src/vulkan/surface_cache.cpp
 @@ -18,6 +18,9 @@
@@ -18447,7 +18958,7 @@ index 84f14b6a..1bc49833 100644
  #include <util/align.h>
  #include <util/log.h>
  #include <util/vector_utils.h>
-@@ -144,9 +148,14 @@ static void protect_surface(MemState &mem, ColorSurfaceCacheInfo &info) {
+@@ -144,14 +148,21 @@ static void protect_surface(MemState &mem, ColorSurfaceCacheInfo &info) {
      // Don't track dirty for small surfaces to avoid false positives from unrelated writes
      std::shared_ptr<bool> dirty = small_surface ? nullptr : info.dirty;
  
@@ -18464,7 +18975,26 @@ index 84f14b6a..1bc49833 100644
                  *dirty = true;
              if (need_sync)
                  *need_sync = true;
-@@ -468,6 +477,57 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
+             return true;
+-        });
++        },
++        // the surface's last protection replaces the one before (mem: an owner keeps one block)
++        &info);
+ }
+ 
+ ColorSurfaceCacheInfo::~ColorSurfaceCacheInfo() {
+@@ -396,6 +407,10 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
+ 
+     color_surface_queue.set_as_mru(&info_added);
+     info_added.last_frame_rendered = context->frame_timestamp;
++#ifdef __PS4__
++    if (ps4stats::enabled.load(std::memory_order_relaxed))
++        ps4stats::add(ps4stats::color_surfaces_made, 1);
++#endif
+ 
+     color_address_lookup[address] = &info_added;
+ 
+@@ -468,6 +483,57 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
      return { info_added.texture.view, &info_added.texture };
  }
  
@@ -18522,7 +19052,7 @@ index 84f14b6a..1bc49833 100644
  std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_texture(const SceGxmTexture &texture, const SceGxmColorBaseFormat base_format, TextureViewport *texture_viewport) {
      // Create the key to access the cache struct
      const uint32_t address = (texture.data_addr << 2);
-@@ -493,9 +553,30 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
+@@ -493,9 +559,30 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
      if (!overlap)
          return std::nullopt;
  
@@ -18554,7 +19084,7 @@ index 84f14b6a..1bc49833 100644
  
      const vk::ComponentMapping swizzle = texture::translate_swizzle(gxm::get_format(texture));
      vk::Format vk_format = color::translate_surface_format(base_format,
-@@ -544,28 +625,36 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
+@@ -544,28 +631,36 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
          || (base_format == SCE_GXM_COLOR_BASE_FORMAT_U4U4U4U4 && vk_format != vk::Format::eR4G4B4A4UnormPack16);
      if ((base_format == SCE_GXM_COLOR_BASE_FORMAT_U8U8U8 || info.format == SCE_GXM_COLOR_BASE_FORMAT_U8U8U8
              || expanded_rgba4)
@@ -18595,7 +19125,7 @@ index 84f14b6a..1bc49833 100644
  
      // TODO: this is true only for linear textures (and also kind of for tiled textures) (and in this case start_x = 0),
      // for swizzled textures this is different
-@@ -656,6 +745,7 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
+@@ -656,6 +751,7 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
          // use prerender cmd as we can't copy an image or use pipeline barriers in a render pass
          VKContext *context = reinterpret_cast<VKContext *>(state.context);
          vk::CommandBuffer cmd_buffer = context->prerender_cmd;
@@ -18603,7 +19133,7 @@ index 84f14b6a..1bc49833 100644
  
          if (casted == nullptr) {
              // Try to crop + cast
-@@ -690,6 +780,13 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
+@@ -690,6 +786,13 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
          }
  
          casted->scene_timestamp = scene_timestamp;
@@ -18617,7 +19147,7 @@ index 84f14b6a..1bc49833 100644
  
          if (bytes_per_pixel_requested == bytes_per_pixel_in_store) {
              vk::ImageCopy image_copy{
-@@ -730,6 +827,7 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
+@@ -730,6 +833,7 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
                  .imageExtent = { info.width, height, 1 }
              };
              cmd_buffer.copyImageToBuffer(info.texture.image, vk::ImageLayout::eGeneral, casted->transition_buffer.buffer, copy_image_buffer);
@@ -18625,7 +19155,7 @@ index 84f14b6a..1bc49833 100644
  
              // then the buffer to the image
              const uint32_t dst_pixel_stride = (stride_bytes / bytes_per_pixel_requested) * state.res_multiplier;
-@@ -740,7 +838,7 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
+@@ -740,7 +844,7 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
                  .setImageExtent({ width, height, 1 });
              cmd_buffer.copyBufferToImage(casted->transition_buffer.buffer, casted->texture.image, vk::ImageLayout::eTransferDstOptimal, copy_image_buffer);
          }
@@ -18634,7 +19164,18 @@ index 84f14b6a..1bc49833 100644
  
          return TextureLookupResult{
              casted->texture.view,
-@@ -1112,6 +1210,7 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_depth_stencil_as_tex
+@@ -834,6 +938,10 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_depth_stencil_for_framebuffer(Sce
+ 
+     // update the lookup info
+     ds_surface_queue.set_as_mru(cached_info);
++#ifdef __PS4__
++    if (ps4stats::enabled.load(std::memory_order_relaxed))
++        ps4stats::add(ps4stats::ds_surfaces_made, 1);
++#endif
+     if (depth_stencil->depth_data)
+         depth_address_lookup[depth_stencil->depth_data.address()] = cached_info;
+     if (depth_stencil->stencil_data)
+@@ -1112,6 +1220,7 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_depth_stencil_as_tex
      delta_row_samples *= state.res_multiplier;
      delta_col_samples *= state.res_multiplier;
  
@@ -18642,7 +19183,7 @@ index 84f14b6a..1bc49833 100644
      read_only.depth_view.transition_to_discard(cmd_buffer, vkutil::ImageLayout::TransferDst, vkutil::ds_subresource_range);
  
      cached_info.texture.transition_to(cmd_buffer, vkutil::ImageLayout::TransferSrc, vkutil::ds_subresource_range);
-@@ -1203,7 +1302,7 @@ Framebuffer &VKSurfaceCache::retrieve_framebuffer_handle(MemState &mem, SceGxmCo
+@@ -1203,7 +1312,7 @@ Framebuffer &VKSurfaceCache::retrieve_framebuffer_handle(MemState &mem, SceGxmCo
          fb_interlock = state.device.createFramebuffer(fb_info);
      }
  

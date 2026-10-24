@@ -247,6 +247,25 @@ index 3f7573af..b4463440 100644
      size_t committed_size = 0;
  #endif
  
+diff --git a/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc b/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+index 272b896a..ea26605f 100644
+--- a/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
++++ b/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+@@ -26,7 +26,14 @@ std::optional<AxxEmitX64::DoNotFastmemMarker> AxxEmitX64::ShouldFastmem(AxxEmitC
+     return marker;
+ }
+ 
++#ifdef __PS4__
++extern "C" void ps4_fastmem_fault();  // HENkaku's perf line (vita3k/cpu/src/dynarmic_cpu.cpp)
++#endif
++
+ FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
++#ifdef __PS4__
++    ps4_fastmem_fault();
++#endif
+     const auto iter = fastmem_patch_info.find(rip_);
+ 
+     if (iter == fastmem_patch_info.end()) {
 diff --git a/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h b/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h
 index 44ac2450..235ffa15 100644
 --- a/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h

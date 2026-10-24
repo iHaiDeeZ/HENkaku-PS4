@@ -71,7 +71,15 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
   accuracy: unfused FMA, the host's estimates, no NaN fix-ups, no standard-FPSCR switch).
   Exclusive accesses (LDREX/STREX: the game's atomics and locks) are inline, the store a
   `lock cmpxchg` on the guest memory, instead of a call into the global monitor under its spin
-  lock (dynarmic's fastmem exclusives, yuzu's default).
+  lock (dynarmic's fastmem exclusives, yuzu's default). Since 1.09 without the global monitor
+  (HENkaku > CPU > Fast atomics, yuzu's default too): Vita3K gives every guest thread a monitor
+  slot (150), so each STREX cleared the other 149 under the monitor's lock (some 450 instructions)
+  and each LDREX took that lock. A fault at a fastmem access (a page the renderer protects) no
+  longer recompiles the instruction to go through a call for the rest of the session. Imports that
+  never wait run inside the JIT's supervisor call (`call_fast_import`: the clocks, GXM's setters and
+  draws on an immediate context), and `sceKernelGetThreadId`, `sceKernelGetTLSAddr` and
+  `sceKernelGetCurrentThreadVfpException` are ARM code in their stubs (`kernel/src/load_self.cpp`):
+  SceUlt (Uncharted) makes some 200,000 of these a second.
 - **Speed** (`perf:` lines in `vita3k.log`, every 10 s while a game runs): the game's frame rate,
   the emulated vblanks a second (60 when the timing holds), where the render thread's time went
   (waiting for the game's commands, showing frames, waiting for the GPU), how long the game's
@@ -101,7 +109,10 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
   didn't line up with the addresses: every guest page cost four of the CPU's 4 KiB TLB entries,
   and the JIT's loads and stores walked page tables (Jaguar's TLBs hold a few hundred entries). Write tracking uses `mprotect` and the
   fault handler (the PS4's FreeBSD signal context, `mc_err`), which hands other faults to the crash
-  log.
+  log. Each texture, render target and trapped buffer keeps one protection block (1.09: a render
+  target made again every frame added one that stayed, and every protection merged them all
+  again, so a scene's start grew to 1.3 ms in minutes); one inside a protected range joins it, and
+  only new pages are protected. The renderer profiler's `memory watch:` line counts them.
 - **Audio**: `audio/src/impl/ps4_audio.cpp`, one sceAudioOut port (48 kHz stereo) fed by a mixer
   thread; each Vita port is resampled to 48 kHz into a ring.
 - **Input**: ScePad into Vita3K's virtual keyboard state (game and menus), the touchpad as touch
