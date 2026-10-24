@@ -168,6 +168,11 @@ The touch pad has two modes (**Touch pad**, for all games or one, also in the HE
 
 The rings can be turned off in HENkaku > Display > Touch markers.
 
+When a game asks you to type something (a name, a save's title, a search), the **PS4's own keyboard** opens with
+the game's title and text. Type with the DualShock 4 (Cross picks a key) or a USB or Bluetooth keyboard, then
+choose Done: the text goes to the game. Closing the keyboard cancels, or keeps the text the game started with if
+the game gives no way to cancel.
+
 ## The HENkaku menu
 
 Press **L3 + R3** while playing. The game pauses under the menu; **Resume** goes back to it and **Exit** to the

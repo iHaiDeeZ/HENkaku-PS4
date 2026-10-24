@@ -117,6 +117,12 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
   thread; each Vita port is resampled to 48 kHz into a ring.
 - **Input**: ScePad into Vita3K's virtual keyboard state (game and menus), the touchpad as touch
   events, motion as sensor events (`ps4_pad.cpp`).
+- **Keyboard** (`ps4_keyboard.cpp`, 1.10): a game's IME dialog (`sceImeDialogInit`) or `sceImeOpen` opens
+  the PS4's own IME dialog, as March33 does: the Vita's title, text (UTF-16 on both), length, type and
+  multiline/password options; the main loop polls it and gives the text to the dialog (finished, OK)
+  or to sceIme (an update of the text, then enter). Vita3K's overlay draws only a text field fed by a
+  computer's keyboard, so it stays hidden for these (`ImeState::host_keyboard`), and the game gets no
+  pad input while the keyboard is open. Cross confirms because of the param.sfo's ATTRIBUTE 0x2.
 - **SDL3**: built for the console (`scripts/build-sdl3.sh`) for Vita3K's core services only (threads,
   timers, surfaces, gamepad and sensor types); dummy video and audio drivers.
 - **Firmware download** (`ps4_download.cpp`, `ps4_launcher.cpp`): libcurl over plain HTTP from

@@ -864,6 +864,19 @@ index 6183ffb4..9c2b220f 100644
  
      for (int i = 1; i < nb_returned_data; i++) {
          memcpy(&pData[i], &pData[0], sizeof(SceCtrlData2));
+diff --git a/vita3k/dialog/include/dialog/state.h b/vita3k/dialog/include/dialog/state.h
+index 07bd22da..a1c7aada 100644
+--- a/vita3k/dialog/include/dialog/state.h
++++ b/vita3k/dialog/include/dialog/state.h
+@@ -44,6 +44,8 @@ struct ImeState {
+     uint16_t *result;
+     char text[SCE_IME_DIALOG_MAX_TEXT_LENGTH];
+     int32_t status;
++    // the host's own keyboard shows it (the PS4's: vita3k/ps4/ps4_keyboard.cpp), not the overlay
++    bool host_keyboard = false;
+ };
+ 
+ struct MsgState {
 diff --git a/vita3k/display/include/display/state.h b/vita3k/display/include/display/state.h
 index 6bf8833c..e0480df8 100644
 --- a/vita3k/display/include/display/state.h
@@ -3716,10 +3729,36 @@ index 1d7fb1ed..12a8b966 100644
      return 0;
  }
 diff --git a/vita3k/modules/SceCommonDialog/SceCommonDialog.cpp b/vita3k/modules/SceCommonDialog/SceCommonDialog.cpp
-index 4a4eedfd..d00cdc39 100644
+index 4a4eedfd..441f3ae5 100644
 --- a/vita3k/modules/SceCommonDialog/SceCommonDialog.cpp
 +++ b/vita3k/modules/SceCommonDialog/SceCommonDialog.cpp
-@@ -241,6 +241,7 @@ EXPORT(int, sceImeDialogInit, const Ptr<SceImeDialogParam> param) {
+@@ -39,6 +39,13 @@
+ #include <ime/keyboard.h>
+ #endif
+ 
++#ifdef __PS4__
++// the PS4's own keyboard (vita3k/ps4/ps4_keyboard.cpp)
++extern "C" bool ps4_keyboard_open(const char16_t *title, const char16_t *text, uint32_t max_length, uint32_t vita_type,
++    uint32_t vita_option, bool password, uint32_t enter_label, bool for_dialog);
++extern "C" void ps4_keyboard_close(bool for_dialog);
++#endif
++
+ #include <util/tracy.h>
+ TRACY_MODULE_NAME(SceCommonDialog);
+ 
+@@ -180,6 +187,11 @@ EXPORT(int, sceImeDialogAbort) {
+         return RET_ERROR(SCE_COMMON_DIALOG_ERROR_NOT_IN_USE);
+     }
+     std::lock_guard<std::recursive_mutex> lock(emuenv.common_dialog.mutex);
++#ifdef __PS4__
++    if (emuenv.common_dialog.ime.host_keyboard)
++        ps4_keyboard_close(true);
++    emuenv.common_dialog.ime.host_keyboard = false;
++#endif
+     emuenv.common_dialog.active_ime = nullptr;
+     emuenv.common_dialog.status = SCE_COMMON_DIALOG_STATUS_FINISHED;
+     emuenv.common_dialog.result = SCE_COMMON_DIALOG_RESULT_ABORTED;
+@@ -241,12 +253,19 @@ EXPORT(int, sceImeDialogInit, const Ptr<SceImeDialogParam> param) {
          emuenv.ime.edit_text.caretIndex = emuenv.ime.caretIndex;
          emuenv.ime.edit_text.preeditIndex = emuenv.ime.caretIndex;
          emuenv.ime.param.maxTextLength = p->maxTextLength;
@@ -3727,7 +3766,29 @@ index 4a4eedfd..d00cdc39 100644
      }
      emuenv.common_dialog.active_ime = &emuenv.ime;
  
-@@ -270,7 +271,7 @@ EXPORT(int, sceImeDialogTerm) {
+ #ifdef __ANDROID__
+     ime::set_keyboard_active(true);
+ #endif
++#ifdef __PS4__
++    // the PS4's own keyboard, with the dialog's title, text and kind of input (a password box:
++    // textBoxMode 2, SCE_IME_DIALOG_TEXTBOX_MODE_PASSWORD); Vita3K's text field if it can't open
++    emuenv.common_dialog.ime.host_keyboard = ps4_keyboard_open(title.c_str(), text.c_str(), p->maxTextLength, p->type, p->option,
++        p->textBoxMode == 2, p->enterLabel, true);
++#endif
+ 
+     return 0;
+ }
+@@ -260,6 +279,9 @@ EXPORT(int, sceImeDialogTerm) {
+         return RET_ERROR(SCE_COMMON_DIALOG_ERROR_NOT_FINISHED);
+ 
+     std::lock_guard<std::recursive_mutex> lock(emuenv.common_dialog.mutex);
++#ifdef __PS4__
++    emuenv.common_dialog.ime.host_keyboard = false;
++#endif
+     emuenv.common_dialog.active_ime = nullptr;
+     emuenv.common_dialog.status = SCE_COMMON_DIALOG_STATUS_NONE;
+     emuenv.common_dialog.type = NO_DIALOG;
+@@ -270,7 +292,7 @@ EXPORT(int, sceImeDialogTerm) {
          emuenv.ime.str.clear();
          emuenv.ime.caretIndex = 0;
          emuenv.ime.edit_text = {};
@@ -3736,7 +3797,7 @@ index 4a4eedfd..d00cdc39 100644
      }
  
  #ifdef __ANDROID__
-@@ -947,8 +948,9 @@ static void check_save_file(const uint32_t index, EmuEnvState &emuenv, const cha
+@@ -947,8 +969,9 @@ static void check_save_file(const uint32_t index, EmuEnvState &emuenv, const cha
      auto &icon_buf_tmp = emuenv.common_dialog.savedata.icon_buffer[index];
      icon_buf_tmp.clear();
  
@@ -3748,7 +3809,7 @@ index 4a4eedfd..d00cdc39 100644
          auto empty_param = emuenv.common_dialog.savedata.list_empty_param[index];
          if (empty_param) {
              emuenv.common_dialog.savedata.title[index] = empty_param->title ? empty_param->title.get(emuenv.mem) : lang::get(lang::str::new_saved_data);
-@@ -965,9 +967,6 @@ static void check_save_file(const uint32_t index, EmuEnvState &emuenv, const cha
+@@ -965,9 +988,6 @@ static void check_save_file(const uint32_t index, EmuEnvState &emuenv, const cha
          }
      } else {
          vfs::FileBuffer thumbnail_buffer;
@@ -3758,7 +3819,7 @@ index 4a4eedfd..d00cdc39 100644
          emuenv.common_dialog.savedata.slot_info[index].isExist = 1;
          emuenv.common_dialog.savedata.title[index] = slot_param.title;
          emuenv.common_dialog.savedata.subtitle[index] = slot_param.subTitle;
-@@ -1238,6 +1237,8 @@ EXPORT(int, sceSaveDataDialogContinue, const SceSaveDataDialogParam *p) {
+@@ -1238,6 +1258,8 @@ EXPORT(int, sceSaveDataDialogContinue, const SceSaveDataDialogParam *p) {
              for (std::uint32_t i = 0; i < emuenv.common_dialog.savedata.slot_list_size; i++) {
                  slot_list[i] = list_param->slotList.get(emuenv.mem)[i];
                  emuenv.common_dialog.savedata.slot_id[i] = slot_list[i].id;
@@ -3767,7 +3828,7 @@ index 4a4eedfd..d00cdc39 100644
                  emuenv.common_dialog.savedata.list_empty_param[i] = slot_list[i].emptyParam.get(emuenv.mem);
                  check_save_file(i, emuenv, export_name);
              }
-@@ -1386,11 +1387,11 @@ EXPORT(int, sceSaveDataDialogInit, const SceSaveDataDialogParam *p) {
+@@ -1386,11 +1408,11 @@ EXPORT(int, sceSaveDataDialogInit, const SceSaveDataDialogParam *p) {
          }
  
          const std::span slots(list_param->slotList.get(emuenv.mem), slot_list_size);
@@ -3781,7 +3842,7 @@ index 4a4eedfd..d00cdc39 100644
              // Hardware finishes the sub status with this error and slot id -1
              emuenv.common_dialog.savedata.slot_id[0] = 0xFFFFFFFF;
              emuenv.common_dialog.result = (SceCommonDialogResult)SCE_SAVEDATA_DIALOG_ERROR_PARAM;
-@@ -1401,6 +1402,8 @@ EXPORT(int, sceSaveDataDialogInit, const SceSaveDataDialogParam *p) {
+@@ -1401,6 +1423,8 @@ EXPORT(int, sceSaveDataDialogInit, const SceSaveDataDialogParam *p) {
          for (SceUInt i = 0; i < slot_list_size; i++) {
              slot_list[i] = list_param->slotList.get(emuenv.mem)[i];
              emuenv.common_dialog.savedata.slot_id[i] = slot_list[i].id;
@@ -4018,11 +4079,30 @@ index 4c864368..2018c81c 100644
      const ThreadStatePtr main_thread = emuenv.kernel.get_thread(thread_id);
      const ThreadStatePtr display_queue_thread = emuenv.kernel.create_thread(emuenv.mem, "SceGxmDisplayQueue", Ptr<void>(0), SCE_KERNEL_HIGHEST_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_DEFAULT, 0, nullptr);
 diff --git a/vita3k/modules/SceIme/SceIme.cpp b/vita3k/modules/SceIme/SceIme.cpp
-index 426a3db7..b153c347 100644
+index 426a3db7..d0e3487a 100644
 --- a/vita3k/modules/SceIme/SceIme.cpp
 +++ b/vita3k/modules/SceIme/SceIme.cpp
-@@ -45,6 +45,11 @@ EXPORT(SceInt32, sceImeClose) {
+@@ -29,6 +29,13 @@
+ #include <ime/keyboard.h>
+ #endif
+ 
++#ifdef __PS4__
++// the PS4's own keyboard (vita3k/ps4/ps4_keyboard.cpp)
++extern "C" bool ps4_keyboard_open(const char16_t *title, const char16_t *text, uint32_t max_length, uint32_t vita_type,
++    uint32_t vita_option, bool password, uint32_t enter_label, bool for_dialog);
++extern "C" void ps4_keyboard_close(bool for_dialog);
++#endif
++
+ #include <util/tracy.h>
+ TRACY_MODULE_NAME(SceIme);
+ 
+@@ -43,8 +50,16 @@ EXPORT(void, SceImeEventHandler, Ptr<void> arg, const SceImeEvent *e) {
+ 
+ EXPORT(SceInt32, sceImeClose) {
      TRACY_FUNC(sceImeClose);
++#ifdef __PS4__
++    ps4_keyboard_close(false);
++#endif
      emuenv.ime.state = false;
  
 +    {
@@ -4033,7 +4113,7 @@ index 426a3db7..b153c347 100644
      if (emuenv.ime.param.inputTextBuffer.address())
          free(emuenv.mem, emuenv.ime.param.inputTextBuffer.address());
      emuenv.ime.param.inputTextBuffer = Ptr<SceWChar16>();
-@@ -89,15 +94,14 @@ EXPORT(SceInt32, sceImeOpen, SceImeParam *param) {
+@@ -89,15 +104,19 @@ EXPORT(SceInt32, sceImeOpen, SceImeParam *param) {
      else
          emuenv.ime.caps_level = 1;
  
@@ -4044,6 +4124,11 @@ index 426a3db7..b153c347 100644
  #ifdef __ANDROID__
      ime::set_keyboard_active(true);
  #endif
++#ifdef __PS4__
++    // the PS4's own keyboard: what's typed comes back as an update of the text and enter
++    ps4_keyboard_open(nullptr, emuenv.ime.str.c_str(), emuenv.ime.param.maxTextLength, emuenv.ime.param.type,
++        emuenv.ime.param.option, false, emuenv.ime.param.enterLabel, false);
++#endif
  
 -    SceImeEvent e{};
 -    memset(&e, 0, sizeof(e));
@@ -4051,7 +4136,7 @@ index 426a3db7..b153c347 100644
  
      return 0;
  }
-@@ -109,7 +113,10 @@ EXPORT(SceInt32, sceImeSetCaret, const SceImeCaret *caret) {
+@@ -109,7 +128,10 @@ EXPORT(SceInt32, sceImeSetCaret, const SceImeCaret *caret) {
  
      Ptr<SceImeEvent> event = Ptr<SceImeEvent>(alloc(emuenv.mem, sizeof(SceImeEvent), "ime_event"));
      SceImeEvent *e = event.get(emuenv.mem);
@@ -4062,7 +4147,7 @@ index 426a3db7..b153c347 100644
      CALL_EXPORT(SceImeEventHandler, emuenv.ime.param.arg, e);
      free(emuenv.mem, event.address());
  
-@@ -123,6 +130,8 @@ EXPORT(SceInt32, sceImeSetPreeditGeometry, const SceImePreeditGeometry *preedit)
+@@ -123,6 +145,8 @@ EXPORT(SceInt32, sceImeSetPreeditGeometry, const SceImePreeditGeometry *preedit)
  
      Ptr<SceImeEvent> event = Ptr<SceImeEvent>(alloc(emuenv.mem, sizeof(SceImeEvent), "ime_event"));
      SceImeEvent *e = event.get(emuenv.mem);
@@ -4071,7 +4156,7 @@ index 426a3db7..b153c347 100644
      e->param.rect.height = preedit->height;
      e->param.rect.x = preedit->x;
      e->param.rect.y = preedit->y;
-@@ -142,20 +151,30 @@ EXPORT(SceInt32, sceImeUpdate) {
+@@ -142,20 +166,30 @@ EXPORT(SceInt32, sceImeUpdate) {
      if (!emuenv.ime.state)
          return RET_ERROR(SCE_IME_ERROR_NOT_OPENED);
  
@@ -5423,7 +5508,7 @@ index 00000000..e3e68402
 +
 +} // namespace overlay
 diff --git a/vita3k/overlay/src/common_dialog.cpp b/vita3k/overlay/src/common_dialog.cpp
-index 9490418e..83cb3b59 100644
+index 9490418e..3935f736 100644
 --- a/vita3k/overlay/src/common_dialog.cpp
 +++ b/vita3k/overlay/src/common_dialog.cpp
 @@ -68,7 +68,7 @@ void submit_ime_dialog(DialogState &dialog) {
@@ -5444,6 +5529,23 @@ index 9490418e..83cb3b59 100644
      }
  
      dialog.ime.status = SCE_IME_DIALOG_BUTTON_CLOSE;
+@@ -180,6 +180,16 @@ bool common_dialog_overlay::poll_dialog(DialogState &dialog, int date_format, in
+ 
+     std::lock_guard<std::recursive_mutex> lock(dialog.mutex);
+ 
++    // an IME dialog the host's own keyboard shows (the PS4's): nothing over the game, and no input
++    if (dialog.type == IME_DIALOG && dialog.ime.host_keyboard && dialog.status == SCE_COMMON_DIALOG_STATUS_RUNNING) {
++        if (m_active_type != 0) {
++            clear_all();
++            m_active_type = 0;
++        }
++        visible = false;
++        return false;
++    }
++
+     if (m_dismissing) {
+         if (!m_dismiss_fade_anim.active && !m_dismiss_scale_anim.active) {
+             if (m_dismiss_is_substate) {
 diff --git a/vita3k/overlay/src/download_notice.cpp b/vita3k/overlay/src/download_notice.cpp
 new file mode 100644
 index 00000000..d29e90c7
@@ -6830,10 +6932,10 @@ index 4eb1f4f0..bd26315a 100644
      // 8) Choose the ux0 destination (a cart image is always a full app)
 diff --git a/vita3k/ps4/ps4.cmake b/vita3k/ps4/ps4.cmake
 new file mode 100644
-index 00000000..95f3d66b
+index 00000000..1bfcc919
 --- /dev/null
 +++ b/vita3k/ps4/ps4.cmake
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,48 @@
 +# PS4: Vita3K's frontend for the console, included from vita3k/CMakeLists.txt once the vita3k target
 +# exists. Built with the port's toolchain (toolchain/ps4-vita3k.cmake, and ps4-love-style.cmake as
 +# the project include: PS4_RUNTIME_SOURCES, ps4_link_mesa, ps4_add_eboot).
@@ -6851,6 +6953,8 @@ index 00000000..95f3d66b
 +	ps4/ps4_launcher.h
 +	ps4/ps4_controls.cpp
 +	ps4/ps4_controls.h
++	ps4/ps4_keyboard.cpp
++	ps4/ps4_keyboard.h
 +	ps4/ps4_pad.cpp
 +	ps4/ps4_pad.h
 +	ps4/ps4_perf.cpp
@@ -6866,7 +6970,7 @@ index 00000000..95f3d66b
 +
 +# archive.h and the other headers next to main.cpp
 +target_include_directories(vita3k PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-+target_link_libraries(vita3k PRIVATE camera emuenv mem np overlay pugixml::pugixml stb vulkan SDL3::SDL3)
++target_link_libraries(vita3k PRIVATE camera dialog emuenv ime mem np overlay pugixml::pugixml stb vulkan SDL3::SDL3)
 +# the launcher's firmware download and PKGj's (ps4_download.cpp)
 +target_link_libraries(vita3k PRIVATE libcurl)
 +
@@ -8900,6 +9004,302 @@ index 00000000..baad3a63
 +Result download(const std::string &url, const fs::path &path, uint64_t size, const Progress &progress);
 +
 +} // namespace ps4download
+diff --git a/vita3k/ps4/ps4_keyboard.cpp b/vita3k/ps4/ps4_keyboard.cpp
+new file mode 100644
+index 00000000..821093be
+--- /dev/null
++++ b/vita3k/ps4/ps4_keyboard.cpp
+@@ -0,0 +1,249 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// PS4: the PS4's own keyboard (its IME dialog, opened as March33 opens it) for the keyboard a Vita
++// game opens, through its IME dialog (a name, a save's title) or sceIme. Vita3K draws a text field
++// over the game and takes the text from a computer's keyboard, which the PS4 doesn't give an app.
++// The text is UTF-16 on both. The keyboard confirms with Cross: the package's param.sfo has
++// ATTRIBUTE 0x2 (scripts/make-pkg.sh), without which system dialogs follow the console's region
++// (Circle on some).
++
++#include "ps4_keyboard.h"
++
++#include <dialog/state.h>
++#include <emuenv/state.h>
++#include <ime/functions.h>
++#include <ime/state.h>
++#include <util/log.h>
++
++#include <orbis/CommonDialog.h>
++#include <orbis/ImeDialog.h>
++#include <orbis/Sysmodule.h>
++#include <orbis/UserService.h>
++
++#include <algorithm>
++#include <iterator>
++#include <mutex>
++#include <string>
++
++namespace {
++
++// the longest text of both IMEs
++constexpr uint32_t MAX_TEXT = SCE_IME_DIALOG_MAX_TEXT_LENGTH;
++// the same bits on both for these two (the Vita's 0x4 is "no assistance", the PS4's a password)
++constexpr uint32_t OPTION_MULTILINE = 0x1;
++constexpr uint32_t OPTION_NO_AUTO_CAPITALIZATION = 0x2;
++constexpr uint32_t OPTION_PASSWORD = 0x4;
++// the PS4 pad's buttons, without its "the system has the input" bit
++constexpr uint32_t PAD_BUTTONS = 0x001FFFFF;
++
++std::mutex g_lock;
++bool g_open = false;
++// for an IME dialog (else sceIme)
++bool g_for_dialog = false;
++// the game closed it, its result goes nowhere
++bool g_closing = false;
++bool g_hold = false;
++char16_t g_text[MAX_TEXT + 2];
++char16_t g_initial[MAX_TEXT + 2];
++char16_t g_title[SCE_IME_DIALOG_MAX_TITLE_LENGTH + 1];
++
++void copy_text(char16_t *out, size_t size, const char16_t *in) {
++    size_t n = 0;
++    if (in) {
++        for (; n + 1 < size && in[n]; n++)
++            out[n] = in[n];
++    }
++    out[n] = 0;
++}
++
++// The Vita's IME types (ime/types.h) as the PS4's
++OrbisImeType ps4_type(uint32_t vita_type) {
++    switch (vita_type) {
++    case SCE_IME_TYPE_BASIC_LATIN: return ORBIS_TYPE_BASIC_LATIN;
++    case SCE_IME_TYPE_NUMBER:
++    case SCE_IME_TYPE_EXTENDED_NUMBER: return ORBIS_TYPE_NUMBER;
++    case SCE_IME_TYPE_URL: return ORBIS_TYPE_TYPE_URL;
++    case SCE_IME_TYPE_MAIL: return ORBIS_TYPE_MAIL;
++    default: return ORBIS_TYPE_DEFAULT;
++    }
++}
++
++// The text typed to an IME dialog: closed on a dialog the game made without a cancel button, the
++// dialog ends with the text it started with
++void give_dialog(EmuEnvState &emuenv, bool done, const std::u16string &text) {
++    DialogState &dialog = emuenv.common_dialog;
++    const std::lock_guard<std::recursive_mutex> dialog_lock(dialog.mutex);
++    if (dialog.type != IME_DIALOG || dialog.status != SCE_COMMON_DIALOG_STATUS_RUNNING || !dialog.ime.host_keyboard)
++        return;
++    if (!done && dialog.ime.cancelable) {
++        cancel_ime_dialog(emuenv);
++        return;
++    }
++    if (done) {
++        const std::lock_guard<std::mutex> ime_lock(emuenv.ime.mutex);
++        emuenv.ime.str = text.substr(0, dialog.ime.max_length);
++        emuenv.ime.caretIndex = static_cast<uint32_t>(emuenv.ime.str.size());
++    }
++    // (takes the dialog's lock again, and the IME's)
++    finish_ime_dialog(emuenv);
++}
++
++// The text typed to sceIme: an update of its text and enter, or its close button
++void give_ime(EmuEnvState &emuenv, bool done, const std::u16string &text) {
++    Ime &ime = emuenv.ime;
++    const std::lock_guard<std::mutex> lock(ime.mutex);
++    if (!ime.state)
++        return;
++    if (!done) {
++        ime.queue_event(SCE_IME_EVENT_PRESS_CLOSE);
++        return;
++    }
++    ime.str = text.substr(0, ime.param.maxTextLength);
++    const uint32_t length = static_cast<uint32_t>(ime.str.size());
++    ime.caretIndex = length;
++    ime.edit_text.caretIndex = length;
++    ime.edit_text.preeditIndex = length;
++    ime.edit_text.preeditLength = 0;
++    ime.queue_event(SCE_IME_EVENT_UPDATE_TEXT);
++    ime.queue_submit_events();
++}
++
++} // namespace
++
++// Opens the keyboard for a game's IME dialog (for_dialog) or its sceIme, with the IME's settings
++// (ime/types.h): false if the PS4 refused every way of opening it
++extern "C" bool ps4_keyboard_open(const char16_t *title, const char16_t *text, uint32_t max_length, uint32_t vita_type,
++    uint32_t vita_option, bool password, uint32_t enter_label, bool for_dialog) {
++    const std::lock_guard<std::mutex> guard(g_lock);
++    if (g_open)
++        return false;
++    static bool loaded = false;
++    if (!loaded) {
++        sceSysmoduleLoadModule(ORBIS_SYSMODULE_IME_DIALOG);
++        sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_COMMON_DIALOG);
++        sceCommonDialogInitialize();
++        loaded = true;
++    }
++    const uint32_t length = std::clamp<uint32_t>(max_length, 1, MAX_TEXT);
++    copy_text(g_initial, length + 1, text);
++    copy_text(g_title, std::size(g_title), title);
++    int32_t user = -1;
++    sceUserServiceGetInitialUser(&user);
++
++    // Each attempt plainer than the one before: the PS4 refuses a password with the default type
++    // (80bc0030, March33), so it gets basic Latin and a password's length
++    struct Attempt {
++        OrbisImeType type;
++        uint32_t option;
++        uint32_t length;
++    };
++    const uint32_t option = vita_option & (OPTION_MULTILINE | OPTION_NO_AUTO_CAPITALIZATION);
++    const Attempt text_attempts[] = {
++        { ps4_type(vita_type), option, length },
++        { ORBIS_TYPE_DEFAULT, 0, length },
++        { ORBIS_TYPE_DEFAULT, 0, std::min<uint32_t>(length, 256) },
++    };
++    const Attempt password_attempts[] = {
++        { ORBIS_TYPE_BASIC_LATIN, OPTION_PASSWORD, std::min<uint32_t>(length, 128) },
++        { ORBIS_TYPE_BASIC_LATIN, OPTION_PASSWORD, std::min<uint32_t>(length, 16) },
++        { ORBIS_TYPE_DEFAULT, OPTION_PASSWORD, std::min<uint32_t>(length, 64) },
++        { ORBIS_TYPE_BASIC_LATIN, OPTION_NO_AUTO_CAPITALIZATION, std::min<uint32_t>(length, 128) },
++    };
++    const Attempt *const attempts = password ? password_attempts : text_attempts;
++    const size_t count = password ? std::size(password_attempts) : std::size(text_attempts);
++    int32_t result = -1;
++    for (size_t i = 0; i < count && result < 0; i++) {
++        copy_text(g_text, attempts[i].length + 1, g_initial);
++        OrbisImeDialogSetting setting{};
++        setting.userId = static_cast<uint32_t>(user);
++        setting.type = attempts[i].type;
++        setting.enterLabel = static_cast<OrbisButtonLabel>(enter_label <= SCE_IME_ENTER_LABEL_GO ? enter_label : SCE_IME_ENTER_LABEL_DEFAULT);
++        setting.option = attempts[i].option;
++        setting.maxTextLength = attempts[i].length;
++        setting.inputTextBuffer = reinterpret_cast<wchar_t *>(g_text);
++        setting.posx = 1920.f / 2;
++        setting.posy = 1080.f / 2;
++        setting.horizontalAlignment = ORBIS_H_CENTER;
++        setting.verticalAlignment = ORBIS_V_CENTER;
++        setting.title = reinterpret_cast<const wchar_t *>(g_title);
++        result = sceImeDialogInit(&setting, nullptr);
++        LOG_INFO("PS4 keyboard: open {:08X} for the game's {} (type {}, option {:X}, length {})", static_cast<uint32_t>(result),
++            for_dialog ? "IME dialog" : "IME", static_cast<int>(attempts[i].type), attempts[i].option, attempts[i].length);
++    }
++    g_open = result >= 0;
++    g_for_dialog = for_dialog;
++    g_closing = false;
++    g_hold = g_hold || g_open;
++    return g_open;
++}
++
++// Closes the keyboard the game opened (for_dialog: its IME dialog, else its sceIme) without a
++// result: the game aborted the dialog or closed its IME
++extern "C" void ps4_keyboard_close(bool for_dialog) {
++    const std::lock_guard<std::mutex> guard(g_lock);
++    if (!g_open || g_for_dialog != for_dialog || g_closing)
++        return;
++    sceImeDialogAbort();
++    g_closing = true;
++}
++
++namespace ps4keyboard {
++
++void update(EmuEnvState &emuenv) {
++    bool for_dialog;
++    bool done;
++    std::u16string text;
++    {
++        const std::lock_guard<std::mutex> guard(g_lock);
++        if (!g_open)
++            return;
++        const OrbisDialogStatus status = sceImeDialogGetStatus();
++        if (status == ORBIS_DIALOG_STATUS_RUNNING)
++            return;
++        OrbisDialogResult result{};
++        if (status == ORBIS_DIALOG_STATUS_STOPPED)
++            sceImeDialogGetResult(&result);
++        sceImeDialogTerm();
++        g_open = false;
++        if (g_closing) {
++            g_closing = false;
++            LOG_INFO("PS4 keyboard: closed by the game");
++            return;
++        }
++        done = status == ORBIS_DIALOG_STATUS_STOPPED && result.endstatus == ORBIS_DIALOG_OK;
++        for_dialog = g_for_dialog;
++        if (done)
++            text = g_text;
++    }
++    LOG_INFO("PS4 keyboard: {} ({} characters)", done ? "done" : "closed", text.size());
++    if (for_dialog)
++        give_dialog(emuenv, done, text);
++    else
++        give_ime(emuenv, done, text);
++}
++
++bool holds_input(uint32_t buttons) {
++    const std::lock_guard<std::mutex> guard(g_lock);
++    if (g_open)
++        return true;
++    if (g_hold && !(buttons & PAD_BUTTONS))
++        g_hold = false;
++    return g_hold;
++}
++
++} // namespace ps4keyboard
+diff --git a/vita3k/ps4/ps4_keyboard.h b/vita3k/ps4/ps4_keyboard.h
+new file mode 100644
+index 00000000..26e9a158
+--- /dev/null
++++ b/vita3k/ps4/ps4_keyboard.h
+@@ -0,0 +1,35 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// PS4: the PS4's own keyboard for the keyboard a Vita game opens (ps4_keyboard.cpp). The game's
++// modules open and close it through ps4_keyboard_open and ps4_keyboard_close.
++
++#pragma once
++
++#include <cstdint>
++
++struct EmuEnvState;
++
++namespace ps4keyboard {
++
++// Gives the game the keyboard's text once it's done (the main loop, every turn)
++void update(EmuEnvState &emuenv);
++// Whether the game's input is held back: while the keyboard is open, and after it until the
++// buttons that closed it are let go
++bool holds_input(uint32_t buttons);
++
++} // namespace ps4keyboard
 diff --git a/vita3k/ps4/ps4_launcher.cpp b/vita3k/ps4/ps4_launcher.cpp
 new file mode 100644
 index 00000000..a1877c1d
@@ -12532,10 +12932,10 @@ index 00000000..800318b2
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..936757dd
+index 00000000..28d0434d
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
-@@ -0,0 +1,696 @@
+@@ -0,0 +1,702 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -12571,6 +12971,7 @@ index 00000000..936757dd
 +#include "ps4_launcher.h"
 +#include "ps4_controls.h"
 +#include "ps4_data.h"
++#include "ps4_keyboard.h"
 +#include "ps4_pad.h"
 +#include "ps4_perf.h"
 +#include "ps4_settings.h"
@@ -13028,7 +13429,12 @@ index 00000000..936757dd
 +    auto next_flush = std::chrono::steady_clock::now();
 +    while (running) {
 +        const ps4pad::Snapshot pad = ps4pad::read();
-+        if (ps4pad::feed(emuenv, pad, session.is_paused())) {
++        // the PS4's keyboard a game opened: its text to the game once it's done, and no input for
++        // the game while it's open (and until the button that closed it is up)
++        ps4keyboard::update(emuenv);
++        if (ps4keyboard::holds_input(pad.buttons))
++            ps4pad::release(emuenv);
++        else if (ps4pad::feed(emuenv, pad, session.is_paused())) {
 +            // L3 + R3: Vita3K's pause menu (Resume / Exit), or back from it
 +            if (session.is_paused())
 +                session.set_pause_reason(app::AppSessionPauseReason::All, false);
