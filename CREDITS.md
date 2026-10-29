@@ -7,6 +7,10 @@ HENkaku is a port. Nearly everything that makes the games run is other people's 
 - **[Vita3K](https://github.com/Vita3K/Vita3K)** by the Vita3K team (GPL-2.0-or-later): the PlayStation Vita
   emulator. HENkaku applies `patches/vita3k-ps4.patch` to it at the commit in `patches/BASE.txt`, with some upstream
   pull requests that weren't merged yet (listed in [docs/PORT.md](docs/PORT.md)).
+- **[Vita3K+](https://github.com/nckstwrt/Vita3K-Plus)** by nckstwrt (GPL-2.0-or-later, a Vita3K fork that also
+  carries work from NaGaa95's vita-nx, nishinji, mohawku-bit's Vita3K-Enhanced and upstream pull requests): its
+  game compatibility fixes (renderer, shader translator, GXM, NGS, codecs, IME, file I/O, library code fixes) are
+  merged into HENkaku since 1.14, without its kernel scheduler, Page Table memory code and Android/Qt parts.
 - **[dynarmic](https://github.com/Vita3K/dynarmic)** (0BSD): the ARM JIT, with `patches/dynarmic-ps4.patch`.
 - The libraries Vita3K brings in its `external/` folder, built into the app under their own licences: capstone,
   CLI11, concurrentqueue, dlmalloc, fmt, glad, glslang, LibAtrac9, libfat16, miniz, psvpfstools, pugixml, spdlog,

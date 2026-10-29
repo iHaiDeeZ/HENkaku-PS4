@@ -52,6 +52,12 @@ downloads the PS Vita firmware from Sony's own update server the first time it s
 - From `/data/HENkaku/install` (copy them over FTP), anywhere on the PS4's storage, or a USB drive.
 - PKGj works as on a Vita with NoNpDrm: its downloads come down in the background and install by themselves.
 
+**More games**
+- Since 1.14 HENkaku carries the game fixes of [Vita3K+](https://github.com/nckstwrt/Vita3K-Plus) by nckstwrt:
+  graphics, shader, sound, video and system fixes for Killzone, Resistance, Need for Speed, Call of Duty, Gundam
+  Breaker 3, Tearaway, LittleBigPlanet, Uncharted's camera and many more. Its thread scheduler and Android memory
+  modes are not included: HENkaku keeps its own (HENkaku > CPU > Vita core threads).
+
 **Made for the PS4**
 - FidelityFX Super Resolution 1 upscales the Vita's picture to 1080p, with adjustable sharpness.
 - Frame generation shows a made frame between every two of a game's under 50 fps, so the screen changes every
@@ -293,6 +299,8 @@ version, the game's title ID, and your PS4 model and firmware. Never attach game
 ## Thanks
 
 - **[Vita3K](https://github.com/Vita3K/Vita3K)** and its team: the emulator, everything that runs the games
+- **[Vita3K+](https://github.com/nckstwrt/Vita3K-Plus)** by nckstwrt (with work from NaGaa95's vita-nx and others):
+  the game compatibility fixes merged in 1.14
 - **[dynarmic](https://github.com/Vita3K/dynarmic)**: the ARM JIT
 - **[Mesa](https://mesa3d.org)**: the RADV Vulkan driver that draws every frame
 - **[OpenOrbis](https://github.com/OpenOrbis)** and **[PacBrew](https://github.com/PacBrew)**: the PS4 toolchains

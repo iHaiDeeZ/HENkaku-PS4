@@ -137,6 +137,14 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
   game's shape and scaled to its size as ARGB, then converted to the format it asked for. Without
   one: `/data/HENkaku/camera.png`/`.jpg`, or grey. SDL's camera subsystem isn't used.
   `init_default_cameras` no longer turns the default into a solid colour.
+- **Vita3K+** (1.14): nckstwrt's fork (branch `all-enhancements`, remote `plus` in the build tree) is merged
+  into the `ps4` branch without its `kernel/`, `mem/`, SceKernelThreadMgr, `cpu/`, gui-qt and Android changes,
+  which stay HENkaku's. Its calls into those parts were removed (scheduler hand-offs such as
+  `guest_sched_release_for_block`, the hang/deadlock breakers in `display.cpp`), and its Page Table helpers are
+  plain checked copies or no-ops in `mem.cpp` (`debug_safe_copy_guest`, `pin_to_arena`, ...). HENkaku's NGS
+  resampler, IME event queue, vertex ring and config defaults (surface sync off, background shader compiling,
+  standard accuracy) were kept over Plus's. `modules/guest_code_fixes.cpp` patches libfios2 and libsceavplayer
+  code as they load.
 - **Vita cores** (`kernel/src/thread.cpp`): since 1.13 a thread of a higher priority takes its Vita
   core from the owner at once (Street Fighter X Tekken's Job Main spins for its workers and held
   the core 10 ms), and the perf lines give each thread's wait for its core.
