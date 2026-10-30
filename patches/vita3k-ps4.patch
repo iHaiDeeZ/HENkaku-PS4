@@ -37597,10 +37597,10 @@ index 00000000..26e9a158
 +} // namespace ps4keyboard
 diff --git a/vita3k/ps4/ps4_launcher.cpp b/vita3k/ps4/ps4_launcher.cpp
 new file mode 100644
-index 00000000..05b3b6b9
+index 00000000..d2ab419a
 --- /dev/null
 +++ b/vita3k/ps4/ps4_launcher.cpp
-@@ -0,0 +1,4441 @@
+@@ -0,0 +1,4517 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -40967,6 +40967,14 @@ index 00000000..05b3b6b9
 +    return item;
 +}
 +
++SItem page_item(std::string name, std::vector<SItem> items) {
++    SItem item;
++    item.type = SItem::kind::page;
++    item.name = std::move(name);
++    item.items = std::move(items);
++    return item;
++}
++
 +// The games' trophies (ux0/user/<user>/trophy: what games add when they start), by name
 +std::vector<TrophyGame> load_trophies(EmuEnvState &emuenv) {
 +    np::trophy::CollectionSource source;
@@ -40998,6 +41006,36 @@ index 00000000..05b3b6b9
 +        return string_utils::tolower(a.title) < string_utils::tolower(b.title);
 +    });
 +    return games;
++}
++
++// A game's folders gone: the game, its update, DLC and license, its own settings and shader cache,
++// and its saves unless keep_saves. Returns false if the game's own folder is still there.
++bool delete_game(EmuEnvState &emuenv, const app::AppEntry &entry, bool keep_saves) {
++    const auto remove = [](const fs::path &path) {
++        boost::system::error_code ec;
++        fs::remove_all(path, ec);
++        if (ec)
++            LOG_WARN("launcher: couldn't delete {}: {}", path.string(), ec.message());
++    };
++    const fs::path ux0 = emuenv.vita_fs_path / "ux0";
++    const fs::path app_dir = ux0 / "app" / entry.path;
++    remove(app_dir);
++    remove(emuenv.config_path / "config" / fmt::format("config_{}.xml", entry.path));
++    if (!entry.title_id.empty()) {
++        remove(ux0 / "patch" / entry.title_id);
++        remove(ux0 / "license" / entry.title_id);
++        remove(emuenv.cache_path / "shaders" / entry.title_id);
++        remove(emuenv.cache_path / "shaderlog" / entry.title_id);
++        remove(emuenv.log_path / "shaderlog" / entry.title_id);
++    }
++    if (!entry.addcont.empty())
++        remove(ux0 / "addcont" / entry.addcont);
++    if (!keep_saves && !entry.savedata.empty())
++        remove(ux0 / "user" / emuenv.io.user_id / "savedata" / entry.savedata);
++    boost::system::error_code ec;
++    const bool gone = !fs::exists(app_dir, ec);
++    LOG_INFO("launcher: deleted {} ({}){}{}", entry.title, entry.path, keep_saves ? ", saves kept" : ", saves too", gone ? "" : ", but its folder is still there");
++    return gone;
 +}
 +
 +} // namespace
@@ -41106,6 +41144,9 @@ index 00000000..05b3b6b9
 +    bool firmware_requested = false;
 +    bool downloads_requested = false;
 +    bool cancel_downloads_requested = false;
++    // a game's settings > Delete: the game (items' index), and whether its saves stay
++    int delete_requested = -1;
++    bool delete_keep_saves = true;
 +
 +    // the last game started is selected again
 +    static std::string last_app_path;
@@ -41277,7 +41318,15 @@ index 00000000..05b3b6b9
 +    const auto open_settings = [&](int game) {
 +        settings_return = mode;
 +        if (game >= 0) {
-+            settings_open(settings, items[game].entry.title, ps4settings::game_pages(emuenv, items[game].entry.path));
++            std::vector<SItem> pages = ps4settings::game_pages(emuenv, items[game].entry.path);
++            // Delete: a page of its own, so one press of Cross can't take a game away
++            std::vector<SItem> confirm;
++            confirm.push_back(section_item("Delete " + items[game].entry.title + "?"));
++            confirm.push_back(action_item("Delete the game, keep its saves", [&, game] { delete_requested = game; delete_keep_saves = true; }));
++            confirm.push_back(action_item("Delete the game and its saves", [&, game] { delete_requested = game; delete_keep_saves = false; }));
++            pages.push_back(section_item("Delete"));
++            pages.push_back(page_item("Delete this game", std::move(confirm)));
++            settings_open(settings, items[game].entry.title, std::move(pages));
 +        } else {
 +            std::vector<SItem> root = ps4settings::global_pages(emuenv);
 +            if (!missing_firmware(fw).empty()) {
@@ -41732,6 +41781,33 @@ index 00000000..05b3b6b9
 +                    mode = Mode::Home;
 +                    start_downloads();
 +                    dirty = true;
++                }
++                if (delete_requested >= 0) {
++                    const Item &gone = items[delete_requested];
++                    const std::string title = gone.entry.title;
++                    delete_requested = -1;
++                    show_message("Deleting", title);
++                    const bool deleted = delete_game(emuenv, gone.entry, delete_keep_saves);
++                    items = load_items(emuenv);
++                    tiles = make_tiles(items);
++                    art.clear();
++                    card_builder.forget();
++                    card_pictures.clear();
++                    cards.erase(std::remove_if(cards.begin(), cards.end(), [&](const std::string &path) { return find_item(path) < 0; }), cards.end());
++                    show_card(0);
++                    card_pos = {};
++                    live = -1;
++                    selected = std::min(selected, std::max(0, static_cast<int>(items.size()) - 1));
++                    tile = std::clamp(tile, 0, std::max(0, static_cast<int>(tiles.size()) - 1));
++                    home_go_to_page(home, tile / PER_PAGE, now);
++                    cards_view.pos = Spring{};
++                    cards_view.pos.pos = static_cast<float>(tile);
++                    settings.stack.clear();
++                    mode = Mode::Home;
++                    notice = deleted ? title + " deleted" + (delete_keep_saves ? " (its saves are kept)" : "") : "Couldn't delete all of " + title;
++                    notice_until = now + std::chrono::seconds(8);
++                    dirty = true;
++                    break;
 +                }
 +                if (cancel_downloads_requested) {
 +                    cancel_downloads_requested = false;
