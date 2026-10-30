@@ -126,7 +126,7 @@ the first time it starts.
 | D-pad, left stick | Move between bubbles |
 | L1 / R1 | A page up or down |
 | Cross | Open: a game's LiveArea (Cross again starts it), the HENkaku bubble's settings, Install |
-| Square | The game's own settings; on the HENkaku bubble, **Themes** |
+| Square | The game's own settings (and **Delete this game**, with or without its saves); on the HENkaku bubble, **Themes** |
 | Triangle | Install games |
 | OPTIONS | HENkaku's settings (Quit is there too) |
 
