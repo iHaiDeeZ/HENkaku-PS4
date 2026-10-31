@@ -248,7 +248,7 @@ index 3f7573af..b4463440 100644
  #endif
  
 diff --git a/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc b/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
-index 272b896a..ea26605f 100644
+index 272b896a..5589e926 100644
 --- a/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
 +++ b/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
 @@ -26,7 +26,14 @@ std::optional<AxxEmitX64::DoNotFastmemMarker> AxxEmitX64::ShouldFastmem(AxxEmitC
@@ -266,6 +266,101 @@ index 272b896a..ea26605f 100644
      const auto iter = fastmem_patch_info.find(rip_);
  
      if (iter == fastmem_patch_info.end()) {
+@@ -356,7 +363,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
+ 
+     const auto wrapped_fn = read_fallbacks[std::make_tuple(ordered, bitsize, vaddr.getIdx(), value_idx)];
+ 
+-    EmitExclusiveLock(code, conf, tmp, tmp2.cvt32());
++    EmitExclusiveLock<bitsize>(code, conf, tmp, tmp2.cvt32());
+ 
+     code.mov(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(1));
+     code.mov(tmp, mcl::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
+@@ -396,7 +403,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
+     code.mov(tmp, mcl::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
+     EmitWriteMemoryMov<bitsize>(code, tmp, value_idx, false);
+ 
+-    EmitExclusiveUnlock(code, conf, tmp, tmp2.cvt32());
++    EmitExclusiveUnlock<bitsize>(code, conf, tmp, tmp2.cvt32());
+ 
+     if constexpr (bitsize == 128) {
+         ctx.reg_alloc.DefineValue(inst, Xbyak::Xmm{value_idx});
+@@ -436,7 +443,7 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
+ 
+     const auto wrapped_fn = exclusive_write_fallbacks[std::make_tuple(ordered, bitsize, vaddr.getIdx(), value.getIdx())];
+ 
+-    EmitExclusiveLock(code, conf, tmp, eax);
++    EmitExclusiveLock<bitsize>(code, conf, tmp, eax);
+ 
+     SharedLabel end = GenSharedLabel();
+ 
+@@ -447,7 +454,7 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
+     code.cmp(qword[tmp], vaddr);
+     code.jne(*end, code.T_NEAR);
+ 
+-    EmitExclusiveTestAndClear(code, conf, vaddr, tmp, rax);
++    EmitExclusiveTestAndClear<bitsize>(code, conf, vaddr, tmp, rax);
+ 
+     code.mov(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(0));
+     code.mov(tmp, mcl::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
+@@ -532,7 +539,7 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
+ 
+     code.L(*end);
+ 
+-    EmitExclusiveUnlock(code, conf, tmp, eax);
++    EmitExclusiveUnlock<bitsize>(code, conf, tmp, eax);
+ 
+     ctx.reg_alloc.DefineValue(inst, status);
+ 
+diff --git a/src/dynarmic/backend/x64/emit_x64_memory.h b/src/dynarmic/backend/x64/emit_x64_memory.h
+index c99980d6..03f0b1c3 100644
+--- a/src/dynarmic/backend/x64/emit_x64_memory.h
++++ b/src/dynarmic/backend/x64/emit_x64_memory.h
+@@ -338,9 +338,19 @@ const void* EmitWriteMemoryMov(BlockOfCode& code, const Xbyak::RegExp& addr, int
+     return fastmem_location;
+ }
+ 
+-template<typename UserConfig>
++// HENkaku: doubleword exclusives (LDREXD/STREXD) always go through the global monitor. Without it a
++// store is a compare-and-swap against what the load read, which a lock-free queue's pointer pair can
++// pass after other threads changed it and changed it back (ABA): Uncharted's thread library (SceUlt)
++// lost a waiter from a semaphore that way and its worker slept forever. The other sizes (locks,
++// counters, bitmaps) may skip the monitor (Unsafe_IgnoreGlobalMonitor, HENkaku > CPU > Fast atomics).
++template<std::size_t bitsize, typename UserConfig>
++bool IgnoresGlobalMonitor(const UserConfig& conf) {
++    return bitsize != 64 && conf.HasOptimization(OptimizationFlag::Unsafe_IgnoreGlobalMonitor);
++}
++
++template<std::size_t bitsize, typename UserConfig>
+ void EmitExclusiveLock(BlockOfCode& code, const UserConfig& conf, Xbyak::Reg64 pointer, Xbyak::Reg32 tmp) {
+-    if (conf.HasOptimization(OptimizationFlag::Unsafe_IgnoreGlobalMonitor)) {
++    if (IgnoresGlobalMonitor<bitsize>(conf)) {
+         return;
+     }
+ 
+@@ -348,9 +358,9 @@ void EmitExclusiveLock(BlockOfCode& code, const UserConfig& conf, Xbyak::Reg64 p
+     EmitSpinLockLock(code, pointer, tmp);
+ }
+ 
+-template<typename UserConfig>
++template<std::size_t bitsize, typename UserConfig>
+ void EmitExclusiveUnlock(BlockOfCode& code, const UserConfig& conf, Xbyak::Reg64 pointer, Xbyak::Reg32 tmp) {
+-    if (conf.HasOptimization(OptimizationFlag::Unsafe_IgnoreGlobalMonitor)) {
++    if (IgnoresGlobalMonitor<bitsize>(conf)) {
+         return;
+     }
+ 
+@@ -358,9 +368,9 @@ void EmitExclusiveUnlock(BlockOfCode& code, const UserConfig& conf, Xbyak::Reg64
+     EmitSpinLockUnlock(code, pointer, tmp);
+ }
+ 
+-template<typename UserConfig>
++template<std::size_t bitsize, typename UserConfig>
+ void EmitExclusiveTestAndClear(BlockOfCode& code, const UserConfig& conf, Xbyak::Reg64 vaddr, Xbyak::Reg64 pointer, Xbyak::Reg64 tmp) {
+-    if (conf.HasOptimization(OptimizationFlag::Unsafe_IgnoreGlobalMonitor)) {
++    if (IgnoresGlobalMonitor<bitsize>(conf)) {
+         return;
+     }
+ 
 diff --git a/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h b/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h
 index 44ac2450..235ffa15 100644
 --- a/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h

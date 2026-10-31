@@ -242,10 +242,11 @@ good guide: a game that doesn't work in Vita3K won't work here either.
   graphics state setters and draws) run inside the translated code instead of stopping it, and the thread's ID and
   storage are answered by a few instructions in the game's own code. Some games make hundreds of thousands a
   second. It's on by default and applies when a game starts.
-- **Fast atomics** (HENkaku > CPU): a game's atomic operations (its locks, counters and queues) run as one host
-  instruction each, without a lock shared by all of its threads. They differ from the Vita only in a case games
-  rarely depend on. It's on by default and applies when a game starts; turn it off if a game hangs or crashes
-  where it didn't before.
+- **Fast atomics** (HENkaku > CPU): a game's atomic operations (its locks and counters) run as one host
+  instruction each, without a lock shared by all of its threads. The 64-bit ones, which lock-free queues use,
+  stay exact either way (since 1.17: Uncharted's thread library lost a waiting thread without that and froze at
+  its first loading screen). It's on by default and applies when a game starts; turn it off if a game hangs or
+  crashes where it didn't before.
 - **Vita core threads** (HENkaku > CPU): **One at a time** (the default) runs the threads a game puts on one Vita
   core one at a time, as the Vita does, and a thread of a higher priority takes the core at once; some games
   deadlock otherwise. **Side by side** lets them all run at the same time; try it if a game hitches.

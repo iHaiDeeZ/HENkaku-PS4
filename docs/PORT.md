@@ -87,7 +87,12 @@ Title ID `VITA00003` (content ID `IV0000-VITA00003_00-VITA3KPS4EMU0000`).
   lock (dynarmic's fastmem exclusives, yuzu's default). Since 1.09 without the global monitor
   (HENkaku > CPU > Fast atomics, yuzu's default too): Vita3K gives every guest thread a monitor
   slot (150), so each STREX cleared the other 149 under the monitor's lock (some 450 instructions)
-  and each LDREX took that lock. A fault at a fastmem access (a page the renderer protects) no
+  and each LDREX took that lock. Since 1.17 the doubleword ones (LDREXD/STREXD) take the monitor
+  even so: a bare compare-and-swap let a lock-free queue's pointer pair pass after other threads
+  changed it and changed it back (ABA), and Uncharted's SceUlt semaphore lost a waiter, its job
+  worker asleep for good and the loading screen spinning on that job. A thread the JIT stops
+  between instructions (a profiler sample, a halt) also loses its reservation, as at a context
+  switch. A fault at a fastmem access (a page the renderer protects) no
   longer recompiles the instruction to go through a call for the rest of the session. Imports that
   never wait run inside the JIT's supervisor call (`call_fast_import`: the clocks, GXM's setters and
   draws on an immediate context), and `sceKernelGetThreadId`, `sceKernelGetTLSAddr` and

@@ -22989,7 +22989,7 @@ index 051d616a..b205a814 100644
      SceSize size;
      SceUInt32 flags;
 diff --git a/vita3k/kernel/src/kernel.cpp b/vita3k/kernel/src/kernel.cpp
-index 97794b3d..21380773 100644
+index 97794b3d..f333093b 100644
 --- a/vita3k/kernel/src/kernel.cpp
 +++ b/vita3k/kernel/src/kernel.cpp
 @@ -23,6 +23,7 @@
@@ -23112,7 +23112,7 @@ index 97794b3d..21380773 100644
  
      process_param = nullptr;
      client_vtable = Ptr<void>(0);
-@@ -326,3 +382,121 @@ SceKernelModuleInfo *KernelState::find_module_by_addr(Address address) {
+@@ -326,3 +382,128 @@ SceKernelModuleInfo *KernelState::find_module_by_addr(Address address) {
      }
      return nullptr;
  }
@@ -23222,8 +23222,15 @@ index 97794b3d..21380773 100644
 +        }
 +        LOG_INFO("hang: {} stack callers: {}", thread->name, callers);
 +        LOG_INFO("hang: {} stack words: {}", thread->name, words(sp, 32));
-+        if (waiting)
++        if (waiting) {
++            for (int r = 0; r < 13; r++) {
++                const Address value = read_reg(cpu, r) & ~3u;
++                if (value < 0x80000000 || !Ptr<uint32_t>(value - 0x20).valid(mem) || !Ptr<uint32_t>(value + 0x1C).valid(mem))
++                    continue;
++                LOG_INFO("hang: {} r{} {:08X}: [-0x20] {}", thread->name, r, value, words(value - 0x20, 16));
++            }
 +            continue;
++        }
 +        for (int r = 0; r < 13; r++) {
 +            const Address value = read_reg(cpu, r) & ~3u;
 +            if (value < 0x80 || !Ptr<uint32_t>(value - 0x80).valid(mem) || !Ptr<uint32_t>(value + 0x3C).valid(mem))
@@ -23329,7 +23336,7 @@ index 78029915..baf00c6a 100644
      const auto guard = lock();
      if (!guard)
 diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
-index c01e4699..bc2e6d54 100644
+index c01e4699..431571a1 100644
 --- a/vita3k/kernel/src/thread.cpp
 +++ b/vita3k/kernel/src/thread.cpp
 @@ -32,6 +32,117 @@
@@ -23485,7 +23492,7 @@ index c01e4699..bc2e6d54 100644
              status_cond.wait(lock, [&] { return status == ThreadStatus::running || exiting(); });
              continue;
          }
-@@ -297,17 +422,59 @@ void ThreadState::run_loop(bool top_level) {
+@@ -297,17 +422,64 @@ void ThreadState::run_loop(bool top_level) {
              if (exiting())
                  break;
              const bool do_step = std::exchange(step_requested, false);
@@ -23542,10 +23549,15 @@ index c01e4699..bc2e6d54 100644
 +#ifdef __PS4__
 +                ps4_perf_import(nid, __builtin_ia32_rdtsc() - run_end);
 +#endif
++                clear_exclusive(*cpu);
++            } else {
++                // stopped between instructions (a profiler sample, a halt): the reservation goes, as
++                // it does at a context switch on the Vita, so an LDREX/STREX pair paused here starts
++                // over instead of comparing against a value other threads may have changed back
                  clear_exclusive(*cpu);
              }
  
-@@ -501,6 +668,11 @@ bool ThreadState::is_deleted() {
+@@ -501,6 +673,11 @@ bool ThreadState::is_deleted() {
      return status == ThreadStatus::deleted;
  }
  
@@ -23557,7 +23569,7 @@ index c01e4699..bc2e6d54 100644
  ThreadStatus ThreadState::get_status() const {
      const std::lock_guard<std::mutex> lock(mutex);
      return status;
-@@ -559,6 +731,11 @@ WaitResult ThreadState::wait(WaitTarget target, Deadline deadline, bool callback
+@@ -559,6 +736,11 @@ WaitResult ThreadState::wait(WaitTarget target, Deadline deadline, bool callback
      const auto woken = [&] { return exiting() || wake_pending || (runs_callbacks && callbacks_notified()); };
      wait_target = { callbacks ? target.type | WAITTYPE_CB_BIT : target.type, target.id };
      update_status(ThreadStatus::waiting);
