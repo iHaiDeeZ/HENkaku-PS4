@@ -22989,7 +22989,7 @@ index 051d616a..b205a814 100644
      SceSize size;
      SceUInt32 flags;
 diff --git a/vita3k/kernel/src/kernel.cpp b/vita3k/kernel/src/kernel.cpp
-index 97794b3d..8d9cafc4 100644
+index 97794b3d..21380773 100644
 --- a/vita3k/kernel/src/kernel.cpp
 +++ b/vita3k/kernel/src/kernel.cpp
 @@ -23,6 +23,7 @@
@@ -23112,7 +23112,7 @@ index 97794b3d..8d9cafc4 100644
  
      process_param = nullptr;
      client_vtable = Ptr<void>(0);
-@@ -326,3 +382,58 @@ SceKernelModuleInfo *KernelState::find_module_by_addr(Address address) {
+@@ -326,3 +382,121 @@ SceKernelModuleInfo *KernelState::find_module_by_addr(Address address) {
      }
      return nullptr;
  }
@@ -23168,6 +23168,69 @@ index 97794b3d..8d9cafc4 100644
 +            }
 +        }
 +        LOG_INFO("waits: {} ({}, priority {}, cores {}): wait type {}, on {}", thread->name, thread->id, thread->get_priority(), log_hex(static_cast<SceUInt32>(thread->get_affinity_mask())), log_hex(target.type), what);
++    }
++}
++
++// PS4: a hang in detail (vita3k/ps4/ps4_main.cpp calls it when the game shows no new frame for
++// 30 s): every guest thread's registers (a thread in a call has its LR where the game called it
++// from), the code addresses on its stack (its callers, mostly) and its first stack words, and for a
++// thread running guest code the memory its registers point at (the lock or job it spins on)
++void ps4_log_threads(KernelState &kernel, MemState &mem) {
++    std::vector<ThreadStatePtr> threads;
++    {
++        const std::lock_guard<std::mutex> guard(kernel.mutex);
++        for (const auto &[id, thread] : kernel.threads)
++            threads.push_back(thread);
++    }
++    const auto where = [&](Address address) {
++        if (const SceKernelModuleInfo *module = kernel.find_module_by_addr(address))
++            return fmt::format("{}+0x{:X}", module->module_name, address - module->segments[0].vaddr.address());
++        return fmt::format("{:08X}", address);
++    };
++    const auto words = [&](Address from, int count) {
++        std::string text;
++        for (int i = 0; i < count; i++) {
++            const Address at = from + i * 4;
++            if (!Ptr<uint32_t>(at).valid(mem))
++                break;
++            fmt::format_to(std::back_inserter(text), "{}{:08X}", i ? " " : "", *Ptr<uint32_t>(at).get(mem));
++        }
++        return text;
++    };
++    LOG_INFO("hang: {} guest threads", threads.size());
++    for (const auto &thread : threads) {
++        if (!thread->cpu)
++            continue;
++        CPUState &cpu = *thread->cpu;
++        const Address sp = read_sp(cpu);
++        const bool waiting = thread->get_wait_target().type != 0;
++        LOG_INFO("hang: {} ({}): status {}{}, pc {}, lr {}, sp {:08X}", thread->name, thread->id, static_cast<SceUInt32>(thread->get_status()),
++            waiting ? " (in a kernel wait)" : "", where(read_pc(cpu)), where(read_lr(cpu)), sp);
++        std::string regs;
++        for (int r = 0; r < 13; r++)
++            fmt::format_to(std::back_inserter(regs), "{}r{} {:08X}", r ? " " : "", r, read_reg(cpu, r));
++        LOG_INFO("hang: {} registers: {}", thread->name, regs);
++        // the code addresses on the stack, with their offsets from sp
++        std::string callers;
++        const Address top = thread->stack_top();
++        for (Address at = sp; at + 4 <= top && at < sp + 8192; at += 4) {
++            if (!Ptr<uint32_t>(at).valid(mem))
++                break;
++            const Address value = *Ptr<uint32_t>(at).get(mem);
++            if (value >= 0x80000000 && kernel.find_module_by_addr(value & ~1u))
++                fmt::format_to(std::back_inserter(callers), "{}sp+0x{:X} {}", callers.empty() ? "" : ", ", at - sp, where(value));
++        }
++        LOG_INFO("hang: {} stack callers: {}", thread->name, callers);
++        LOG_INFO("hang: {} stack words: {}", thread->name, words(sp, 32));
++        if (waiting)
++            continue;
++        for (int r = 0; r < 13; r++) {
++            const Address value = read_reg(cpu, r) & ~3u;
++            if (value < 0x80 || !Ptr<uint32_t>(value - 0x80).valid(mem) || !Ptr<uint32_t>(value + 0x3C).valid(mem))
++                continue;
++            LOG_INFO("hang: {} r{} {:08X}: [-0x80] {}", thread->name, r, value, words(value - 0x80, 32));
++            LOG_INFO("hang: {} r{} {:08X}: [+0x00] {}", thread->name, r, value, words(value, 16));
++        }
 +    }
 +}
 +#endif
@@ -42170,10 +42233,10 @@ index 00000000..800318b2
 +} // namespace ps4launcher
 diff --git a/vita3k/ps4/ps4_main.cpp b/vita3k/ps4/ps4_main.cpp
 new file mode 100644
-index 00000000..28d0434d
+index 00000000..171ec63a
 --- /dev/null
 +++ b/vita3k/ps4/ps4_main.cpp
-@@ -0,0 +1,702 @@
+@@ -0,0 +1,715 @@
 +// Vita3K emulator project
 +// Copyright (C) 2026 Vita3K team
 +//
@@ -42269,6 +42332,7 @@ index 00000000..28d0434d
 +
 +// kernel/src/kernel.cpp: every guest thread's wait, and who holds what it waits for
 +void ps4_log_waits(KernelState &kernel);
++void ps4_log_threads(KernelState &kernel, MemState &mem);
 +
 +// The renderer profiler's line: HENkaku's render thread's draws and what each part of them took,
 +// its biggest kinds of state set and command (renderer/ps4_render_stats.h)
@@ -42436,6 +42500,15 @@ index 00000000..28d0434d
 +                wait_logs++;
 +                ps4_log_waits(emuenv.kernel);
 +            }
++            // a hang behind a loading screen: the game shows no new frame while the render thread
++            // waits for it. After 30 s (and again after 90), where every thread is.
++            stalled = emuenv.frame_count == last_frame_count ? stalled + 1 : 0;
++            last_frame_count = emuenv.frame_count;
++            if ((stalled == 3 || stalled == 9) && ps4settings::prefs().freeze_log) {
++                LOG_INFO("hang: no new frame for {} s", stalled * 10);
++                ps4_log_waits(emuenv.kernel);
++                ps4_log_threads(emuenv.kernel, emuenv.mem);
++            }
 +            log_profile(emuenv);
 +            if (ps4settings::prefs().host_profiler)
 +                log_render_stats(emuenv, seconds, (tsc - last_tsc) / (seconds * 1000.0));
@@ -42451,6 +42524,9 @@ index 00000000..28d0434d
 +
 +private:
 +    bool started = false;
++    // the 10 s reports in a row without a new frame from the game
++    int stalled = 0;
++    size_t last_frame_count = 0;
 +    std::chrono::steady_clock::time_point last{}, next{};
 +    uint64_t vblanks = 0;
 +    uint64_t last_tsc = 0;
